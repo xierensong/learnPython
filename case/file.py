@@ -1,4 +1,5 @@
 import json
+import os.path as path
 
 
 if __name__ == '__main__':
@@ -17,5 +18,12 @@ if __name__ == '__main__':
         # read file data
         json_data = f.read()
         print(json_data)
+
+    # path parse
+    print('file size: ', path.getsize('../data/temp'))
+    if (path.getsize('../data/temp')) == 0:
+        print ('file is empty!')
+
+
 
 
