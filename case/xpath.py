@@ -8,8 +8,8 @@ if __name__ == '__main__':
     selector = etree.HTML(sourceHTML.text)
     folder_list = selector.xpath('//pre[position()=1]/a[@href]')
     for elmt in folder_list:
-        dict = elmt.attrib
-        href_TT = dict['href']
+        #
+        href_TT = elmt.get('href')
         print('href_TT ', href_TT)
         if href_TT[len(href_TT)-1] == '/':
             print('folder_list', elmt.attrib)
