@@ -16,3 +16,10 @@ with open('names.csv', newline='') as csvfile:
     for row in reader:
         # print(row['first_name'], row['last_name'])
         print('| '.join(row))
+
+# 读csv文件
+with open('names.csv', 'r', newline='') as csv_file:
+    reader = csv.DictReader(csv_file)
+    for row in reader:
+        print('| '.join(row))
+
