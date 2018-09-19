@@ -13,7 +13,7 @@ text = '''
 '''
 
 html = etree.HTML(text)
-
+print(html)
 print('text: ', etree.tostring(html, pretty_print=True))
 
 result = html.xpath('//li')
@@ -30,7 +30,7 @@ for x in result:
     # （方法3)使用x.attrib获取属性列表，dict格式化.items方法返回所有属性信息
     d = dict(x.attrib)
     print('x: ', d.items())
-    print('x\'s path: ', html.getpath(x))
+    # print('x\'s path: ', html.getpath(x))
 
 result1 = html.xpath('//text()')
 print('result1: ', result1)
