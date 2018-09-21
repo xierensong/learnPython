@@ -14,7 +14,15 @@ xml_content = xml_file.read_text()
 # print('xml content: ', xml_content)
 
 # etree.tostring(xml_content, encoding='UTF-8')
-xml_tree = etree.parse('../data/pom.xml')
+#xml_tree = etree.parse('../data/pom.xml')
+
+parser = etree.XMLParser(ns_clean=True,remove_blank_text=True)
+try:
+    xml_tree = etree.parse('../data/pom1.xml')
+except etree.XMLSyntaxError as e:
+    print(str(e.error_log.last_error))
+    pass
+
 # print('root xml_version', xml_tree.docinfo.xml_version)
 # print('root ', xml_tree.getroot())
 root = xml_tree.getroot()
