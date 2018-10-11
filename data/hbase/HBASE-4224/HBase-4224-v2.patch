@@ -1,0 +1,645 @@
+Index: src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java	(revision 1222676)
++++ src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java	(working copy)
+@@ -22,11 +22,17 @@
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+-import java.lang.reflect.UndeclaredThrowableException;
+ import java.net.SocketTimeoutException;
+ import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Map.Entry;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.regex.Pattern;
+ 
+@@ -63,6 +69,9 @@
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.util.StringUtils;
+ 
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++
+ /**
+  * Provides an interface to manage HBase database table metadata + general
+  * administrative functions.  Use HBaseAdmin to create, drop, list, enable and
+@@ -85,6 +94,8 @@
+   private final int retryLongerMultiplier;
+   private boolean aborted;
+   
++  private ExecutorService executorService= Executors.newCachedThreadPool();
++  
+   /**
+    * Constructor
+    *
+@@ -1118,68 +1129,289 @@
+   }
+ 
+   /**
+-   * Flush a table or an individual region.
+-   * Asynchronous operation.
+-   *
+-   * @param tableNameOrRegionName table or region to flush
++   * Flush a region, an entire region server or an entire table.
++   * 
++   * @see #flush(byte[])
++   * @param name ame table or region to flush
+    * @throws IOException if a remote or network exception occurs
+    * @throws InterruptedException
+    */
+-  public void flush(final String tableNameOrRegionName)
+-  throws IOException, InterruptedException {
+-    flush(Bytes.toBytes(tableNameOrRegionName));
++  public void flush(final String name)
++      throws IOException, InterruptedException {
++    flush(Bytes.toBytes(name));
+   }
+ 
+   /**
+-   * Flush a table or an individual region.
+-   * Asynchronous operation.
++   * Flush a region, an entire region server or an entire table. 
++   * 
++   * If flushing an entire table, the calls to flush are made in  parallel to 
++   * all the HRegionServers and waits till all the HRegionServers have finished
++   * flushing.
++   * 
++   * The HLog is rolled if the flush is a table/regionserver flush and all the 
++   * regions of the table/region server were successfully flushed.
++   * 
+    *
+-   * @param tableNameOrRegionName table or region to flush
++   * @param name - This could represent one of the following
++   *               1. Address of the region server to flush
++   *                  Format: "hostname, port, startcode"
++   *               2. Name of a specific region to be flushed
++   *               3. Name of a specific table to be flushed
++   *               
+    * @throws IOException if a remote or network exception occurs
+    * @throws InterruptedException
+    */
+-  public void flush(final byte [] tableNameOrRegionName)
+-  throws IOException, InterruptedException {
+-    boolean isRegionName = isRegionName(tableNameOrRegionName);
+-    CatalogTracker ct = getCatalogTracker();
++  public void flush(final byte [] name)
++      throws IOException, InterruptedException {
++    HashMap<ServerName, List<HRegionInfo>> serverRegionsMap = Maps.newHashMap();
++    
++    /*
++     * Check if an entire HRegionsServer has to be flushed by checking if the 
++     * name is a valid HRegionServer name
++     */
++    ServerName serverName = getServerNameIfValid(name);
++      
++    boolean rollWAL = true;
++    if( serverName != null) {
++      // Flush all regions of a Region Server
++      serverRegionsMap.put(serverName, null);
++    } else if (isRegionName(name)) {
++      // Flush a particular region
++      rollWAL = false;
++      serverRegionsMap = getServerRegionsMapForRegion(name);
++    } else {
++      // Flush all regions of a Table
++      serverRegionsMap =  getServerRegionsMapForTable(name);
++    }
++    
++    /*
++     * Flushes the regions in the list and returns the list of servers whose
++     * WAL ( Write Ahead Log ) has to be rolled
++     */
++      List<ServerName> serverList = flushRegions(serverRegionsMap);
++      
++      if(rollWAL) {
++        rollHLogWriterForServers(serverList);
++      }
++  }
++  
++  
++  /**
++   * Returns the ServerName object if the string represents a valid 
++   * Region Server. 
++   * A valid string is of the format: "Hostname,Port,RegionStartCode" 
++   * 
++   * @param name - a valid region server name identified by
++   *               "Hostname,Port,RegionStartCode"
++   * @return ServerName object representation of the string
++   */
++  private ServerName getServerNameIfValid(byte [] name) {
+     try {
+-      if (isRegionName) {
+-        Pair<HRegionInfo, ServerName> pair =
+-          MetaReader.getRegion(ct, tableNameOrRegionName);
+-        if (pair == null || pair.getSecond() == null) {
+-          LOG.info("No server in .META. for " +
+-            Bytes.toStringBinary(tableNameOrRegionName) + "; pair=" + pair);
+-        } else {
+-          flush(pair.getSecond(), pair.getFirst());
+-        }
+-      } else {
+-        List<Pair<HRegionInfo, ServerName>> pairs =
+-          MetaReader.getTableRegionsAndLocations(ct,
+-              Bytes.toString(tableNameOrRegionName));
+-        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+-          if (pair.getFirst().isOffline()) continue;
+-          if (pair.getSecond() == null) continue;
+-          try {
+-            flush(pair.getSecond(), pair.getFirst());
+-          } catch (NotServingRegionException e) {
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Trying to flush " + pair.getFirst() + ": " +
+-                StringUtils.stringifyException(e));
+-            }
+-          }
+-        }
++      ServerName serverName = new ServerName(name);
++      if(!serverName.isValid()) {
++        return null;
+       }
++      return serverName;
++    }catch (Exception e) {
++      LOG.error("Exception in ServerName", e);
++      return null;
++    }
++  }
++
++  /**
++   * Fetches the HRegionInfo and ServerName reference representing the 
++   * region name from the CatalogTracker.
++
++   * @return A {@link Pair} of HRegion, ServerName 
++   * @throws ZooKeeperConnectionException
++   * @throws IOException
++   */
++  private HashMap<ServerName, List<HRegionInfo>> getServerRegionsMapForRegion
++      (byte[] regionName) throws ZooKeeperConnectionException, IOException {
++    
++    CatalogTracker catalogTracker = getCatalogTracker();
++    try {
++      Pair<HRegionInfo, ServerName> pair = 
++          MetaReader.getRegion(catalogTracker, regionName);
++      
++      if (!isValidRegionServerPair(pair)) return null;
++      
++      ServerName serverName = pair.getSecond();
++      List<HRegionInfo> regions = Lists.newArrayList(pair.getFirst());
++      HashMap<ServerName, List<HRegionInfo>> serverToRegionsMap = 
++          Maps.newHashMap();
++      serverToRegionsMap.put(serverName, regions);
++      return serverToRegionsMap;
++      
+     } finally {
+-      cleanupCatalogTracker(ct);
++      cleanupCatalogTracker(catalogTracker);
+     }
+   }
++  
++  /**
++   * Check if the pair representing the region server is a valid one
++   * 
++   * The pair is considered valid when
++   * 1. Pair reference is not null
++   * 2. Region represented by HregionInfo in the pair is online
++   * 3. ServerName reference in the pair is not null
++   *   
++   * @param pair - A pair of HRegionInfo and ServerName which represents
++   *               a region and the region server address where this 
++   *               region is hosted respectively
++   * @return true if the pair is valid
++   */
++  private boolean isValidRegionServerPair(Pair<HRegionInfo, ServerName> pair) {
++    boolean isValid = true;
++    if (pair == null) {
++      isValid = false;
++    } else if (pair.getFirst().isOffline() || pair.getSecond() == null) { 
++      byte[] regionName = pair.getFirst().getRegionName();
++      LOG.info("No server in .META. for " + Bytes.toStringBinary(regionName) + 
++          "; pair=" + pair);
++      isValid = false;
++    }
++    return isValid;
++  }
++  
++  /**
++   * Fetches the region info pairs for all the regions belonging to a 
++   * particular table
++   * 
++   * @return The list of HRegionInfo, ServerName pairs of all regions
++   *         belonging to the table
++   * @throws ZooKeeperConnectionException
++   * @throws IOException
++   * @throws InterruptedException
++   */
++  private HashMap<ServerName, List<HRegionInfo>> getServerRegionsMapForTable(
++      byte[] tableName) throws ZooKeeperConnectionException, IOException, 
++      InterruptedException {
++    CatalogTracker catalogTracker = getCatalogTracker();
++    try {
++      HashMap<ServerName, List<HRegionInfo>> regionsPerServer = Maps.newHashMap();                         
+ 
+-  private void flush(final ServerName sn, final HRegionInfo hri)
+-  throws IOException {
+-    HRegionInterface rs =
+-      this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+-    rs.flushRegion(hri);
++      List<Pair<HRegionInfo, ServerName>> pairs =
++          MetaReader.getTableRegionsAndLocations(catalogTracker,
++              Bytes.toString(tableName));
++      
++      for (Pair<HRegionInfo, ServerName> pair: pairs) {
++        if(isValidRegionServerPair(pair)) {
++          ServerName serverName = pair.getSecond();
++          HRegionInfo region = pair.getFirst();
++          List<HRegionInfo> regions = regionsPerServer.get(serverName);
++          
++          if (regions == null) {
++            regions = Lists.newArrayList();
++            regionsPerServer.put(serverName, regions);
++          }
++          regions.add(region);
++        }  
++      }
++      return regionsPerServer;
++      
++    } finally {
++      cleanupCatalogTracker(catalogTracker);
++    }
+   }
++  
++  /**
++   * Flushes the all the regions present in the flush list and returns the list
++   * of ServerNames whose WAL is to be rolled
++   * 
++   * @param flushList - List of pair of HRegionInfo, ServerName each
++   *                    representing a region
++   * @return list of ServerNames whose WAL is to be rolled
++   * @throws IOException
++   * @throws ExecutionException 
++   * @throws InterruptedException 
++   */
++  private List<ServerName> flushRegions(HashMap<ServerName, List<HRegionInfo>> 
++      serverRegionsMap) throws IOException, InterruptedException {
++    List<ServerName> rollWALServers;
++    List<Future<ServerName>> flushStatusList = Lists.newArrayList(); 
++    
++    /*
++     * Submit the batch flush to every regions server in a separate thread
++     */
++    for(Entry<ServerName, List<HRegionInfo>> pair : 
++        serverRegionsMap.entrySet()) {
++      Future<ServerName> status = submitFlushTask(pair);
++      flushStatusList.add(status);
++    }
++    
++    /*
++     * Wait for the region server flushes to complete. If the flush was 
++     * successful, then add it to the list of servers whole WAL is to be rolled
++     */
++    rollWALServers = getAllSuccessfulFlushes(flushStatusList);
++    
++    return rollWALServers;
++    
++  }
++  
++  /**
++   * Submits a non-blocking flush task on a separate thread and returns 
++   * the future object for the caller to wait on.
++   * 
++   * @param pair A pair of ServerName and a list of regions on that 
++   * HRegionServer to be flushed.
++   * @return Future object which contains the server name if all the
++   * specified regions were flushed successfully else null.
++   */
++  private Future<ServerName> submitFlushTask(Entry<ServerName, 
++      List<HRegionInfo>> pair) {
++    ServerName serverName = pair.getKey();
++    List<HRegionInfo> regions = pair.getValue();
++    AsyncFlusher asyncFlusher = new AsyncFlusher(this, serverName, regions);
++    return executorService.submit(asyncFlusher);
++  }
++  
++  /**
++   * Waits on every future object in the list, essentially waiting on all the
++   * flushes to complete/terminate and returns the list of ServerName whose
++   * flushes completed successfully
++   * 
++   * @param flushStatusList - List of Future object of an AsyncFlusher task
++   * @return the list of ServerName whose flush successfully completed
++   * @throws InterruptedException
++   */
++  private List<ServerName> getAllSuccessfulFlushes(
++      List<Future<ServerName>> flushStatusList) throws InterruptedException {
++    List<ServerName> rollWALServers = Lists.newArrayList();
++    for(Future<ServerName> futureServerName : flushStatusList) {
++      try {
++        ServerName serverName = futureServerName.get();
++        if (serverName != null) {
++          rollWALServers.add(serverName);
++        }
++      } catch(ExecutionException e) {
++        if (LOG.isDebugEnabled())
++          LOG.debug("Error while flushing : " + StringUtils.stringifyException(e));
++      }
++    }
++    return rollWALServers;
++  }
++  
++  /**
++   * Makes the actual RPC call to flush the a particular region.
++   *   
++   * @param serverName - Server address where the region is hosted 
++   * @param region - region to be flushed.
++   * @return true if the flush was successful
++   * @throws IOException
++   */
++  private boolean flush(ServerName serverName, List<HRegionInfo> regions) throws IOException {
++    boolean isRollWAL;
++    HRegionInterface regionServer =
++      this.connection.getHRegionConnection(serverName.getHostname(), serverName.getPort());
++    if (regions != null) {
++      isRollWAL = regionServer.flushRegions(regions);
++    } else {
++      isRollWAL = regionServer.flushAllRegions();
++    }    
++    return isRollWAL;
++  }
+ 
+   /**
+    * Compact a table or an individual region.
+@@ -1608,14 +1840,131 @@
+    * @throws IOException if a remote or network exception occurs
+    * @throws FailedLogCloseException
+    */
+- public synchronized  byte[][] rollHLogWriter(String serverName)
++ public byte[][] rollHLogWriter(String serverName)
+       throws IOException, FailedLogCloseException {
+     ServerName sn = new ServerName(serverName);
+-    HRegionInterface rs = this.connection.getHRegionConnection(
+-        sn.getHostname(), sn.getPort());
+-    return rs.rollHLogWriter();
+-  }
++    return rollHLogWriter(sn);
++ }
++ 
++ public byte[][] rollHLogWriter(ServerName serverName) throws IOException {
++   HRegionInterface rs = this.connection.getHRegionConnection(
++       serverName.getHostname(), serverName.getPort());
++   return rs.rollHLogWriter();
++ }
++ 
++ public void rollHLogWriterForServers(List<ServerName> serverList) {
++   List<Future<Boolean>> futureList = Lists.newArrayList();
++   
++   for(ServerName server: serverList) {
++     AsyncLogRoller asyncLogRoller = new AsyncLogRoller(this, server);
++     Future<Boolean> waitFuture = executorService.submit(asyncLogRoller);
++     futureList.add(waitFuture);
++   }
++   
++   for(Future<Boolean> future : futureList) {
++     try {
++       future.get();
++     } catch(ExecutionException e) {
++       if (LOG.isDebugEnabled())
++         LOG.debug("Error while flushing : " + StringUtils.stringifyException(e));
++     } catch (InterruptedException e) {
++       if (LOG.isDebugEnabled())
++         LOG.debug("Error while flushing : " + StringUtils.stringifyException(e));
++     }
++   }
++     
++ }
++ 
++ /**
++  * Thread used to make Async Log Roll calls on an HRegionServer. Takes the 
++  * ServerName as the parameter.
++  *
++  */
++ public static class AsyncLogRoller implements Callable<Boolean> {
++  
++   private static final Log LOG = LogFactory.getLog(AsyncLogRoller.class);
++   private HBaseAdmin admin;
++   private ServerName serverName;
++   
++   public AsyncLogRoller(HBaseAdmin admin, ServerName serverName) {
++     this.admin = admin;
++     this.serverName = serverName;
++   }
++   
++   /**
++    * Rolls the log on a HRegionServer.
++    * @return - true if LogRoll was successful else false
++    */
++   @Override
++   public Boolean call() {
++     try {
++       admin.rollHLogWriter(serverName);
++     } catch (Exception e) {
++       if (LOG.isDebugEnabled()) 
++         LOG.debug("Trying to rollLog " + serverName + ": " +
++             StringUtils.stringifyException(e));
++     }
++     return true;
++   } 
++ }
++ 
++ 
++ /**
++  * Thread which flushes an entire regionserver in a batch. The constructor
++  * is initialized with the ServerName and a list of regions to be flushed.
++  * This makes a batch call to the region server with the list of regions to
++  * be flushed and returns the ServerName if all the regions were successfully
++  * or else returns null
++  * 
++  */
++ public static class AsyncFlusher implements Callable<ServerName> {
++   
++   private static final Log LOG = LogFactory.getLog(AsyncFlusher.class);
++   private HBaseAdmin admin;
++   private ServerName serverName;
++   private List<HRegionInfo> regions;
++   
++   /** 
++    * Parameterized constructor which takes a List of HRegionInfo on a particular
++    * server.
++    * @param admin - HBaseAdmin object that is used to send the flush command to the
++    * HRegionServer
++    * @param serverName - ServerName object representing the HRegionServer that is to
++    * be flushed
++    * @param regions - List of HRegionInfo which represent the regions which are to be
++    * flushed
++    */
++   AsyncFlusher(HBaseAdmin admin, ServerName serverName, 
++       List<HRegionInfo> regions) {
++     this.admin = admin;
++     this.serverName = serverName;
++     this.regions = regions;
++   }
++   
++   /**
++    *  Flushes a list of regions servers on a particular HRegionServer. Passes
++    *  a list of regions to make a batch flush
++    *  
++    *  @return - ServerName if all the regions of the HRegionServer were 
++    *  successfully flushed else null  
++    */
++   @Override
++   public ServerName call() throws Exception {
++     ServerName returnValue = null;
++     try {
++       if(admin.flush(serverName, regions)) 
++         returnValue = serverName;
++     } catch (NotServingRegionException e) {
++       if (LOG.isDebugEnabled()) 
++         LOG.debug("Trying to flush " + serverName + ": " +
++             StringUtils.stringifyException(e));
++       
++     }
++     return returnValue;
++   }
++ }   
+ 
++
+   public String[] getMasterCoprocessors() {
+     try {
+       return getClusterStatus().getMasterCoprocessors();
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(revision 1222676)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(working copy)
+@@ -2766,12 +2766,30 @@
+ 
+   @Override
+   @QosPriority(priority=HIGH_QOS)
+-  public void flushRegion(HRegionInfo regionInfo)
++  public boolean flushAllRegions()
++    throws NotServingRegionException, IOException {
++    List<HRegionInfo> onlineRegions = getOnlineRegions();
++    return flushRegions(onlineRegions);
++  }
++  
++  @Override
++  @QosPriority(priority=HIGH_QOS)
++  public boolean flushRegions(List<HRegionInfo> regions) throws NotServingRegionException, IOException {
++    boolean isAllFlushesSuccessful = true;
++    for(HRegionInfo region : regions) 
++      isAllFlushesSuccessful &= flushRegion(region);
++    return isAllFlushesSuccessful;
++  }
++  
++  @Override
++  @QosPriority(priority=HIGH_QOS)
++  public boolean flushRegion(HRegionInfo regionInfo)
+       throws NotServingRegionException, IOException {
+     checkOpen();
+     LOG.info("Flushing " + regionInfo.getRegionNameAsString());
+     HRegion region = getRegion(regionInfo.getRegionName());
+-    region.flushcache();
++    boolean isFlushed = region.flushcache();
++    return isFlushed;
+   }
+ 
+   @Override
+Index: src/main/java/org/apache/hadoop/hbase/ServerName.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/ServerName.java	(revision 1222676)
++++ src/main/java/org/apache/hadoop/hbase/ServerName.java	(working copy)
+@@ -22,6 +22,7 @@
+ import java.util.Collection;
+ import java.util.regex.Pattern;
+ 
++import org.apache.commons.lang.StringUtils;
+ import org.apache.hadoop.hbase.util.Addressing;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
+@@ -86,6 +87,10 @@
+     this.startcode = startcode;
+     this.servername = getServerName(hostname, port, startcode);
+   }
++  
++  public ServerName(final byte[] serverName) {
++    this(Bytes.toString(serverName));
++  }
+ 
+   public ServerName(final String serverName) {
+     this(parseHostname(serverName), parsePort(serverName),
+@@ -259,6 +264,22 @@
+   }
+ 
+   /**
++   * Checks if the server name represented by this instance is valid
++   * A ServerName is considered valid if 
++   * 1. hostname is not null and,
++   * 2. post > 0
++   * 3. startcode > 0
++   * 
++   * @return true if the server name is valid
++   */
++  public boolean isValid() {
++    if(StringUtils.isNotBlank(hostname) && port > 0 && startcode > 0) 
++      return true;
++    return false;
++  }
++  
++
++  /**
+    * Use this method instantiating a {@link ServerName} from bytes
+    * gotten from a call to {@link #getVersionedBytes()}.  Will take care of the
+    * case where bytes were written by an earlier version of hbase.
+@@ -287,4 +308,4 @@
+     return SERVERNAME_PATTERN.matcher(str).matches()? new ServerName(str):
+       new ServerName(str, NON_STARTCODE);
+   }
+-}
+\ No newline at end of file
++}
+Index: src/main/java/org/apache/hadoop/hbase/ipc/HRegionInterface.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/ipc/HRegionInterface.java	(revision 1222676)
++++ src/main/java/org/apache/hadoop/hbase/ipc/HRegionInterface.java	(working copy)
+@@ -472,10 +472,33 @@
+    * @throws IOException
+    * @deprecated use {@link #flushRegion(byte[])} instead
+    */
+-  void flushRegion(HRegionInfo regionInfo)
+-  throws NotServingRegionException, IOException;
+-
++  boolean flushRegion(HRegionInfo regionInfo)
++    throws NotServingRegionException, IOException;
++  
++ 
+   /**
++   * Flushes the Memstore of a list of regions on the region server
++   * 
++   * @param regions A list of regions to be flushed
++   * @return true if all the regions were flushed
++   * @throws NotServingRegionException
++   * @throws IOException 
++   */
++  boolean flushRegions(List<HRegionInfo> regions)
++      throws NotServingRegionException, IOException;
++  
++  /**
++   * Flushes the Memstore of all the regions which are online on the 
++   * region server
++   * 
++   * @return true if all the regions were flushed
++   * @throws NotServingRegionException
++   * @throws IOExceptions
++   */
++  boolean flushAllRegions() 
++    throws NotServingRegionException, IOException;
++  
++  /**
+    * Splits the specified region.
+    * <p>
+    * This method currently flushes the region and then forces a compaction which

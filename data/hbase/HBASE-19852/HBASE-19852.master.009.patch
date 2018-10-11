@@ -1,0 +1,1134 @@
+From 45749ce12f2b39abadd7f1aa7c6faee2a8801b44 Mon Sep 17 00:00:00 2001
+From: Kevin Risden <krisden@apache.org>
+Date: Thu, 14 Dec 2017 10:32:00 -0600
+Subject: [PATCH] HBase Thrift should use a SPNEGO HTTP/hostname principal for
+ checking HTTP Kerberos authentication
+
+Return 401 sooner when AUTHORIZATION header is missing
+
+HBase Thrift server was checking for the AUTHORIZATION header and assuming it was always present
+even when it was the first request. Many clients will not send the AUTHORIZATION header until
+a 401 is received. HBase Thrift in the case of no header was throwing multiple exceptions and
+filling the logs with exceptions. This was fixed by checking that if the AUTHORIZATION header is
+empty then return a 401 immediately if security is enabled.
+---
+ hbase-thrift/pom.xml                          |   5 +
+ .../hbase/thrift/ThriftHttpServlet.java       |  93 ++++--
+ .../hbase/thrift/ThriftServerRunner.java      | 211 +++++++------
+ .../hbase/thrift/TestThriftHttpServer.java    |   8 +-
+ .../thrift/TestThriftSpnegoHttpServer.java    | 283 ++++++++++++++++++
+ 5 files changed, 454 insertions(+), 146 deletions(-)
+ mode change 100644 => 100755 hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java
+ mode change 100644 => 100755 hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java
+ create mode 100644 hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftSpnegoHttpServer.java
+
+diff --git a/hbase-thrift/pom.xml b/hbase-thrift/pom.xml
+index 0142ccdb59..814650d932 100644
+--- a/hbase-thrift/pom.xml
++++ b/hbase-thrift/pom.xml
+@@ -291,6 +291,11 @@
+       <groupId>org.glassfish</groupId>
+       <artifactId>javax.el</artifactId>
+     </dependency>
++    <dependency>
++      <groupId>org.apache.kerby</groupId>
++      <artifactId>kerb-simplekdc</artifactId>
++      <scope>test</scope>
++    </dependency>
+   </dependencies>
+ 
+   <profiles>
+diff --git a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java
+old mode 100644
+new mode 100755
+index 8d68964113..1d8c932f90
+--- a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java
++++ b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -18,6 +18,9 @@
+ 
+ package org.apache.hadoop.hbase.thrift;
+ 
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_KEYTAB_FILE_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_PRINCIPAL_KEY;
++
+ import java.io.IOException;
+ import java.security.PrivilegedExceptionAction;
+ 
+@@ -31,6 +34,7 @@ import org.apache.hadoop.hbase.util.Base64;
+ import org.apache.hadoop.security.UserGroupInformation;
+ import org.apache.hadoop.security.authorize.AuthorizationException;
+ import org.apache.hadoop.security.authorize.ProxyUsers;
++import org.apache.http.HttpHeaders;
+ import org.apache.thrift.TProcessor;
+ import org.apache.thrift.protocol.TProtocolFactory;
+ import org.apache.thrift.server.TServlet;
+@@ -52,26 +56,36 @@ import org.slf4j.LoggerFactory;
+ public class ThriftHttpServlet extends TServlet {
+   private static final long serialVersionUID = 1L;
+   private static final Logger LOG = LoggerFactory.getLogger(ThriftHttpServlet.class.getName());
+-  private transient final UserGroupInformation realUser;
+-  private transient final Configuration conf;
+-  private final boolean securityEnabled;
++  private final transient UserGroupInformation serviceUGI;
++  private final transient UserGroupInformation httpUGI;
++  private final transient ThriftServerRunner.HBaseHandler hbaseHandler;
+   private final boolean doAsEnabled;
+-  private transient ThriftServerRunner.HBaseHandler hbaseHandler;
++  private final boolean securityEnabled;
++  private String outToken;
+ 
+   // HTTP Header related constants.
+-  public static final String WWW_AUTHENTICATE = "WWW-Authenticate";
+-  public static final String AUTHORIZATION = "Authorization";
+   public static final String NEGOTIATE = "Negotiate";
+ 
+   public ThriftHttpServlet(TProcessor processor, TProtocolFactory protocolFactory,
+-      UserGroupInformation realUser, Configuration conf, ThriftServerRunner.HBaseHandler
+-      hbaseHandler, boolean securityEnabled, boolean doAsEnabled) {
++      UserGroupInformation serviceUGI, Configuration conf,
++      ThriftServerRunner.HBaseHandler hbaseHandler, boolean securityEnabled, boolean doAsEnabled)
++      throws IOException {
+     super(processor, protocolFactory);
+-    this.realUser = realUser;
+-    this.conf = conf;
++    this.serviceUGI = serviceUGI;
+     this.hbaseHandler = hbaseHandler;
+     this.securityEnabled = securityEnabled;
+     this.doAsEnabled = doAsEnabled;
++
++    if (securityEnabled) {
++      // login the spnego principal
++      UserGroupInformation.setConfiguration(conf);
++      this.httpUGI = UserGroupInformation.loginUserFromKeytabAndReturnUGI(
++          conf.get(THRIFT_SPNEGO_PRINCIPAL_KEY),
++          conf.get(THRIFT_SPNEGO_KEYTAB_FILE_KEY)
++      );
++    } else {
++      this.httpUGI = null;
++    }
+   }
+ 
+   @Override
+@@ -79,6 +93,19 @@ public class ThriftHttpServlet extends TServlet {
+       throws ServletException, IOException {
+     String effectiveUser = request.getRemoteUser();
+     if (securityEnabled) {
++      /*
++      Check that the AUTHORIZATION header has any content. If it does not then return a 401
++      requesting AUTHORIZATION header to be sent. This is typical where the first request doesn't
++      send the AUTHORIZATION header initially.
++       */
++      String authHeader = request.getHeader(HttpHeaders.AUTHORIZATION);
++      if (authHeader == null || authHeader.isEmpty()) {
++        // Send a 401 to the client
++        response.addHeader(HttpHeaders.WWW_AUTHENTICATE, NEGOTIATE);
++        response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
++        return;
++      }
++
+       try {
+         // As Thrift HTTP transport doesn't support SPNEGO yet (THRIFT-889),
+         // Kerberos authentication is being done at servlet level.
+@@ -86,24 +113,27 @@ public class ThriftHttpServlet extends TServlet {
+         effectiveUser = identity.principal;
+         // It is standard for client applications expect this header.
+         // Please see http://tools.ietf.org/html/rfc4559 for more details.
+-        response.addHeader(WWW_AUTHENTICATE,  NEGOTIATE + " " + identity.outToken);
++        response.addHeader(HttpHeaders.WWW_AUTHENTICATE,  NEGOTIATE + " " + outToken);
+       } catch (HttpAuthenticationException e) {
+         LOG.error("Kerberos Authentication failed", e);
+         // Send a 401 to the client
+-        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+-        response.addHeader(WWW_AUTHENTICATE, NEGOTIATE);
+-        response.getWriter().println("Authentication Error: " + e.getMessage());
++        response.addHeader(HttpHeaders.WWW_AUTHENTICATE, NEGOTIATE);
++        response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
++            "Authentication Error: " + e.getMessage());
+         return;
+       }
+     }
+-    String doAsUserFromQuery = request.getHeader("doAs");
++
+     if(effectiveUser == null) {
+-      effectiveUser = realUser.getShortUserName();
++      effectiveUser = serviceUGI.getShortUserName();
+     }
++
++    String doAsUserFromQuery = request.getHeader("doAs");
+     if (doAsUserFromQuery != null) {
+       if (!doAsEnabled) {
+         throw new ServletException("Support for proxyuser is not configured");
+       }
++
+       // The authenticated remote user is attempting to perform 'doAs' proxy user.
+       UserGroupInformation remoteUser = UserGroupInformation.createRemoteUser(effectiveUser);
+       // create and attempt to authorize a proxy user (the client is attempting
+@@ -112,9 +142,9 @@ public class ThriftHttpServlet extends TServlet {
+           remoteUser);
+       // validate the proxy user authorization
+       try {
+-        ProxyUsers.authorize(ugi, request.getRemoteAddr(), conf);
++        ProxyUsers.authorize(ugi, request.getRemoteAddr());
+       } catch (AuthorizationException e) {
+-        throw new ServletException(e.getMessage());
++        throw new ServletException(e);
+       }
+       effectiveUser = doAsUserFromQuery;
+     }
+@@ -124,17 +154,18 @@ public class ThriftHttpServlet extends TServlet {
+ 
+   /**
+    * Do the GSS-API kerberos authentication.
+-   * We already have a logged in subject in the form of serviceUGI,
++   * We already have a logged in subject in the form of httpUGI,
+    * which GSS-API will extract information from.
+    */
+   private RemoteUserIdentity doKerberosAuth(HttpServletRequest request)
+-      throws HttpAuthenticationException {
+-    HttpKerberosServerAction action = new HttpKerberosServerAction(request, realUser);
++    throws HttpAuthenticationException {
+     try {
+-      String principal = realUser.doAs(action);
++      HttpKerberosServerAction action = new HttpKerberosServerAction(request, httpUGI);
++      String principal = httpUGI.doAs(action);
++      outToken = action.outToken;
+       return new RemoteUserIdentity(principal, action.outToken);
+     } catch (Exception e) {
+-      LOG.error("Failed to perform authentication");
++      LOG.info("Failed to authenticate with {} kerberos principal", httpUGI.getUserName());
+       throw new HttpAuthenticationException(e);
+     }
+   }
+@@ -154,12 +185,12 @@ public class ThriftHttpServlet extends TServlet {
+   }
+ 
+   private static class HttpKerberosServerAction implements PrivilegedExceptionAction<String> {
+-    HttpServletRequest request;
+-    UserGroupInformation serviceUGI;
++    final HttpServletRequest request;
++    final UserGroupInformation httpUGI;
+     String outToken = null;
+-    HttpKerberosServerAction(HttpServletRequest request, UserGroupInformation serviceUGI) {
++    HttpKerberosServerAction(HttpServletRequest request, UserGroupInformation httpUGI) {
+       this.request = request;
+-      this.serviceUGI = serviceUGI;
++      this.httpUGI = httpUGI;
+     }
+ 
+     @Override
+@@ -167,7 +198,7 @@ public class ThriftHttpServlet extends TServlet {
+       // Get own Kerberos credentials for accepting connection
+       GSSManager manager = GSSManager.getInstance();
+       GSSContext gssContext = null;
+-      String serverPrincipal = SecurityUtil.getPrincipalWithoutRealm(serviceUGI.getUserName());
++      String serverPrincipal = SecurityUtil.getPrincipalWithoutRealm(httpUGI.getUserName());
+       try {
+         // This Oid for Kerberos GSS-API mechanism.
+         Oid kerberosMechOid = new Oid("1.2.840.113554.1.2.2");
+@@ -218,7 +249,7 @@ public class ThriftHttpServlet extends TServlet {
+      */
+     private String getAuthHeader(HttpServletRequest request)
+         throws HttpAuthenticationException {
+-      String authHeader = request.getHeader(AUTHORIZATION);
++      String authHeader = request.getHeader(HttpHeaders.AUTHORIZATION);
+       // Each http request must have an Authorization header
+       if (authHeader == null || authHeader.isEmpty()) {
+         throw new HttpAuthenticationException("Authorization header received " +
+@@ -228,7 +259,7 @@ public class ThriftHttpServlet extends TServlet {
+       int beginIndex = (NEGOTIATE + " ").length();
+       authHeaderBase64String = authHeader.substring(beginIndex);
+       // Authorization header must have a payload
+-      if (authHeaderBase64String == null || authHeaderBase64String.isEmpty()) {
++      if (authHeaderBase64String.isEmpty()) {
+         throw new HttpAuthenticationException("Authorization header received " +
+             "from the client does not contain any data.");
+       }
+diff --git a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java
+old mode 100644
+new mode 100755
+index 49f20a23b1..5e248f1fed
+--- a/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java
++++ b/hbase-thrift/src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java
+@@ -1,4 +1,4 @@
+-/**
++/*
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -110,7 +110,6 @@ import org.apache.thrift.TException;
+ import org.apache.thrift.TProcessor;
+ import org.apache.thrift.protocol.TBinaryProtocol;
+ import org.apache.thrift.protocol.TCompactProtocol;
+-import org.apache.thrift.protocol.TProtocol;
+ import org.apache.thrift.protocol.TProtocolFactory;
+ import org.apache.thrift.server.THsHaServer;
+ import org.apache.thrift.server.TNonblockingServer;
+@@ -168,17 +167,28 @@ public class ThriftServerRunner implements Runnable {
+   static final String PORT_CONF_KEY = "hbase.regionserver.thrift.port";
+   static final String COALESCE_INC_KEY = "hbase.regionserver.thrift.coalesceIncrement";
+   static final String USE_HTTP_CONF_KEY = "hbase.regionserver.thrift.http";
+-  static final String HTTP_MIN_THREADS = "hbase.thrift.http_threads.min";
+-  static final String HTTP_MAX_THREADS = "hbase.thrift.http_threads.max";
+-
+-  static final String THRIFT_SSL_ENABLED = "hbase.thrift.ssl.enabled";
+-  static final String THRIFT_SSL_KEYSTORE_STORE = "hbase.thrift.ssl.keystore.store";
+-  static final String THRIFT_SSL_KEYSTORE_PASSWORD = "hbase.thrift.ssl.keystore.password";
+-  static final String THRIFT_SSL_KEYSTORE_KEYPASSWORD = "hbase.thrift.ssl.keystore.keypassword";
+-  static final String THRIFT_SSL_EXCLUDE_CIPHER_SUITES = "hbase.thrift.ssl.exclude.cipher.suites";
+-  static final String THRIFT_SSL_INCLUDE_CIPHER_SUITES = "hbase.thrift.ssl.include.cipher.suites";
+-  static final String THRIFT_SSL_EXCLUDE_PROTOCOLS = "hbase.thrift.ssl.exclude.protocols";
+-  static final String THRIFT_SSL_INCLUDE_PROTOCOLS = "hbase.thrift.ssl.include.protocols";
++  static final String HTTP_MIN_THREADS_KEY = "hbase.thrift.http_threads.min";
++  static final String HTTP_MAX_THREADS_KEY = "hbase.thrift.http_threads.max";
++
++  static final String THRIFT_SSL_ENABLED_KEY = "hbase.thrift.ssl.enabled";
++  static final String THRIFT_SSL_KEYSTORE_STORE_KEY = "hbase.thrift.ssl.keystore.store";
++  static final String THRIFT_SSL_KEYSTORE_PASSWORD_KEY = "hbase.thrift.ssl.keystore.password";
++  static final String THRIFT_SSL_KEYSTORE_KEYPASSWORD_KEY = "hbase.thrift.ssl.keystore.keypassword";
++  static final String THRIFT_SSL_EXCLUDE_CIPHER_SUITES_KEY =
++      "hbase.thrift.ssl.exclude.cipher.suites";
++  static final String THRIFT_SSL_INCLUDE_CIPHER_SUITES_KEY =
++      "hbase.thrift.ssl.include.cipher.suites";
++  static final String THRIFT_SSL_EXCLUDE_PROTOCOLS_KEY = "hbase.thrift.ssl.exclude.protocols";
++  static final String THRIFT_SSL_INCLUDE_PROTOCOLS_KEY = "hbase.thrift.ssl.include.protocols";
++
++  static final String THRIFT_SUPPORT_PROXYUSER_KEY = "hbase.thrift.support.proxyuser";
++
++  static final String THRIFT_DNS_INTERFACE_KEY = "hbase.thrift.dns.interface";
++  static final String THRIFT_DNS_NAMESERVER_KEY = "hbase.thrift.dns.nameserver";
++  static final String THRIFT_KERBEROS_PRINCIPAL_KEY = "hbase.thrift.kerberos.principal";
++  static final String THRIFT_KEYTAB_FILE_KEY = "hbase.thrift.keytab.file";
++  static final String THRIFT_SPNEGO_PRINCIPAL_KEY = "hbase.thrift.spnego.principal";
++  static final String THRIFT_SPNEGO_KEYTAB_FILE_KEY = "hbase.thrift.spnego.keytab.file";
+ 
+   /**
+    * Amount of time in milliseconds before a server thread will timeout
+@@ -205,7 +215,7 @@ public class ThriftServerRunner implements Runnable {
+   private static final String DEFAULT_BIND_ADDR = "0.0.0.0";
+   public static final int DEFAULT_LISTEN_PORT = 9090;
+   public static final int HREGION_VERSION = 1;
+-  static final String THRIFT_SUPPORT_PROXYUSER = "hbase.thrift.support.proxyuser";
++
+   private final int listenPort;
+ 
+   private Configuration conf;
+@@ -214,7 +224,7 @@ public class ThriftServerRunner implements Runnable {
+   private final Hbase.Iface handler;
+   private final ThriftMetrics metrics;
+   private final HBaseHandler hbaseHandler;
+-  private final UserGroupInformation realUser;
++  private final UserGroupInformation serviceUGI;
+ 
+   private SaslUtil.QualityOfProtection qop;
+   private String host;
+@@ -232,8 +242,7 @@ public class ThriftServerRunner implements Runnable {
+     HS_HA("hsha", true, THsHaServer.class, true),
+     NONBLOCKING("nonblocking", true, TNonblockingServer.class, true),
+     THREAD_POOL("threadpool", false, TBoundedThreadPoolServer.class, true),
+-    THREADED_SELECTOR(
+-        "threadedselector", true, TThreadedSelectorServer.class, true);
++    THREADED_SELECTOR("threadedselector", true, TThreadedSelectorServer.class, true);
+ 
+     public static final ImplType DEFAULT = THREAD_POOL;
+ 
+@@ -251,8 +260,7 @@ public class ThriftServerRunner implements Runnable {
+     }
+ 
+     /**
+-     * @return <code>-option</code> so we can get the list of options from
+-     *         {@link #values()}
++     * @return <code>-option</code>
+      */
+     @Override
+     public String toString() {
+@@ -330,46 +338,44 @@ public class ThriftServerRunner implements Runnable {
+       }
+       return l;
+     }
+-
+   }
+ 
+   public ThriftServerRunner(Configuration conf) throws IOException {
+-    UserProvider userProvider = UserProvider.instantiate(conf);
+     // login the server principal (if using secure Hadoop)
++    UserProvider userProvider = UserProvider.instantiate(conf);
+     securityEnabled = userProvider.isHadoopSecurityEnabled()
+-      && userProvider.isHBaseSecurityEnabled();
++        && userProvider.isHBaseSecurityEnabled();
+     if (securityEnabled) {
+       host = Strings.domainNamePointerToHostName(DNS.getDefaultHost(
+-        conf.get("hbase.thrift.dns.interface", "default"),
+-        conf.get("hbase.thrift.dns.nameserver", "default")));
+-      userProvider.login("hbase.thrift.keytab.file",
+-        "hbase.thrift.kerberos.principal", host);
++        conf.get(THRIFT_DNS_INTERFACE_KEY, "default"),
++        conf.get(THRIFT_DNS_NAMESERVER_KEY, "default")));
++      userProvider.login(THRIFT_KEYTAB_FILE_KEY, THRIFT_KERBEROS_PRINCIPAL_KEY, host);
+     }
++    this.serviceUGI = userProvider.getCurrent().getUGI();
++
+     this.conf = HBaseConfiguration.create(conf);
+     this.listenPort = conf.getInt(PORT_CONF_KEY, DEFAULT_LISTEN_PORT);
+     this.metrics = new ThriftMetrics(conf, ThriftMetrics.ThriftServerType.ONE);
+     this.pauseMonitor = new JvmPauseMonitor(conf, this.metrics.getSource());
+     this.hbaseHandler = new HBaseHandler(conf, userProvider);
+     this.hbaseHandler.initMetrics(metrics);
+-    this.handler = HbaseHandlerMetricsProxy.newInstance(
+-      hbaseHandler, metrics, conf);
+-    this.realUser = userProvider.getCurrent().getUGI();
++    this.handler = HbaseHandlerMetricsProxy.newInstance(hbaseHandler, metrics, conf);
++
++    boolean httpEnabled = conf.getBoolean(USE_HTTP_CONF_KEY, false);
++    doAsEnabled = conf.getBoolean(THRIFT_SUPPORT_PROXYUSER_KEY, false);
++    if (doAsEnabled && !httpEnabled) {
++      LOG.warn("Fail to enable the doAs feature. " + USE_HTTP_CONF_KEY + " is not configured");
++    }
++
+     String strQop = conf.get(THRIFT_QOP_KEY);
+     if (strQop != null) {
+       this.qop = SaslUtil.getQop(strQop);
+     }
+-    doAsEnabled = conf.getBoolean(THRIFT_SUPPORT_PROXYUSER, false);
+-    if (doAsEnabled) {
+-      if (!conf.getBoolean(USE_HTTP_CONF_KEY, false)) {
+-        LOG.warn("Fail to enable the doAs feature. hbase.regionserver.thrift.http is not " +
+-                "configured ");
+-      }
+-    }
+     if (qop != null) {
+       if (qop != QualityOfProtection.AUTHENTICATION &&
+           qop != QualityOfProtection.INTEGRITY &&
+           qop != QualityOfProtection.PRIVACY) {
+-        throw new IOException(String.format("Invalide %s: It must be one of %s, %s, or %s.",
++        throw new IOException(String.format("Invalid %s: It must be one of %s, %s, or %s.",
+                               THRIFT_QOP_KEY,
+                               QualityOfProtection.AUTHENTICATION.name(),
+                               QualityOfProtection.INTEGRITY.name(),
+@@ -377,8 +383,7 @@ public class ThriftServerRunner implements Runnable {
+       }
+       checkHttpSecurity(qop, conf);
+       if (!securityEnabled) {
+-        throw new IOException("Thrift server must"
+-          + " run in secure mode to support authentication");
++        throw new IOException("Thrift server must run in secure mode to support authentication");
+       }
+     }
+   }
+@@ -386,9 +391,9 @@ public class ThriftServerRunner implements Runnable {
+   private void checkHttpSecurity(QualityOfProtection qop, Configuration conf) {
+     if (qop == QualityOfProtection.PRIVACY &&
+         conf.getBoolean(USE_HTTP_CONF_KEY, false) &&
+-        !conf.getBoolean(THRIFT_SSL_ENABLED, false)) {
++        !conf.getBoolean(THRIFT_SSL_ENABLED_KEY, false)) {
+       throw new IllegalArgumentException("Thrift HTTP Server's QoP is privacy, but " +
+-          THRIFT_SSL_ENABLED + " is false");
++          THRIFT_SSL_ENABLED_KEY + " is false");
+     }
+   }
+ 
+@@ -397,7 +402,7 @@ public class ThriftServerRunner implements Runnable {
+    */
+   @Override
+   public void run() {
+-    realUser.doAs(new PrivilegedAction<Object>() {
++    serviceUGI.doAs(new PrivilegedAction<Object>() {
+       @Override
+       public Object run() {
+         try {
+@@ -434,7 +439,7 @@ public class ThriftServerRunner implements Runnable {
+         httpServer.stop();
+         httpServer = null;
+       } catch (Exception e) {
+-        LOG.error("Problem encountered in shutting down HTTP server " + e.getCause());
++        LOG.error("Problem encountered in shutting down HTTP server", e);
+       }
+       httpServer = null;
+     }
+@@ -443,7 +448,7 @@ public class ThriftServerRunner implements Runnable {
+   private void setupHTTPServer() throws IOException {
+     TProtocolFactory protocolFactory = new TBinaryProtocol.Factory();
+     TProcessor processor = new Hbase.Processor<>(handler);
+-    TServlet thriftHttpServlet = new ThriftHttpServlet(processor, protocolFactory, realUser,
++    TServlet thriftHttpServlet = new ThriftHttpServlet(processor, protocolFactory, serviceUGI,
+         conf, hbaseHandler, securityEnabled, doAsEnabled);
+ 
+     // Set the default max thread number to 100 to limit
+@@ -451,8 +456,8 @@ public class ThriftServerRunner implements Runnable {
+     // Jetty set the default max thread number to 250, if we don't set it.
+     //
+     // Our default min thread number 2 is the same as that used by Jetty.
+-    int minThreads = conf.getInt(HTTP_MIN_THREADS, 2);
+-    int maxThreads = conf.getInt(HTTP_MAX_THREADS, 100);
++    int minThreads = conf.getInt(HTTP_MIN_THREADS_KEY, 2);
++    int maxThreads = conf.getInt(HTTP_MAX_THREADS_KEY, 100);
+     QueuedThreadPool threadPool = new QueuedThreadPool(maxThreads);
+     threadPool.setMinThreads(minThreads);
+     httpServer = new Server(threadPool);
+@@ -475,39 +480,39 @@ public class ThriftServerRunner implements Runnable {
+     httpConfig.setSendDateHeader(false);
+ 
+     ServerConnector serverConnector;
+-    if(conf.getBoolean(THRIFT_SSL_ENABLED, false)) {
++    if(conf.getBoolean(THRIFT_SSL_ENABLED_KEY, false)) {
+       HttpConfiguration httpsConfig = new HttpConfiguration(httpConfig);
+       httpsConfig.addCustomizer(new SecureRequestCustomizer());
+ 
+       SslContextFactory sslCtxFactory = new SslContextFactory();
+-      String keystore = conf.get(THRIFT_SSL_KEYSTORE_STORE);
++      String keystore = conf.get(THRIFT_SSL_KEYSTORE_STORE_KEY);
+       String password = HBaseConfiguration.getPassword(conf,
+-          THRIFT_SSL_KEYSTORE_PASSWORD, null);
++          THRIFT_SSL_KEYSTORE_PASSWORD_KEY, null);
+       String keyPassword = HBaseConfiguration.getPassword(conf,
+-          THRIFT_SSL_KEYSTORE_KEYPASSWORD, password);
++          THRIFT_SSL_KEYSTORE_KEYPASSWORD_KEY, password);
+       sslCtxFactory.setKeyStorePath(keystore);
+       sslCtxFactory.setKeyStorePassword(password);
+       sslCtxFactory.setKeyManagerPassword(keyPassword);
+ 
+       String[] excludeCiphers = conf.getStrings(
+-          THRIFT_SSL_EXCLUDE_CIPHER_SUITES, ArrayUtils.EMPTY_STRING_ARRAY);
++          THRIFT_SSL_EXCLUDE_CIPHER_SUITES_KEY, ArrayUtils.EMPTY_STRING_ARRAY);
+       if (excludeCiphers.length != 0) {
+         sslCtxFactory.setExcludeCipherSuites(excludeCiphers);
+       }
+       String[] includeCiphers = conf.getStrings(
+-          THRIFT_SSL_INCLUDE_CIPHER_SUITES, ArrayUtils.EMPTY_STRING_ARRAY);
++          THRIFT_SSL_INCLUDE_CIPHER_SUITES_KEY, ArrayUtils.EMPTY_STRING_ARRAY);
+       if (includeCiphers.length != 0) {
+         sslCtxFactory.setIncludeCipherSuites(includeCiphers);
+       }
+ 
+       // Disable SSLv3 by default due to "Poodle" Vulnerability - CVE-2014-3566
+       String[] excludeProtocols = conf.getStrings(
+-          THRIFT_SSL_EXCLUDE_PROTOCOLS, "SSLv3");
++          THRIFT_SSL_EXCLUDE_PROTOCOLS_KEY, "SSLv3");
+       if (excludeProtocols.length != 0) {
+         sslCtxFactory.setExcludeProtocols(excludeProtocols);
+       }
+       String[] includeProtocols = conf.getStrings(
+-          THRIFT_SSL_INCLUDE_PROTOCOLS, ArrayUtils.EMPTY_STRING_ARRAY);
++          THRIFT_SSL_INCLUDE_PROTOCOLS_KEY, ArrayUtils.EMPTY_STRING_ARRAY);
+       if (includeProtocols.length != 0) {
+         sslCtxFactory.setIncludeProtocols(includeProtocols);
+       }
+@@ -519,8 +524,7 @@ public class ThriftServerRunner implements Runnable {
+       serverConnector = new ServerConnector(httpServer, new HttpConnectionFactory(httpConfig));
+     }
+     serverConnector.setPort(listenPort);
+-    String host = getBindAddress(conf).getHostAddress();
+-    serverConnector.setHost(host);
++    serverConnector.setHost(getBindAddress(conf).getHostAddress());
+     httpServer.addConnector(serverConnector);
+     httpServer.setStopAtShutdown(true);
+ 
+@@ -528,7 +532,7 @@ public class ThriftServerRunner implements Runnable {
+       ProxyUsers.refreshSuperUserGroupsConfiguration(conf);
+     }
+ 
+-    LOG.info("Starting Thrift HTTP Server on " + Integer.toString(listenPort));
++    LOG.info("Starting Thrift HTTP Server on {}", Integer.toString(listenPort));
+   }
+ 
+   /**
+@@ -556,8 +560,11 @@ public class ThriftServerRunner implements Runnable {
+       transportFactory = new TTransportFactory();
+     } else {
+       // Extract the name from the principal
+-      String name = SecurityUtil.getUserFromPrincipal(
+-        conf.get("hbase.thrift.kerberos.principal"));
++      String thriftKerberosPrincipal = conf.get(THRIFT_KERBEROS_PRINCIPAL_KEY);
++      if (thriftKerberosPrincipal == null) {
++        throw new IllegalArgumentException(THRIFT_KERBEROS_PRINCIPAL_KEY + " cannot be null");
++      }
++      String name = SecurityUtil.getUserFromPrincipal(thriftKerberosPrincipal);
+       Map<String, String> saslProperties = SaslUtil.initSaslProperties(qop.name());
+       TSaslServerTransport.Factory saslFactory = new TSaslServerTransport.Factory();
+       saslFactory.addServerDefinition("GSSAPI", name, host, saslProperties,
+@@ -582,7 +589,7 @@ public class ThriftServerRunner implements Runnable {
+               } else {
+                 ac.setAuthorized(true);
+                 String userName = SecurityUtil.getUserFromPrincipal(authzid);
+-                LOG.info("Effective user: " + userName);
++                LOG.info("Effective user: {}", userName);
+                 ac.setAuthorizedID(userName);
+               }
+             }
+@@ -591,27 +598,21 @@ public class ThriftServerRunner implements Runnable {
+       transportFactory = saslFactory;
+ 
+       // Create a processor wrapper, to get the caller
+-      processor = new TProcessor() {
+-        @Override
+-        public boolean process(TProtocol inProt,
+-            TProtocol outProt) throws TException {
+-          TSaslServerTransport saslServerTransport =
+-            (TSaslServerTransport)inProt.getTransport();
+-          SaslServer saslServer = saslServerTransport.getSaslServer();
+-          String principal = saslServer.getAuthorizationID();
+-          hbaseHandler.setEffectiveUser(principal);
+-          return p.process(inProt, outProt);
+-        }
++      processor = (inProt, outProt) -> {
++        TSaslServerTransport saslServerTransport =
++          (TSaslServerTransport)inProt.getTransport();
++        SaslServer saslServer = saslServerTransport.getSaslServer();
++        String principal = saslServer.getAuthorizationID();
++        hbaseHandler.setEffectiveUser(principal);
++        return p.process(inProt, outProt);
+       };
+     }
+ 
+     if (conf.get(BIND_CONF_KEY) != null && !implType.canSpecifyBindIP) {
+-      LOG.error("Server types " + Joiner.on(", ").join(
+-          ImplType.serversThatCannotSpecifyBindIP()) + " don't support IP " +
+-          "address binding at the moment. See " +
+-          "https://issues.apache.org/jira/browse/HBASE-2155 for details.");
+-      throw new RuntimeException(
+-          "-" + BIND_CONF_KEY + " not supported with " + implType);
++      LOG.error("Server types {} don't support IP address binding at the moment. See " +
++          "https://issues.apache.org/jira/browse/HBASE-2155 for details.",
++          Joiner.on(", ").join(ImplType.serversThatCannotSpecifyBindIP()));
++      throw new RuntimeException("-" + BIND_CONF_KEY + " not supported with " + implType);
+     }
+ 
+     // Thrift's implementation uses '0' as a placeholder for 'use the default.'
+@@ -648,8 +649,8 @@ public class ThriftServerRunner implements Runnable {
+                 .transportFactory(transportFactory).protocolFactory(protocolFactory);
+         tserver = new TThreadedSelectorServer(serverArgs);
+       }
+-      LOG.info("starting HBase " + implType.simpleClassName() +
+-          " server on " + Integer.toString(listenPort));
++      LOG.info("starting HBase {} server on {}", implType.simpleClassName(),
++          Integer.toString(listenPort));
+     } else if (implType == ImplType.THREAD_POOL) {
+       // Thread pool server. Get the IP address to bind to.
+       InetAddress listenAddress = getBindAddress(conf);
+@@ -745,11 +746,11 @@ public class ThriftServerRunner implements Runnable {
+ 
+     // nextScannerId and scannerMap are used to manage scanner state
+     protected int nextScannerId = 0;
+-    protected HashMap<Integer, ResultScannerWrapper> scannerMap = null;
++    protected HashMap<Integer, ResultScannerWrapper> scannerMap;
+     private ThriftMetrics metrics = null;
+ 
+     private final ConnectionCache connectionCache;
+-    IncrementCoalescer coalescer = null;
++    IncrementCoalescer coalescer;
+ 
+     static final String CLEANUP_INTERVAL = "hbase.thrift.connection.cleanup-interval";
+     static final String MAX_IDLETIME = "hbase.thrift.connection.max-idletime";
+@@ -914,8 +915,8 @@ public class ThriftServerRunner implements Runnable {
+       try {
+         TableName[] tableNames = this.getAdmin().listTableNames();
+         ArrayList<ByteBuffer> list = new ArrayList<>(tableNames.length);
+-        for (int i = 0; i < tableNames.length; i++) {
+-          list.add(ByteBuffer.wrap(tableNames[i].getName()));
++        for (TableName tableName : tableNames) {
++          list.add(ByteBuffer.wrap(tableName.getName()));
+         }
+         return list;
+       } catch (IOException e) {
+@@ -928,8 +929,7 @@ public class ThriftServerRunner implements Runnable {
+      * @return the list of regions in the given table, or an empty list if the table does not exist
+      */
+     @Override
+-    public List<TRegionInfo> getTableRegions(ByteBuffer tableName)
+-    throws IOError {
++    public List<TRegionInfo> getTableRegions(ByteBuffer tableName) throws IOError {
+       try (RegionLocator locator = connectionCache.getRegionLocator(getBytes(tableName))) {
+         List<HRegionLocation> regionLocations = locator.getAllRegionLocations();
+         List<TRegionInfo> results = new ArrayList<>(regionLocations.size());
+@@ -1319,7 +1319,7 @@ public class ThriftServerRunner implements Runnable {
+     public void deleteTable(ByteBuffer in_tableName) throws IOError {
+       TableName tableName = getTableName(in_tableName);
+       if (LOG.isDebugEnabled()) {
+-        LOG.debug("deleteTable: table=" + tableName);
++        LOG.debug("deleteTable: table={}", tableName);
+       }
+       try {
+         if (!getAdmin().tableExists(tableName)) {
+@@ -1336,8 +1336,7 @@ public class ThriftServerRunner implements Runnable {
+     public void mutateRow(ByteBuffer tableName, ByteBuffer row,
+         List<Mutation> mutations, Map<ByteBuffer, ByteBuffer> attributes)
+         throws IOError, IllegalArgument {
+-      mutateRowTs(tableName, row, mutations, HConstants.LATEST_TIMESTAMP,
+-                  attributes);
++      mutateRowTs(tableName, row, mutations, HConstants.LATEST_TIMESTAMP, attributes);
+     }
+ 
+     @Override
+@@ -1367,8 +1366,7 @@ public class ThriftServerRunner implements Runnable {
+             } else {
+               delete.addColumns(famAndQf[0], famAndQf[1], timestamp);
+             }
+-            delete.setDurability(m.writeToWAL ? Durability.SYNC_WAL
+-                : Durability.SKIP_WAL);
++            delete.setDurability(m.writeToWAL ? Durability.SYNC_WAL : Durability.SKIP_WAL);
+           } else {
+             if(famAndQf.length == 1) {
+               LOG.warn("No column qualifier specified. Delete is the only mutation supported "
+@@ -1479,7 +1477,6 @@ public class ThriftServerRunner implements Runnable {
+         if (!deletes.isEmpty()) {
+           table.delete(deletes);
+         }
+-
+       } catch (IOException e) {
+         LOG.warn(e.getMessage(), e);
+         throw getIOError(e);
+@@ -1520,11 +1517,10 @@ public class ThriftServerRunner implements Runnable {
+ 
+     @Override
+     public void scannerClose(int id) throws IOError, IllegalArgument {
+-      LOG.debug("scannerClose: id=" + id);
++      LOG.debug("scannerClose: id={}", id);
+       ResultScannerWrapper resultScannerWrapper = getScanner(id);
+       if (resultScannerWrapper == null) {
+-        String message = "scanner ID is invalid";
+-        LOG.warn(message);
++        LOG.warn("scanner ID is invalid");
+         throw new IllegalArgument("scanner ID is invalid");
+       }
+       resultScannerWrapper.getScanner().close();
+@@ -1534,7 +1530,7 @@ public class ThriftServerRunner implements Runnable {
+     @Override
+     public List<TRowResult> scannerGetList(int id,int nbRows)
+         throws IllegalArgument, IOError {
+-      LOG.debug("scannerGetList: id=" + id);
++      LOG.debug("scannerGetList: id={}", id);
+       ResultScannerWrapper resultScannerWrapper = getScanner(id);
+       if (null == resultScannerWrapper) {
+         String message = "scanner ID is invalid";
+@@ -1542,7 +1538,7 @@ public class ThriftServerRunner implements Runnable {
+         throw new IllegalArgument("scanner ID is invalid");
+       }
+ 
+-      Result [] results = null;
++      Result [] results;
+       try {
+         results = resultScannerWrapper.getScanner().next(nbRows);
+         if (null == results) {
+@@ -1585,7 +1581,7 @@ public class ThriftServerRunner implements Runnable {
+         if (tScan.isSetBatchSize()) {
+           scan.setBatch(tScan.getBatchSize());
+         }
+-        if (tScan.isSetColumns() && tScan.getColumns().size() != 0) {
++        if (tScan.isSetColumns() && !tScan.getColumns().isEmpty()) {
+           for(ByteBuffer column : tScan.getColumns()) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1625,7 +1621,7 @@ public class ThriftServerRunner implements Runnable {
+         table = getTable(tableName);
+         Scan scan = new Scan(getBytes(startRow));
+         addAttributes(scan, attributes);
+-        if(columns != null && columns.size() != 0) {
++        if(columns != null && !columns.isEmpty()) {
+           for(ByteBuffer column : columns) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1655,7 +1651,7 @@ public class ThriftServerRunner implements Runnable {
+         table = getTable(tableName);
+         Scan scan = new Scan(getBytes(startRow), getBytes(stopRow));
+         addAttributes(scan, attributes);
+-        if(columns != null && columns.size() != 0) {
++        if(columns != null && !columns.isEmpty()) {
+           for(ByteBuffer column : columns) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1689,7 +1685,7 @@ public class ThriftServerRunner implements Runnable {
+         Filter f = new WhileMatchFilter(
+             new PrefixFilter(getBytes(startAndPrefix)));
+         scan.setFilter(f);
+-        if (columns != null && columns.size() != 0) {
++        if (columns != null && !columns.isEmpty()) {
+           for(ByteBuffer column : columns) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1719,7 +1715,7 @@ public class ThriftServerRunner implements Runnable {
+         Scan scan = new Scan(getBytes(startRow));
+         addAttributes(scan, attributes);
+         scan.setTimeRange(0, timestamp);
+-        if (columns != null && columns.size() != 0) {
++        if (columns != null && !columns.isEmpty()) {
+           for (ByteBuffer column : columns) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1750,7 +1746,7 @@ public class ThriftServerRunner implements Runnable {
+         Scan scan = new Scan(getBytes(startRow), getBytes(stopRow));
+         addAttributes(scan, attributes);
+         scan.setTimeRange(0, timestamp);
+-        if (columns != null && columns.size() != 0) {
++        if (columns != null && !columns.isEmpty()) {
+           for (ByteBuffer column : columns) {
+             byte [][] famQf = CellUtil.parseColumn(getBytes(column));
+             if(famQf.length == 1) {
+@@ -1850,13 +1846,9 @@ public class ThriftServerRunner implements Runnable {
+       scan.setReversed(true);
+       scan.addFamily(family);
+       scan.setStartRow(row);
+-      Table table = getTable(tableName);
+-      try (ResultScanner scanner = table.getScanner(scan)) {
++      try (Table table = getTable(tableName);
++           ResultScanner scanner = table.getScanner(scan)) {
+         return scanner.next();
+-      } finally{
+-        if(table != null){
+-          table.close();
+-        }
+       }
+     }
+ 
+@@ -1968,7 +1960,6 @@ public class ThriftServerRunner implements Runnable {
+     }
+   }
+ 
+-
+   private static IOError getIOError(Throwable throwable) {
+     IOError error = new IOErrorWithCause(throwable);
+     error.setMessage(Throwables.getStackTraceAsString(throwable));
+@@ -2006,7 +1997,7 @@ public class ThriftServerRunner implements Runnable {
+   }
+ 
+   public static class IOErrorWithCause extends IOError {
+-    private Throwable cause;
++    private final Throwable cause;
+     public IOErrorWithCause(Throwable cause) {
+       this.cause = cause;
+     }
+diff --git a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftHttpServer.java b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftHttpServer.java
+index 2366ee70b5..9d081ba04f 100644
+--- a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftHttpServer.java
++++ b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftHttpServer.java
+@@ -58,7 +58,6 @@ import org.apache.hbase.thirdparty.com.google.common.base.Joiner;
+  */
+ @Category({ClientTests.class, LargeTests.class})
+ public class TestThriftHttpServer {
+-
+   @ClassRule
+   public static final HBaseClassTestRule CLASS_RULE =
+       HBaseClassTestRule.forClass(TestThriftHttpServer.class);
+@@ -66,8 +65,7 @@ public class TestThriftHttpServer {
+   private static final Logger LOG =
+       LoggerFactory.getLogger(TestThriftHttpServer.class);
+ 
+-  private static final HBaseTestingUtility TEST_UTIL =
+-      new HBaseTestingUtility();
++  static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+ 
+   private Thread httpServerThread;
+   private volatile Exception httpServerException;
+@@ -75,7 +73,7 @@ public class TestThriftHttpServer {
+   private Exception clientSideException;
+ 
+   private ThriftServer thriftServer;
+-  private int port;
++  int port;
+ 
+   @BeforeClass
+   public static void setUpBeforeClass() throws Exception {
+@@ -152,7 +150,7 @@ public class TestThriftHttpServer {
+     runThriftServer(0);
+   }
+ 
+-  private void runThriftServer(int customHeaderSize) throws Exception {
++  void runThriftServer(int customHeaderSize) throws Exception {
+     List<String> args = new ArrayList<>(3);
+     port = HBaseTestingUtility.randomFreePort();
+     args.add("-" + ThriftServer.PORT_OPTION);
+diff --git a/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftSpnegoHttpServer.java b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftSpnegoHttpServer.java
+new file mode 100644
+index 0000000000..2958eab742
+--- /dev/null
++++ b/hbase-thrift/src/test/java/org/apache/hadoop/hbase/thrift/TestThriftSpnegoHttpServer.java
+@@ -0,0 +1,283 @@
++/*
++ * Copyright The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with this
++ * work for additional information regarding copyright ownership. The ASF
++ * licenses this file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.hadoop.hbase.thrift;
++
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_KERBEROS_PRINCIPAL_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_KEYTAB_FILE_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_KEYTAB_FILE_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SPNEGO_PRINCIPAL_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.THRIFT_SUPPORT_PROXYUSER_KEY;
++import static org.apache.hadoop.hbase.thrift.ThriftServerRunner.USE_HTTP_CONF_KEY;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++import java.io.File;
++import java.security.Principal;
++import java.security.PrivilegedExceptionAction;
++import java.util.Set;
++
++import javax.security.auth.Subject;
++import javax.security.auth.kerberos.KerberosTicket;
++
++import org.apache.commons.io.FileUtils;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.HBaseClassTestRule;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.security.HBaseKerberosUtils;
++import org.apache.hadoop.hbase.testclassification.ClientTests;
++import org.apache.hadoop.hbase.testclassification.LargeTests;
++import org.apache.hadoop.hbase.thrift.generated.Hbase;
++import org.apache.hadoop.hdfs.DFSConfigKeys;
++import org.apache.hadoop.security.authentication.util.KerberosName;
++import org.apache.http.HttpHeaders;
++import org.apache.http.auth.AuthSchemeProvider;
++import org.apache.http.auth.AuthScope;
++import org.apache.http.auth.KerberosCredentials;
++import org.apache.http.client.config.AuthSchemes;
++import org.apache.http.config.Lookup;
++import org.apache.http.config.RegistryBuilder;
++import org.apache.http.impl.auth.SPNegoSchemeFactory;
++import org.apache.http.impl.client.BasicCredentialsProvider;
++import org.apache.http.impl.client.CloseableHttpClient;
++import org.apache.http.impl.client.HttpClients;
++import org.apache.kerby.kerberos.kerb.KrbException;
++import org.apache.kerby.kerberos.kerb.client.JaasKrbUtil;
++import org.apache.kerby.kerberos.kerb.server.SimpleKdcServer;
++import org.apache.thrift.protocol.TBinaryProtocol;
++import org.apache.thrift.protocol.TProtocol;
++import org.apache.thrift.transport.THttpClient;
++import org.ietf.jgss.GSSCredential;
++import org.ietf.jgss.GSSManager;
++import org.ietf.jgss.GSSName;
++import org.ietf.jgss.Oid;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.ClassRule;
++import org.junit.experimental.categories.Category;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Start the HBase Thrift HTTP server on a random port through the command-line
++ * interface and talk to it from client side with SPNEGO security enabled.
++ */
++@Category({ClientTests.class, LargeTests.class})
++public class TestThriftSpnegoHttpServer extends TestThriftHttpServer {
++  @ClassRule
++  public static final HBaseClassTestRule CLASS_RULE =
++    HBaseClassTestRule.forClass(TestThriftSpnegoHttpServer.class);
++
++  private static final Logger LOG =
++    LoggerFactory.getLogger(TestThriftSpnegoHttpServer.class);
++
++  private static final String KDC_SERVER_HOST = HConstants.LOCALHOST;
++
++  private static SimpleKdcServer kdc;
++  private static File serverKeytab;
++  private static File spnegoServerKeytab;
++  private static File clientKeytab;
++
++  private static String clientPrincipal;
++  private static String serverPrincipal;
++  private static String spnegoServerPrincipal;
++
++  private static void setupUser(SimpleKdcServer kdc, File keytab, String principal)
++      throws KrbException {
++    kdc.createPrincipal(principal);
++    kdc.exportPrincipal(principal, keytab);
++  }
++
++  private static SimpleKdcServer buildMiniKdc() throws Exception {
++    SimpleKdcServer kdc = new SimpleKdcServer();
++
++    final File target = new File(System.getProperty("user.dir"), "target");
++    File kdcDir = new File(target, TestThriftSpnegoHttpServer.class.getSimpleName());
++    if (kdcDir.exists()) {
++      FileUtils.deleteDirectory(kdcDir);
++    }
++    kdcDir.mkdirs();
++    kdc.setWorkDir(kdcDir);
++
++    kdc.setKdcHost(KDC_SERVER_HOST);
++    int kdcPort = HBaseTestingUtility.randomFreePort();
++    kdc.setAllowTcp(true);
++    kdc.setAllowUdp(false);
++    kdc.setKdcTcpPort(kdcPort);
++
++    LOG.info("Starting KDC server at " + KDC_SERVER_HOST + ":" + kdcPort);
++
++    kdc.init();
++
++    return kdc;
++  }
++
++  private static void addSecurityConfigurations(Configuration conf) {
++    KerberosName.setRules("DEFAULT");
++
++    HBaseKerberosUtils.setKeytabFileForTesting(serverKeytab.getAbsolutePath());
++    HBaseKerberosUtils.setPrincipalForTesting(serverPrincipal);
++    HBaseKerberosUtils.setSecuredConfiguration(conf);
++
++    // if we drop support for hadoop-2.4.0 and hadoop-2.4.1,
++    // the following key should be changed.
++    // 1) DFS_NAMENODE_USER_NAME_KEY -> DFS_NAMENODE_KERBEROS_PRINCIPAL_KEY
++    // 2) DFS_DATANODE_USER_NAME_KEY -> DFS_DATANODE_KERBEROS_PRINCIPAL_KEY
++    conf.set(DFSConfigKeys.DFS_NAMENODE_USER_NAME_KEY, serverPrincipal);
++    conf.set(DFSConfigKeys.DFS_NAMENODE_KEYTAB_FILE_KEY, serverKeytab.getAbsolutePath());
++    conf.set(DFSConfigKeys.DFS_DATANODE_USER_NAME_KEY, serverPrincipal);
++    conf.set(DFSConfigKeys.DFS_DATANODE_KEYTAB_FILE_KEY, serverKeytab.getAbsolutePath());
++
++    conf.setBoolean(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY, true);
++
++    conf.set(DFSConfigKeys.DFS_WEB_AUTHENTICATION_KERBEROS_PRINCIPAL_KEY, spnegoServerPrincipal);
++    conf.set(DFSConfigKeys.DFS_WEB_AUTHENTICATION_KERBEROS_KEYTAB_KEY,
++        spnegoServerKeytab.getAbsolutePath());
++
++    conf.setBoolean("ignore.secure.ports.for.testing", true);
++
++    conf.setBoolean(THRIFT_SUPPORT_PROXYUSER_KEY, true);
++    conf.setBoolean(USE_HTTP_CONF_KEY, true);
++    conf.set("hadoop.proxyuser.hbase.hosts", "*");
++    conf.set("hadoop.proxyuser.hbase.groups", "*");
++
++    conf.set(THRIFT_KERBEROS_PRINCIPAL_KEY, serverPrincipal);
++    conf.set(THRIFT_KEYTAB_FILE_KEY, serverKeytab.getAbsolutePath());
++    conf.set(THRIFT_SPNEGO_PRINCIPAL_KEY, spnegoServerPrincipal);
++    conf.set(THRIFT_SPNEGO_KEYTAB_FILE_KEY, spnegoServerKeytab.getAbsolutePath());
++  }
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    final File target = new File(System.getProperty("user.dir"), "target");
++    assertTrue(target.exists());
++
++    File keytabDir = new File(target, TestThriftSpnegoHttpServer.class.getSimpleName() +
++      "_keytabs");
++    if (keytabDir.exists()) {
++      FileUtils.deleteDirectory(keytabDir);
++    }
++    keytabDir.mkdirs();
++
++    kdc = buildMiniKdc();
++    kdc.start();
++
++    clientPrincipal = "client@" + kdc.getKdcConfig().getKdcRealm();
++    clientKeytab = new File(keytabDir, clientPrincipal + ".keytab");
++    setupUser(kdc, clientKeytab, clientPrincipal);
++
++    serverPrincipal = "hbase/" + KDC_SERVER_HOST + "@" + kdc.getKdcConfig().getKdcRealm();
++    serverKeytab = new File(keytabDir, serverPrincipal.replace('/', '_') + ".keytab");
++    setupUser(kdc, serverKeytab, serverPrincipal);
++
++    spnegoServerPrincipal = "HTTP/" + KDC_SERVER_HOST + "@" + kdc.getKdcConfig().getKdcRealm();
++    spnegoServerKeytab = new File(keytabDir, spnegoServerPrincipal.replace('/', '_') + ".keytab");
++    setupUser(kdc, spnegoServerKeytab, spnegoServerPrincipal);
++
++    TEST_UTIL.getConfiguration().setBoolean(USE_HTTP_CONF_KEY, true);
++    TEST_UTIL.getConfiguration().setBoolean("hbase.table.sanity.checks", false);
++    addSecurityConfigurations(TEST_UTIL.getConfiguration());
++
++    TestThriftHttpServer.setUpBeforeClass();
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TestThriftHttpServer.tearDownAfterClass();
++
++    try {
++      if (null != kdc) {
++        kdc.stop();
++      }
++    } catch (Exception e) {
++      LOG.info("Failed to stop mini KDC", e);
++    }
++  }
++
++  @Override
++  void talkToThriftServer(int customHeaderSize) throws Exception {
++    // Close httpClient and THttpClient automatically on any failures
++    try (
++        CloseableHttpClient httpClient = createHttpClient();
++        THttpClient tHttpClient = new THttpClient("http://" + HConstants.LOCALHOST + ":" + port,
++            httpClient)
++    ) {
++      tHttpClient.open();
++      if (customHeaderSize > 0) {
++        StringBuilder sb = new StringBuilder();
++        for (int i = 0; i < customHeaderSize; i++) {
++          sb.append("a");
++        }
++        tHttpClient.setCustomHeader(HttpHeaders.USER_AGENT, sb.toString());
++      }
++
++      TProtocol prot = new TBinaryProtocol(tHttpClient);
++      Hbase.Client client = new Hbase.Client(prot);
++      if (!tableCreated) {
++        TestThriftServer.createTestTables(client);
++        tableCreated = true;
++      }
++      TestThriftServer.checkTableList(client);
++    }
++  }
++
++  private CloseableHttpClient createHttpClient() throws Exception {
++    final Subject clientSubject = JaasKrbUtil.loginUsingKeytab(clientPrincipal, clientKeytab);
++    final Set<Principal> clientPrincipals = clientSubject.getPrincipals();
++    // Make sure the subject has a principal
++    assertFalse(clientPrincipals.isEmpty());
++
++    // Get a TGT for the subject (might have many, different encryption types). The first should
++    // be the default encryption type.
++    Set<KerberosTicket> privateCredentials =
++        clientSubject.getPrivateCredentials(KerberosTicket.class);
++    assertFalse(privateCredentials.isEmpty());
++    KerberosTicket tgt = privateCredentials.iterator().next();
++    assertNotNull(tgt);
++
++    // The name of the principal
++    final String clientPrincipalName = clientPrincipals.iterator().next().getName();
++
++    return Subject.doAs(clientSubject, new PrivilegedExceptionAction<CloseableHttpClient>() {
++      @Override
++      public CloseableHttpClient run() throws Exception {
++        // Logs in with Kerberos via GSS
++        GSSManager gssManager = GSSManager.getInstance();
++        // jGSS Kerberos login constant
++        Oid oid = new Oid("1.2.840.113554.1.2.2");
++        GSSName gssClient = gssManager.createName(clientPrincipalName, GSSName.NT_USER_NAME);
++        GSSCredential credential = gssManager.createCredential(gssClient,
++            GSSCredential.DEFAULT_LIFETIME, oid, GSSCredential.INITIATE_ONLY);
++
++        Lookup<AuthSchemeProvider> authRegistry = RegistryBuilder.<AuthSchemeProvider>create()
++            .register(AuthSchemes.SPNEGO, new SPNegoSchemeFactory(true, true))
++            .build();
++
++        BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
++        credentialsProvider.setCredentials(AuthScope.ANY, new KerberosCredentials(credential));
++
++        return HttpClients.custom()
++            .setDefaultAuthSchemeRegistry(authRegistry)
++            .setDefaultCredentialsProvider(credentialsProvider)
++            .build();
++      }
++    });
++  }
++}
+-- 
+2.17.1

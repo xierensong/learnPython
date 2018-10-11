@@ -1,0 +1,275 @@
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/replication/ReplicationZookeeper.java hbase-server/src/main/java/org/apache/hadoop/hbase/replication/ReplicationZookeeper.java
+index 6eaa51f..6dc8beb 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/replication/ReplicationZookeeper.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/replication/ReplicationZookeeper.java
+@@ -26,6 +26,7 @@ import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.SortedMap;
+ import java.util.SortedSet;
+ import java.util.TreeMap;
+@@ -41,11 +42,16 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.RetryCounter;
++import org.apache.hadoop.hbase.util.RetryCounterFactory;
+ import org.apache.hadoop.hbase.zookeeper.ZKUtil;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperListener;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperNodeTracker;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
++import org.apache.zookeeper.CreateMode;
+ import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.Op;
++import org.apache.zookeeper.OpResult;
+ import org.apache.zookeeper.KeeperException.ConnectionLossException;
+ import org.apache.zookeeper.KeeperException.SessionExpiredException;
+ 
+@@ -721,6 +727,120 @@ public class ReplicationZookeeper implements Closeable{
+   }
+ 
+   /**
++   * Take the dead region server znode; 
++   * 0) do validation: whether this is us or not? Or if there is no log to process.
++   * 1) Make one trx for all the "move" for znodes: for logs, peerZnodes and deadRS znode;
++   * There will be only one multi call; Try the multi command in a do-while loop just to
++   * avoid any edgy condition where we missed out the transaction. So, we give up retrying
++   * only after making sure that the dead regionserver znodes has been processed.
++   * We also need to watch the logs znodes; so a separate collection holds the znodes to watch.
++   * @param deadRSZnode
++   * @return
++   */
++  public SortedMap<String, SortedSet<String>> copyDeadRSLogsWithMulti(
++      String deadRSZnode) {
++    SortedMap<String, SortedSet<String>> logQueuePerPeer = null;
++    String deadRSZnodePath = ZKUtil.joinZNode(rsZNode, deadRSZnode); // /hbase/replication/rs/<deadRS>
++    if (this.rsServerNameZnode.equals(deadRSZnodePath)) { // check with itself
++      LOG.warn("This is us! Skipping the processing as we might be closing down.");
++      return null;
++    }
++    List<Op> opsList = null;
++    List<String> znodesToWatch = null; // the successful rs will watch the peer's logs znodes
++    List<String> peerIdsToProcess = null;
++    RetryCounterFactory retryCounterFactory = new RetryCounterFactory(Integer.MAX_VALUE, 3 * 1000);
++    // 3 seconds gap for retrying. Can be made configurable.
++    RetryCounter retryCounter = retryCounterFactory.create();
++    do {
++      logQueuePerPeer = new TreeMap<String, SortedSet<String>>();
++      znodesToWatch = new ArrayList<String>();
++      opsList = new ArrayList<Op>();
++      try {
++        peerIdsToProcess = ZKUtil.listChildrenNoWatch(this.zookeeper,
++            deadRSZnodePath);
++      } catch (KeeperException ke) {
++        LOG.error("KeeperException while reading dead rs node? " + ke);
++        this.abortable.abort("KeeperException while reading dead rs node", ke);
++      }
++      if (peerIdsToProcess == null || peerIdsToProcess.size() == 0)
++        return null;
++
++      for (String peerId : peerIdsToProcess) {
++        String newPeerId = peerId + "-" + deadRSZnode;
++        LOG.debug("peerID to process: " + peerId);
++        String newPeerZnode = ZKUtil.joinZNode(rsServerNameZnode, newPeerId); 
++        //creating it inside "this" rs;
++        Op createPeerZnodeOp = Op.create(newPeerZnode, HConstants.EMPTY_BYTE_ARRAY,
++            ZKUtil.createACL(zookeeper, newPeerZnode), CreateMode.PERSISTENT);
++        znodesToWatch.add(newPeerZnode);
++        opsList.add(createPeerZnodeOp);
++        String logPathForThisCluster = ZKUtil.joinZNode(deadRSZnodePath, peerId);
++        SortedSet<String> logQueue = new TreeSet<String>();
++        logQueuePerPeer.put(newPeerId, logQueue);
++        addLogsForPeer(logPathForThisCluster, newPeerZnode, opsList, znodesToWatch, logQueue);
++        // add delete ops for peerId
++        Op deleteOpForPeerId = Op.delete(logPathForThisCluster, -1);
++        opsList.add(deleteOpForPeerId);
++      }
++      LOG.info("Transactions created for peers + logs; make one for deleting deadRS."
++          + deadRSZnodePath);
++      Op deleteOpForRS = Op.delete(deadRSZnodePath, -1);
++      opsList.add(deleteOpForRS);
++      // execute the multi;
++      try {
++        List<OpResult> res = ZKUtil.doMultiAndWatch(zookeeper, opsList,
++            znodesToWatch);
++        // if it comes here, it is successful;
++        LOG.info("Successfully transferred logs for dead region server: "+ deadRSZnode);
++        return logQueuePerPeer;
++      } catch (KeeperException ke) {
++        LOG.warn("KeeperException occurred in multi; " +
++            "seems some other regionserver took the logs before us.");
++        logQueuePerPeer = null;
++      }
++      try {
++        retryCounter.sleepUntilNextRetry();
++      } catch (InterruptedException e) {
++        LOG.warn("InterruptedException while sleeping in the retryCounter loop while processing "
++            + "deadRS log queue.");
++      }
++    } while (retryCounter.shouldRetry());
++    return null;
++  }
++
++  private void addLogsForPeer(String peerZnodePath, String newPeerZnode,
++      List<Op> opsList, List<String> znodesToWatch,
++      Set<String> logQueueForThisPeer) {
++    LOG.debug("getting logs for peerId: " + peerZnodePath);
++    try {
++      List<String> logsList = ZKUtil.listChildrenNoWatch(zookeeper,
++          peerZnodePath);
++      if (logsList == null || logsList.size() <= 0)
++        return;
++      LOG.debug("Number of logs to process: " + logsList.size());
++
++      for (String hLog : logsList) {
++        // make a create Op, and append to the list;
++        String zNodeForCurrentLog = ZKUtil.joinZNode(peerZnodePath, hLog);
++        byte[] position = ZKUtil.getData(this.zookeeper, zNodeForCurrentLog);
++        LOG.debug("Create Ops for " + hLog + " with data " + Bytes.toString(position));
++        String logZnode = ZKUtil.joinZNode(newPeerZnode, hLog);
++        Op createOpForLog = Op.create(logZnode, position,
++            ZKUtil.createACL(zookeeper, logZnode), CreateMode.PERSISTENT);
++        // create delete Op for the src log;
++        Op deleteOpForLog = Op.delete(zNodeForCurrentLog, -1);
++        znodesToWatch.add(logZnode);
++        opsList.add(createOpForLog);
++        opsList.add(deleteOpForLog);
++        logQueueForThisPeer.add(hLog);
++      }
++    } catch (KeeperException e) {
++      e.printStackTrace();
++    }
++    return;
++  }  
++
++  /**
+    * Delete a complete queue of hlogs
+    * @param peerZnode znode of the peer cluster queue of hlogs to delete
+    */
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSourceManager.java hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSourceManager.java
+index 97af2e8..996e16d 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSourceManager.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSourceManager.java
+@@ -560,19 +560,16 @@ public class ReplicationSourceManager {
+         LOG.info("Not transferring queue since we are shutting down");
+         return;
+       }
+-      if (!zkHelper.lockOtherRS(rsZnode)) {
+-        return;
+-      }
+       LOG.info("Moving " + rsZnode + "'s hlogs to my queue");
+       SortedMap<String, SortedSet<String>> newQueues =
+-          zkHelper.copyQueuesFromRS(rsZnode);
+-      zkHelper.deleteRsQueues(rsZnode);
++          zkHelper.copyDeadRSLogsWithMulti(rsZnode);
+       if (newQueues == null || newQueues.size() == 0) {
++        LOG.debug(" Was not able to grab the logs, returning.");
+         return;
+       }
+-
+       for (Map.Entry<String, SortedSet<String>> entry : newQueues.entrySet()) {
+         String peerId = entry.getKey();
++        LOG.debug("adding peerId: "+peerId);
+         try {
+           ReplicationSourceInterface src = getReplicationSource(conf,
+               fs, ReplicationSourceManager.this, stopper, replicating, peerId);
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/RecoverableZooKeeper.java hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/RecoverableZooKeeper.java
+index 233c3cc..9a40512 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/RecoverableZooKeeper.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/RecoverableZooKeeper.java
+@@ -34,6 +34,8 @@ import org.apache.hadoop.hbase.util.RetryCounterFactory;
+ import org.apache.zookeeper.AsyncCallback;
+ import org.apache.zookeeper.CreateMode;
+ import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.Op;
++import org.apache.zookeeper.OpResult;
+ import org.apache.zookeeper.Watcher;
+ import org.apache.zookeeper.ZooKeeper;
+ import org.apache.zookeeper.ZooKeeper.States;
+@@ -549,6 +551,26 @@ public class RecoverableZooKeeper {
+ 
+     return newData;
+   }
++  /**
++   * performs the multi operation. 
++   * The multi API guarantees to perform a atomic batch operation.
++   * @param opList: list of Op to be executed as one trx.
++   * @return: the list of OpResult.
++   */
++  public List<OpResult> multi(List<Op> opList) throws KeeperException {
++    List<OpResult> opsResult = null;
++    if(opList == null || opList.size() ==0)
++      return opsResult;
++    try{
++      opsResult = this.zk.multi(opList);
++    }catch (InterruptedException ie) {
++      LOG.warn("multi call interrupted; process failed!" + ie);
++    } catch (KeeperException e) {
++      LOG.warn("multi call failed! One of the passed ops has failed which result in the rolled back.");
++      throw e;
++    }
++    return opsResult;
++  }
+ 
+   public long getSessionId() {
+     return zk.getSessionId();
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+index 5ac3276..227e24a 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+@@ -43,6 +43,8 @@ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.zookeeper.AsyncCallback;
+ import org.apache.zookeeper.CreateMode;
+ import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.Op;
++import org.apache.zookeeper.OpResult;
+ import org.apache.zookeeper.KeeperException.NoNodeException;
+ import org.apache.zookeeper.Watcher;
+ import org.apache.zookeeper.ZooDefs.Ids;
+@@ -721,7 +723,7 @@ public class ZKUtil {
+     return (System.getProperty("java.security.auth.login.config") != null);
+   }
+ 
+-  private static ArrayList<ACL> createACL(ZooKeeperWatcher zkw, String node) {
++  public static ArrayList<ACL> createACL(ZooKeeperWatcher zkw, String node) {
+     if (isSecureZooKeeper(zkw.getConfiguration())) {
+       // Certain znodes are accessed directly by the client,
+       // so they must be readable by non-authenticated clients
+@@ -1043,6 +1045,35 @@ public class ZKUtil {
+     }
+   }
+ 
++  /**
++   * performs the zookeeper multi operation, and creates watch on the passed list if the multi
++   * operation is successful. This is useful when we are creating some watchable znodes in the
++   * multi operation. Since its either all or none operation, its safe to use a list of znodes
++   * to watch for: either all or none of them will be there.
++   * 
++   * @param opList
++   * @param zNodesToWatch
++   */
++  public static  List<OpResult> doMultiAndWatch(ZooKeeperWatcher zkw, List<Op> opList, 
++      List<String> zNodesToWatch) throws KeeperException {
++    List<OpResult> multiResult = null;
++    try {
++      waitForZKConnectionIfAuthenticating(zkw);
++      multiResult = zkw.getRecoverableZooKeeper().multi(opList);
++      // no exception, therefore, the multi call succeeds... now, set the watches;
++      for(String zNode : zNodesToWatch) {
++        zkw.getRecoverableZooKeeper().exists(zNode, zkw);
++      }
++    } catch (InterruptedException e) {
++      LOG.warn("This shouldn't have come here...."+e);
++    } catch (KeeperException e){
++      LOG.warn("Got Keeper exception while executing the multi; no watches  to be set... " +
++          "some other regionserver did it earlier than us...");
++      throw e;
++    }
++    return multiResult;
++  }
++
+   //
+   // ZooKeeper cluster information
+   //

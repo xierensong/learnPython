@@ -1,0 +1,1749 @@
+From 503c5e11cccbf65d8488e59c5cf3a805858c30e3 Mon Sep 17 00:00:00 2001
+From: Yi Liang <yliang@us.ibm.com>
+Date: Tue, 27 Jun 2017 16:55:05 -0700
+Subject: [PATCH] HBASE-18229: create new Async Split API to embrace AM v2
+
+---
+ .../java/org/apache/hadoop/hbase/client/Admin.java |  13 +
+ .../hadoop/hbase/client/AsyncHBaseAdmin.java       |  50 ++-
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java | 121 +++++-
+ .../hbase/shaded/protobuf/RequestConverter.java    |  34 ++
+ .../shaded/protobuf/generated/AdminProtos.java     | 481 +++++++++++++++------
+ .../shaded/protobuf/generated/ClientProtos.java    |   4 +-
+ .../shaded/protobuf/generated/MasterProtos.java    |  25 +-
+ .../src/main/protobuf/Admin.proto                  |   3 +
+ .../src/main/protobuf/Master.proto                 |   2 +-
+ .../hadoop/hbase/master/MasterRpcServices.java     |   2 +-
+ .../hbase/master/assignment/AssignmentManager.java |  24 +-
+ .../assignment/MergeTableRegionsProcedure.java     |  10 +-
+ .../assignment/SplitTableRegionProcedure.java      | 100 +++--
+ .../hadoop/hbase/master/assignment/Util.java       |  13 +-
+ .../hadoop/hbase/regionserver/RSRpcServices.java   |  13 +
+ .../hadoop/hbase/backup/TestIncrementalBackup.java |  11 +-
+ .../org/apache/hadoop/hbase/client/TestAdmin1.java |  94 ++--
+ .../security/access/TestTablePermissions.java      |  11 +-
+ 18 files changed, 738 insertions(+), 273 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
+index 9300372..85af727 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
+@@ -985,6 +985,8 @@ public interface Admin extends Abortable, Closeable {
+    *
+    * @param regionName region to split
+    * @throws IOException if a remote or network exception occurs
++   * @deprecated Since 2.0. Will be removed in 3.0. Use
++   *     {@link #splitRegionAsync(byte[], byte[])} instead.
+    */
+   void splitRegion(final byte[] regionName) throws IOException;
+ 
+@@ -1004,11 +1006,22 @@ public interface Admin extends Abortable, Closeable {
+    * @param regionName region to split
+    * @param splitPoint the explicit position to split on
+    * @throws IOException if a remote or network exception occurs
++   * @deprecated Since 2.0. Will be removed in 3.0. Use
++   *     {@link #splitRegionAsync(byte[], byte[])} instead.
+    */
+   void splitRegion(final byte[] regionName, final byte[] splitPoint)
+     throws IOException;
+ 
+   /**
++   * Split an individual region. Asynchronous operation.
++   * @param regionName region to split
++   * @param splitPoint the explicit position to split on
++   * @throws IOException if a remote or network exception occurs
++   */
++  Future<Void> splitRegionAsync(byte[] regionName, byte[] splitPoint)
++    throws IOException;
++
++  /**
+    * Modify an existing table, more IRB friendly version.
+    *
+    * @param tableName name of table.
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
+index 1da660c..f59cca9 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
+@@ -160,6 +160,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaRe
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SnapshotRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SnapshotResponse;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.TruncateTableRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.TruncateTableResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.UnassignRegionRequest;
+@@ -1102,7 +1104,7 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+                       if (hri == null || hri.isSplitParent()
+                           || hri.getReplicaId() != HRegionInfo.DEFAULT_REPLICA_ID)
+                         continue;
+-                      splitFutures.add(split(h.getServerName(), hri, Optional.empty()));
++                      splitFutures.add(split(hri, Optional.empty()));
+                     }
+                   }
+                 }
+@@ -1170,7 +1172,7 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+               .toStringBinary(regionName)));
+           return;
+         }
+-        split(serverName, regionInfo, splitPoint).whenComplete((ret, err2) -> {
++        split(regionInfo, splitPoint).whenComplete((ret, err2) -> {
+           if (err2 != null) {
+             future.completeExceptionally(err2);
+           } else {
+@@ -1181,21 +1183,36 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+     return future;
+   }
+ 
+-  private CompletableFuture<Void> split(final ServerName sn, final HRegionInfo hri,
++  private CompletableFuture<Void> split(final HRegionInfo hri,
+       Optional<byte[]> splitPoint) {
+     if (hri.getStartKey() != null && splitPoint.isPresent()
+         && Bytes.compareTo(hri.getStartKey(), splitPoint.get()) == 0) {
+       return failedFuture(new IllegalArgumentException(
+           "should not give a splitkey which equals to startkey!"));
+     }
+-    return this
+-        .<Void> newAdminCaller()
+-        .action(
+-          (controller, stub) -> this.<SplitRegionRequest, SplitRegionResponse, Void> adminCall(
+-            controller, stub,
+-            ProtobufUtil.buildSplitRegionRequest(hri.getRegionName(), splitPoint),
+-            (s, c, req, done) -> s.splitRegion(controller, req, done), resp -> null))
+-        .serverName(sn).call();
++
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    TableName tableName = hri.getTable();
++    SplitTableRegionRequest request = null;
++    try {
++      request = RequestConverter
++          .buildSplitTableRegionRequest(hri, splitPoint.isPresent() ? splitPoint.get() : null,
++              ng.getNonceGroup(), ng.newNonce());
++    } catch (DeserializationException e) {
++      future.completeExceptionally(e);
++      return future;
++    }
++
++    this.<SplitTableRegionRequest, SplitTableRegionResponse>procedureCall(request,
++        (s, c, req, done) -> s.splitRegion(c, req, done), (resp) -> resp.getProcId(),
++        new SplitTableRegionProcedureBiConsumer(this, tableName)).whenComplete((ret, err2) -> {
++      if (err2 != null) {
++        future.completeExceptionally(err2);
++      } else {
++        future.complete(ret);
++      }
++    });
++    return future;
+   }
+ 
+   @Override
+@@ -2242,6 +2259,17 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+     }
+   }
+ 
++  private class SplitTableRegionProcedureBiConsumer extends  TableProcedureBiConsumer {
++
++    SplitTableRegionProcedureBiConsumer(AsyncAdmin admin, TableName tableName) {
++      super(admin, tableName);
++    }
++
++    String getOperationType() {
++      return "SPLIT_REGION";
++    }
++  }
++
+   private CompletableFuture<Void> waitProcedureResult(CompletableFuture<Long> procFuture) {
+     CompletableFuture<Void> future = new CompletableFuture<>();
+     procFuture.whenComplete((procId, error) -> {
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index 1c6ea03..fe015cd 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -177,6 +177,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetNormali
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ShutdownRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SnapshotRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SnapshotResponse;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.StopMasterRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.TruncateTableRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.TruncateTableResponse;
+@@ -1635,6 +1637,97 @@ public class HBaseAdmin implements Admin {
+       return "MERGE_REGIONS";
+     }
+   }
++  /**
++   * Split one region. Synchronous operation.
++   * Note: It is not feasible to predict the length of split.
++   *   Therefore, this is for internal testing only.
++   * @param regionName encoded or full name of region
++   * @param splitPoint key where region splits
++   * @throws IOException
++   */
++  @VisibleForTesting
++  public void splitRegionSync(byte[] regionName, byte[] splitPoint) throws IOException {
++    splitRegionSync(regionName, splitPoint, syncWaitTimeout, TimeUnit.MILLISECONDS);
++  }
++
++
++  /**
++   * Split one region. Synchronous operation.
++   * @param regionName region to be split
++   * @param splitPoint split point
++   * @param timeout Do a get with a timeout against the passed in <code>future<code>.
++   * @param units time units
++   * @throws IOException
++   */
++  public void splitRegionSync(byte[] regionName, byte[] splitPoint,
++    final long timeout, final TimeUnit units) throws IOException {
++    get(
++        splitRegionAsync(regionName, splitPoint),
++        timeout,
++        units);
++  }
++
++  @Override
++  public Future<Void> splitRegionAsync(byte[] regionName, byte[] splitPoint)
++      throws IOException {
++    byte[] encodedNameofRegionToSplit = HRegionInfo.isEncodedRegionName(regionName) ?
++        regionName : HRegionInfo.encodeRegionName(regionName).getBytes();
++    Pair<HRegionInfo, ServerName> pair = getRegion(regionName);
++    if (pair != null) {
++      if (pair.getFirst() != null &&
++          pair.getFirst().getReplicaId() != HRegionInfo.DEFAULT_REPLICA_ID) {
++        throw new IllegalArgumentException ("Can't invoke split on non-default regions directly");
++      }
++    } else {
++      throw new UnknownRegionException (
++          "Can't invoke merge on unknown region "
++              + Bytes.toStringBinary(encodedNameofRegionToSplit));
++    }
++
++    HRegionInfo hri = pair.getFirst();
++    return splitRegionAsync(hri, splitPoint);
++  }
++
++  Future<Void> splitRegionAsync(HRegionInfo hri, byte[] splitPoint) throws IOException {
++    TableName tableName = hri.getTable();
++    if (hri.getStartKey() != null && splitPoint != null &&
++        Bytes.compareTo(hri.getStartKey(), splitPoint) == 0) {
++      throw new IOException("should not give a splitkey which equals to startkey!");
++    }
++
++    SplitTableRegionResponse response = executeCallable(
++        new MasterCallable<SplitTableRegionResponse>(getConnection(), getRpcControllerFactory()) {
++          @Override
++          protected SplitTableRegionResponse rpcCall() throws Exception {
++            setPriority(tableName);
++            SplitTableRegionRequest request = RequestConverter
++                .buildSplitTableRegionRequest(hri, splitPoint, ng.getNonceGroup(), ng.newNonce());
++            return master.splitRegion(getRpcController(), request);
++          }
++        });
++    return new SplitTableRegionFuture(this, tableName, response);
++  }
++
++  private static class SplitTableRegionFuture extends TableFuture<Void> {
++    public SplitTableRegionFuture(final HBaseAdmin admin,
++        final TableName tableName,
++        final SplitTableRegionResponse response) {
++      super(admin, tableName,
++          (response != null && response.hasProcId()) ? response.getProcId() : null);
++    }
++
++    public SplitTableRegionFuture(
++        final HBaseAdmin admin,
++        final TableName tableName,
++        final Long procId) {
++      super(admin, tableName, procId);
++    }
++
++    @Override
++    public String getOperationType() {
++      return "SPLIT_REGION";
++    }
++  }
+ 
+   @Override
+   public void split(final TableName tableName) throws IOException {
+@@ -1646,9 +1739,6 @@ public class HBaseAdmin implements Admin {
+     splitRegion(regionName, null);
+   }
+ 
+-  /**
+-   * {@inheritDoc}
+-   */
+   @Override
+   public void split(final TableName tableName, final byte [] splitPoint) throws IOException {
+     ZooKeeperWatcher zookeeper = null;
+@@ -1662,6 +1752,9 @@ public class HBaseAdmin implements Admin {
+       } else {
+         pairs = MetaTableAccessor.getTableRegionsAndLocations(connection, tableName);
+       }
++      if (splitPoint == null) {
++        LOG.info("SplitPoint is null, will find bestSplitPoint from Region");
++      }
+       for (Pair<HRegionInfo, ServerName> pair: pairs) {
+         // May not be a server for a particular row
+         if (pair.getSecond() == null) continue;
+@@ -1671,8 +1764,8 @@ public class HBaseAdmin implements Admin {
+         // if a split point given, only split that particular region
+         if (r.getReplicaId() != HRegionInfo.DEFAULT_REPLICA_ID ||
+            (splitPoint != null && !r.containsRow(splitPoint))) continue;
+-        // call out to region server to do split now
+-        split(pair.getSecond(), pair.getFirst(), splitPoint);
++        // call out to master to do split now
++        splitRegionAsync(pair.getFirst(), splitPoint);
+       }
+     } finally {
+       if (zookeeper != null) {
+@@ -1695,23 +1788,7 @@ public class HBaseAdmin implements Admin {
+     if (regionServerPair.getSecond() == null) {
+       throw new NoServerForRegionException(Bytes.toStringBinary(regionName));
+     }
+-    split(regionServerPair.getSecond(), regionServerPair.getFirst(), splitPoint);
+-  }
+-
+-  @VisibleForTesting
+-  public void split(final ServerName sn, final HRegionInfo hri,
+-      byte[] splitPoint) throws IOException {
+-    if (hri.getStartKey() != null && splitPoint != null &&
+-         Bytes.compareTo(hri.getStartKey(), splitPoint) == 0) {
+-       throw new IOException("should not give a splitkey which equals to startkey!");
+-    }
+-    // TODO: There is no timeout on this controller. Set one!
+-    HBaseRpcController controller = rpcControllerFactory.newController();
+-    controller.setPriority(hri.getTable());
+-
+-    // TODO: this does not do retries, it should. Set priority and timeout in controller
+-    AdminService.BlockingInterface admin = this.connection.getAdmin(sn);
+-    ProtobufUtil.split(controller, admin, hri, splitPoint);
++    splitRegionAsync(regionServerPair.getFirst(), splitPoint);
+   }
+ 
+   @Override
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
+index 39ae6a5..c84e438 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
+@@ -118,6 +118,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.RunCleaner
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetNormalizerRunningRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetSplitOrMergeEnabledRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SplitTableRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.TruncateTableRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.UnassignRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.GetQuotaStatesRequest;
+@@ -782,6 +784,19 @@ public final class RequestConverter {
+   public static GetRegionInfoRequest
+       buildGetRegionInfoRequest(final byte[] regionName,
+         final boolean includeCompactionState) {
++    return buildGetRegionInfoRequest(regionName, includeCompactionState, false);
++  }
++
++  /**
++   *
++   * @param regionName the name of the region to get info
++   * @param includeCompactionState indicate if the compaction state is requested
++   * @param includeBestSplitRow indicate if the bestSplitRow  is requested
++   * @return protocol buffer GetRegionInfoRequest
++   */
++  public static GetRegionInfoRequest
++      buildGetRegionInfoRequest(final byte[] regionName,
++      final boolean includeCompactionState, final boolean includeBestSplitRow) {
+     GetRegionInfoRequest.Builder builder = GetRegionInfoRequest.newBuilder();
+     RegionSpecifier region = buildRegionSpecifier(
+       RegionSpecifierType.REGION_NAME, regionName);
+@@ -789,9 +804,13 @@ public final class RequestConverter {
+     if (includeCompactionState) {
+       builder.setCompactionState(includeCompactionState);
+     }
++    if(includeBestSplitRow) {
++      builder.setBestSplitRow(includeBestSplitRow);
++    }
+     return builder.build();
+   }
+ 
++
+   /**
+    * Create a protocol buffer GetRegionLoadRequest for all regions/regions of a table.
+    *
+@@ -1149,6 +1168,21 @@ public final class RequestConverter {
+     return builder.build();
+   }
+ 
++  public static SplitTableRegionRequest buildSplitTableRegionRequest(
++      final HRegionInfo regionInfo,
++      final byte[] splitRow,
++      final long nonceGroup,
++      final long nonce) throws DeserializationException {
++    SplitTableRegionRequest.Builder builder = SplitTableRegionRequest.newBuilder();
++    builder.setRegionInfo(HRegionInfo.convert(regionInfo));
++    if (splitRow != null) {
++      builder.setSplitRow(UnsafeByteOperations.unsafeWrap(splitRow));
++    }
++    builder.setNonceGroup(nonceGroup);
++    builder.setNonce(nonce);
++    return builder.build();
++  }
++
+   /**
+    * Create a protocol buffer AssignRegionRequest
+    *
+diff --git a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/AdminProtos.java b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/AdminProtos.java
+index 812cf3b..639be5a 100644
+--- a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/AdminProtos.java
++++ b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/AdminProtos.java
+@@ -39,6 +39,15 @@ public final class AdminProtos {
+      * <code>optional bool compaction_state = 2;</code>
+      */
+     boolean getCompactionState();
++
++    /**
++     * <code>optional bool best_split_row = 3;</code>
++     */
++    boolean hasBestSplitRow();
++    /**
++     * <code>optional bool best_split_row = 3;</code>
++     */
++    boolean getBestSplitRow();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.GetRegionInfoRequest}
+@@ -53,6 +62,7 @@ public final class AdminProtos {
+     }
+     private GetRegionInfoRequest() {
+       compactionState_ = false;
++      bestSplitRow_ = false;
+     }
+ 
+     @java.lang.Override
+@@ -101,6 +111,11 @@ public final class AdminProtos {
+               compactionState_ = input.readBool();
+               break;
+             }
++            case 24: {
++              bitField0_ |= 0x00000004;
++              bestSplitRow_ = input.readBool();
++              break;
++            }
+           }
+         }
+       } catch (org.apache.hadoop.hbase.shaded.com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -162,6 +177,21 @@ public final class AdminProtos {
+       return compactionState_;
+     }
+ 
++    public static final int BEST_SPLIT_ROW_FIELD_NUMBER = 3;
++    private boolean bestSplitRow_;
++    /**
++     * <code>optional bool best_split_row = 3;</code>
++     */
++    public boolean hasBestSplitRow() {
++      return ((bitField0_ & 0x00000004) == 0x00000004);
++    }
++    /**
++     * <code>optional bool best_split_row = 3;</code>
++     */
++    public boolean getBestSplitRow() {
++      return bestSplitRow_;
++    }
++
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+       byte isInitialized = memoizedIsInitialized;
+@@ -188,6 +218,9 @@ public final class AdminProtos {
+       if (((bitField0_ & 0x00000002) == 0x00000002)) {
+         output.writeBool(2, compactionState_);
+       }
++      if (((bitField0_ & 0x00000004) == 0x00000004)) {
++        output.writeBool(3, bestSplitRow_);
++      }
+       unknownFields.writeTo(output);
+     }
+ 
+@@ -204,6 +237,10 @@ public final class AdminProtos {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
+           .computeBoolSize(2, compactionState_);
+       }
++      if (((bitField0_ & 0x00000004) == 0x00000004)) {
++        size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
++          .computeBoolSize(3, bestSplitRow_);
++      }
+       size += unknownFields.getSerializedSize();
+       memoizedSize = size;
+       return size;
+@@ -231,6 +268,11 @@ public final class AdminProtos {
+         result = result && (getCompactionState()
+             == other.getCompactionState());
+       }
++      result = result && (hasBestSplitRow() == other.hasBestSplitRow());
++      if (hasBestSplitRow()) {
++        result = result && (getBestSplitRow()
++            == other.getBestSplitRow());
++      }
+       result = result && unknownFields.equals(other.unknownFields);
+       return result;
+     }
+@@ -251,6 +293,11 @@ public final class AdminProtos {
+         hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashBoolean(
+             getCompactionState());
+       }
++      if (hasBestSplitRow()) {
++        hash = (37 * hash) + BEST_SPLIT_ROW_FIELD_NUMBER;
++        hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashBoolean(
++            getBestSplitRow());
++      }
+       hash = (29 * hash) + unknownFields.hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -378,6 +425,8 @@ public final class AdminProtos {
+         bitField0_ = (bitField0_ & ~0x00000001);
+         compactionState_ = false;
+         bitField0_ = (bitField0_ & ~0x00000002);
++        bestSplitRow_ = false;
++        bitField0_ = (bitField0_ & ~0x00000004);
+         return this;
+       }
+ 
+@@ -414,6 +463,10 @@ public final class AdminProtos {
+           to_bitField0_ |= 0x00000002;
+         }
+         result.compactionState_ = compactionState_;
++        if (((from_bitField0_ & 0x00000004) == 0x00000004)) {
++          to_bitField0_ |= 0x00000004;
++        }
++        result.bestSplitRow_ = bestSplitRow_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -462,6 +515,9 @@ public final class AdminProtos {
+         if (other.hasCompactionState()) {
+           setCompactionState(other.getCompactionState());
+         }
++        if (other.hasBestSplitRow()) {
++          setBestSplitRow(other.getBestSplitRow());
++        }
+         this.mergeUnknownFields(other.unknownFields);
+         onChanged();
+         return this;
+@@ -645,6 +701,38 @@ public final class AdminProtos {
+         onChanged();
+         return this;
+       }
++
++      private boolean bestSplitRow_ ;
++      /**
++       * <code>optional bool best_split_row = 3;</code>
++       */
++      public boolean hasBestSplitRow() {
++        return ((bitField0_ & 0x00000004) == 0x00000004);
++      }
++      /**
++       * <code>optional bool best_split_row = 3;</code>
++       */
++      public boolean getBestSplitRow() {
++        return bestSplitRow_;
++      }
++      /**
++       * <code>optional bool best_split_row = 3;</code>
++       */
++      public Builder setBestSplitRow(boolean value) {
++        bitField0_ |= 0x00000004;
++        bestSplitRow_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <code>optional bool best_split_row = 3;</code>
++       */
++      public Builder clearBestSplitRow() {
++        bitField0_ = (bitField0_ & ~0x00000004);
++        bestSplitRow_ = false;
++        onChanged();
++        return this;
++      }
+       public final Builder setUnknownFields(
+           final org.apache.hadoop.hbase.shaded.com.google.protobuf.UnknownFieldSet unknownFields) {
+         return super.setUnknownFields(unknownFields);
+@@ -762,6 +850,23 @@ public final class AdminProtos {
+      * <code>optional bool mergeable = 5;</code>
+      */
+     boolean getMergeable();
++
++    /**
++     * <pre>
++     * Get bestSplitRow
++     * </pre>
++     *
++     * <code>optional bytes best_split_row = 6;</code>
++     */
++    boolean hasBestSplitRow();
++    /**
++     * <pre>
++     * Get bestSplitRow
++     * </pre>
++     *
++     * <code>optional bytes best_split_row = 6;</code>
++     */
++    org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getBestSplitRow();
+   }
+   /**
+    * Protobuf type {@code hbase.pb.GetRegionInfoResponse}
+@@ -779,6 +884,7 @@ public final class AdminProtos {
+       isRecovering_ = false;
+       splittable_ = false;
+       mergeable_ = false;
++      bestSplitRow_ = org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString.EMPTY;
+     }
+ 
+     @java.lang.Override
+@@ -848,6 +954,11 @@ public final class AdminProtos {
+               mergeable_ = input.readBool();
+               break;
+             }
++            case 50: {
++              bitField0_ |= 0x00000020;
++              bestSplitRow_ = input.readBytes();
++              break;
++            }
+           }
+         }
+       } catch (org.apache.hadoop.hbase.shaded.com.google.protobuf.InvalidProtocolBufferException e) {
+@@ -1079,6 +1190,29 @@ public final class AdminProtos {
+       return mergeable_;
+     }
+ 
++    public static final int BEST_SPLIT_ROW_FIELD_NUMBER = 6;
++    private org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString bestSplitRow_;
++    /**
++     * <pre>
++     * Get bestSplitRow
++     * </pre>
++     *
++     * <code>optional bytes best_split_row = 6;</code>
++     */
++    public boolean hasBestSplitRow() {
++      return ((bitField0_ & 0x00000020) == 0x00000020);
++    }
++    /**
++     * <pre>
++     * Get bestSplitRow
++     * </pre>
++     *
++     * <code>optional bytes best_split_row = 6;</code>
++     */
++    public org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getBestSplitRow() {
++      return bestSplitRow_;
++    }
++
+     private byte memoizedIsInitialized = -1;
+     public final boolean isInitialized() {
+       byte isInitialized = memoizedIsInitialized;
+@@ -1114,6 +1248,9 @@ public final class AdminProtos {
+       if (((bitField0_ & 0x00000010) == 0x00000010)) {
+         output.writeBool(5, mergeable_);
+       }
++      if (((bitField0_ & 0x00000020) == 0x00000020)) {
++        output.writeBytes(6, bestSplitRow_);
++      }
+       unknownFields.writeTo(output);
+     }
+ 
+@@ -1142,6 +1279,10 @@ public final class AdminProtos {
+         size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
+           .computeBoolSize(5, mergeable_);
+       }
++      if (((bitField0_ & 0x00000020) == 0x00000020)) {
++        size += org.apache.hadoop.hbase.shaded.com.google.protobuf.CodedOutputStream
++          .computeBytesSize(6, bestSplitRow_);
++      }
+       size += unknownFields.getSerializedSize();
+       memoizedSize = size;
+       return size;
+@@ -1183,6 +1324,11 @@ public final class AdminProtos {
+         result = result && (getMergeable()
+             == other.getMergeable());
+       }
++      result = result && (hasBestSplitRow() == other.hasBestSplitRow());
++      if (hasBestSplitRow()) {
++        result = result && getBestSplitRow()
++            .equals(other.getBestSplitRow());
++      }
+       result = result && unknownFields.equals(other.unknownFields);
+       return result;
+     }
+@@ -1217,6 +1363,10 @@ public final class AdminProtos {
+         hash = (53 * hash) + org.apache.hadoop.hbase.shaded.com.google.protobuf.Internal.hashBoolean(
+             getMergeable());
+       }
++      if (hasBestSplitRow()) {
++        hash = (37 * hash) + BEST_SPLIT_ROW_FIELD_NUMBER;
++        hash = (53 * hash) + getBestSplitRow().hashCode();
++      }
+       hash = (29 * hash) + unknownFields.hashCode();
+       memoizedHashCode = hash;
+       return hash;
+@@ -1350,6 +1500,8 @@ public final class AdminProtos {
+         bitField0_ = (bitField0_ & ~0x00000008);
+         mergeable_ = false;
+         bitField0_ = (bitField0_ & ~0x00000010);
++        bestSplitRow_ = org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString.EMPTY;
++        bitField0_ = (bitField0_ & ~0x00000020);
+         return this;
+       }
+ 
+@@ -1398,6 +1550,10 @@ public final class AdminProtos {
+           to_bitField0_ |= 0x00000010;
+         }
+         result.mergeable_ = mergeable_;
++        if (((from_bitField0_ & 0x00000020) == 0x00000020)) {
++          to_bitField0_ |= 0x00000020;
++        }
++        result.bestSplitRow_ = bestSplitRow_;
+         result.bitField0_ = to_bitField0_;
+         onBuilt();
+         return result;
+@@ -1455,6 +1611,9 @@ public final class AdminProtos {
+         if (other.hasMergeable()) {
+           setMergeable(other.getMergeable());
+         }
++        if (other.hasBestSplitRow()) {
++          setBestSplitRow(other.getBestSplitRow());
++        }
+         this.mergeUnknownFields(other.unknownFields);
+         onChanged();
+         return this;
+@@ -1770,6 +1929,57 @@ public final class AdminProtos {
+         onChanged();
+         return this;
+       }
++
++      private org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString bestSplitRow_ = org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString.EMPTY;
++      /**
++       * <pre>
++       * Get bestSplitRow
++       * </pre>
++       *
++       * <code>optional bytes best_split_row = 6;</code>
++       */
++      public boolean hasBestSplitRow() {
++        return ((bitField0_ & 0x00000020) == 0x00000020);
++      }
++      /**
++       * <pre>
++       * Get bestSplitRow
++       * </pre>
++       *
++       * <code>optional bytes best_split_row = 6;</code>
++       */
++      public org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getBestSplitRow() {
++        return bestSplitRow_;
++      }
++      /**
++       * <pre>
++       * Get bestSplitRow
++       * </pre>
++       *
++       * <code>optional bytes best_split_row = 6;</code>
++       */
++      public Builder setBestSplitRow(org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString value) {
++        if (value == null) {
++    throw new NullPointerException();
++  }
++  bitField0_ |= 0x00000020;
++        bestSplitRow_ = value;
++        onChanged();
++        return this;
++      }
++      /**
++       * <pre>
++       * Get bestSplitRow
++       * </pre>
++       *
++       * <code>optional bytes best_split_row = 6;</code>
++       */
++      public Builder clearBestSplitRow() {
++        bitField0_ = (bitField0_ & ~0x00000020);
++        bestSplitRow_ = getDefaultInstance().getBestSplitRow();
++        onChanged();
++        return this;
++      }
+       public final Builder setUnknownFields(
+           final org.apache.hadoop.hbase.shaded.com.google.protobuf.UnknownFieldSet unknownFields) {
+         return super.setUnknownFields(unknownFields);
+@@ -30221,140 +30431,141 @@ public final class AdminProtos {
+     java.lang.String[] descriptorData = {
+       "\n\013Admin.proto\022\010hbase.pb\032\023ClusterStatus.p" +
+       "roto\032\013HBase.proto\032\tWAL.proto\032\013Quota.prot" +
+-      "o\"[\n\024GetRegionInfoRequest\022)\n\006region\030\001 \002(" +
++      "o\"s\n\024GetRegionInfoRequest\022)\n\006region\030\001 \002(" +
+       "\0132\031.hbase.pb.RegionSpecifier\022\030\n\020compacti" +
+-      "on_state\030\002 \001(\010\"\222\002\n\025GetRegionInfoResponse" +
+-      "\022)\n\013region_info\030\001 \002(\0132\024.hbase.pb.RegionI" +
+-      "nfo\022I\n\020compaction_state\030\002 \001(\0162/.hbase.pb" +
+-      ".GetRegionInfoResponse.CompactionState\022\024" +
+-      "\n\014isRecovering\030\003 \001(\010\022\022\n\nsplittable\030\004 \001(\010" +
+-      "\022\021\n\tmergeable\030\005 \001(\010\"F\n\017CompactionState\022\010",
+-      "\n\004NONE\020\000\022\t\n\005MINOR\020\001\022\t\n\005MAJOR\020\002\022\023\n\017MAJOR_" +
+-      "AND_MINOR\020\003\"P\n\023GetStoreFileRequest\022)\n\006re" +
+-      "gion\030\001 \002(\0132\031.hbase.pb.RegionSpecifier\022\016\n" +
+-      "\006family\030\002 \003(\014\"*\n\024GetStoreFileResponse\022\022\n" +
+-      "\nstore_file\030\001 \003(\t\"\030\n\026GetOnlineRegionRequ" +
+-      "est\"D\n\027GetOnlineRegionResponse\022)\n\013region" +
+-      "_info\030\001 \003(\0132\024.hbase.pb.RegionInfo\"\263\002\n\021Op" +
+-      "enRegionRequest\022=\n\topen_info\030\001 \003(\0132*.hba" +
+-      "se.pb.OpenRegionRequest.RegionOpenInfo\022\027" +
+-      "\n\017serverStartCode\030\002 \001(\004\022\032\n\022master_system",
+-      "_time\030\005 \001(\004\032\251\001\n\016RegionOpenInfo\022$\n\006region" +
+-      "\030\001 \002(\0132\024.hbase.pb.RegionInfo\022\037\n\027version_" +
+-      "of_offline_node\030\002 \001(\r\022+\n\rfavored_nodes\030\003" +
+-      " \003(\0132\024.hbase.pb.ServerName\022#\n\033openForDis" +
+-      "tributedLogReplay\030\004 \001(\010\"\246\001\n\022OpenRegionRe" +
+-      "sponse\022F\n\ropening_state\030\001 \003(\0162/.hbase.pb" +
+-      ".OpenRegionResponse.RegionOpeningState\"H" +
+-      "\n\022RegionOpeningState\022\n\n\006OPENED\020\000\022\022\n\016ALRE" +
+-      "ADY_OPENED\020\001\022\022\n\016FAILED_OPENING\020\002\"?\n\023Warm" +
+-      "upRegionRequest\022(\n\nregionInfo\030\001 \002(\0132\024.hb",
+-      "ase.pb.RegionInfo\"\026\n\024WarmupRegionRespons" +
+-      "e\"\313\001\n\022CloseRegionRequest\022)\n\006region\030\001 \002(\013" +
+-      "2\031.hbase.pb.RegionSpecifier\022\037\n\027version_o" +
+-      "f_closing_node\030\002 \001(\r\022\036\n\020transition_in_ZK" +
+-      "\030\003 \001(\010:\004true\0220\n\022destination_server\030\004 \001(\013" +
+-      "2\024.hbase.pb.ServerName\022\027\n\017serverStartCod" +
+-      "e\030\005 \001(\004\"%\n\023CloseRegionResponse\022\016\n\006closed" +
+-      "\030\001 \002(\010\"y\n\022FlushRegionRequest\022)\n\006region\030\001" +
+-      " \002(\0132\031.hbase.pb.RegionSpecifier\022\030\n\020if_ol" +
+-      "der_than_ts\030\002 \001(\004\022\036\n\026write_flush_wal_mar",
+-      "ker\030\003 \001(\010\"_\n\023FlushRegionResponse\022\027\n\017last" +
+-      "_flush_time\030\001 \002(\004\022\017\n\007flushed\030\002 \001(\010\022\036\n\026wr" +
+-      "ote_flush_wal_marker\030\003 \001(\010\"T\n\022SplitRegio" +
+-      "nRequest\022)\n\006region\030\001 \002(\0132\031.hbase.pb.Regi" +
+-      "onSpecifier\022\023\n\013split_point\030\002 \001(\014\"\025\n\023Spli" +
+-      "tRegionResponse\"`\n\024CompactRegionRequest\022" +
+-      ")\n\006region\030\001 \002(\0132\031.hbase.pb.RegionSpecifi" +
+-      "er\022\r\n\005major\030\002 \001(\010\022\016\n\006family\030\003 \001(\014\"\027\n\025Com" +
+-      "pactRegionResponse\"\315\001\n\031UpdateFavoredNode" +
+-      "sRequest\022I\n\013update_info\030\001 \003(\01324.hbase.pb",
+-      ".UpdateFavoredNodesRequest.RegionUpdateI" +
+-      "nfo\032e\n\020RegionUpdateInfo\022$\n\006region\030\001 \002(\0132" +
+-      "\024.hbase.pb.RegionInfo\022+\n\rfavored_nodes\030\002" +
+-      " \003(\0132\024.hbase.pb.ServerName\".\n\032UpdateFavo" +
+-      "redNodesResponse\022\020\n\010response\030\001 \001(\r\"a\n\010WA" +
+-      "LEntry\022\035\n\003key\030\001 \002(\0132\020.hbase.pb.WALKey\022\027\n" +
+-      "\017key_value_bytes\030\002 \003(\014\022\035\n\025associated_cel" +
+-      "l_count\030\003 \001(\005\"\242\001\n\030ReplicateWALEntryReque" +
+-      "st\022!\n\005entry\030\001 \003(\0132\022.hbase.pb.WALEntry\022\034\n" +
+-      "\024replicationClusterId\030\002 \001(\t\022\"\n\032sourceBas",
+-      "eNamespaceDirPath\030\003 \001(\t\022!\n\031sourceHFileAr" +
+-      "chiveDirPath\030\004 \001(\t\"\033\n\031ReplicateWALEntryR" +
+-      "esponse\"\026\n\024RollWALWriterRequest\"0\n\025RollW" +
+-      "ALWriterResponse\022\027\n\017region_to_flush\030\001 \003(" +
+-      "\014\"#\n\021StopServerRequest\022\016\n\006reason\030\001 \002(\t\"\024" +
+-      "\n\022StopServerResponse\"\026\n\024GetServerInfoReq" +
+-      "uest\"K\n\nServerInfo\022)\n\013server_name\030\001 \002(\0132" +
+-      "\024.hbase.pb.ServerName\022\022\n\nwebui_port\030\002 \001(" +
+-      "\r\"B\n\025GetServerInfoResponse\022)\n\013server_inf" +
+-      "o\030\001 \002(\0132\024.hbase.pb.ServerInfo\"\034\n\032UpdateC",
+-      "onfigurationRequest\"\035\n\033UpdateConfigurati" +
+-      "onResponse\"?\n\024GetRegionLoadRequest\022\'\n\nta" +
+-      "ble_name\030\001 \001(\0132\023.hbase.pb.TableName\"C\n\025G" +
+-      "etRegionLoadResponse\022*\n\014region_loads\030\001 \003" +
+-      "(\0132\024.hbase.pb.RegionLoad\"2\n\034ClearCompact" +
+-      "ionQueuesRequest\022\022\n\nqueue_name\030\001 \003(\t\"\037\n\035" +
+-      "ClearCompactionQueuesResponse\"\200\001\n\030Execut" +
+-      "eProceduresRequest\0220\n\013open_region\030\001 \003(\0132" +
+-      "\033.hbase.pb.OpenRegionRequest\0222\n\014close_re" +
+-      "gion\030\002 \003(\0132\034.hbase.pb.CloseRegionRequest",
+-      "\"\203\001\n\031ExecuteProceduresResponse\0221\n\013open_r" +
+-      "egion\030\001 \003(\0132\034.hbase.pb.OpenRegionRespons" +
+-      "e\0223\n\014close_region\030\002 \003(\0132\035.hbase.pb.Close" +
+-      "RegionResponse\"\244\001\n\023MergeRegionsRequest\022+" +
+-      "\n\010region_a\030\001 \002(\0132\031.hbase.pb.RegionSpecif" +
+-      "ier\022+\n\010region_b\030\002 \002(\0132\031.hbase.pb.RegionS" +
+-      "pecifier\022\027\n\010forcible\030\003 \001(\010:\005false\022\032\n\022mas" +
+-      "ter_system_time\030\004 \001(\004\"\026\n\024MergeRegionsRes" +
+-      "ponse2\216\016\n\014AdminService\022P\n\rGetRegionInfo\022" +
+-      "\036.hbase.pb.GetRegionInfoRequest\032\037.hbase.",
+-      "pb.GetRegionInfoResponse\022M\n\014GetStoreFile" +
+-      "\022\035.hbase.pb.GetStoreFileRequest\032\036.hbase." +
+-      "pb.GetStoreFileResponse\022V\n\017GetOnlineRegi" +
+-      "on\022 .hbase.pb.GetOnlineRegionRequest\032!.h" +
+-      "base.pb.GetOnlineRegionResponse\022G\n\nOpenR" +
+-      "egion\022\033.hbase.pb.OpenRegionRequest\032\034.hba" +
+-      "se.pb.OpenRegionResponse\022M\n\014WarmupRegion" +
+-      "\022\035.hbase.pb.WarmupRegionRequest\032\036.hbase." +
+-      "pb.WarmupRegionResponse\022J\n\013CloseRegion\022\034" +
+-      ".hbase.pb.CloseRegionRequest\032\035.hbase.pb.",
+-      "CloseRegionResponse\022J\n\013FlushRegion\022\034.hba" +
+-      "se.pb.FlushRegionRequest\032\035.hbase.pb.Flus" +
+-      "hRegionResponse\022J\n\013SplitRegion\022\034.hbase.p" +
+-      "b.SplitRegionRequest\032\035.hbase.pb.SplitReg" +
+-      "ionResponse\022P\n\rCompactRegion\022\036.hbase.pb." +
+-      "CompactRegionRequest\032\037.hbase.pb.CompactR" +
+-      "egionResponse\022\\\n\021ReplicateWALEntry\022\".hba" +
+-      "se.pb.ReplicateWALEntryRequest\032#.hbase.p" +
+-      "b.ReplicateWALEntryResponse\022Q\n\006Replay\022\"." +
+-      "hbase.pb.ReplicateWALEntryRequest\032#.hbas",
+-      "e.pb.ReplicateWALEntryResponse\022P\n\rRollWA" +
+-      "LWriter\022\036.hbase.pb.RollWALWriterRequest\032" +
+-      "\037.hbase.pb.RollWALWriterResponse\022P\n\rGetS" +
+-      "erverInfo\022\036.hbase.pb.GetServerInfoReques" +
+-      "t\032\037.hbase.pb.GetServerInfoResponse\022G\n\nSt" +
+-      "opServer\022\033.hbase.pb.StopServerRequest\032\034." +
+-      "hbase.pb.StopServerResponse\022_\n\022UpdateFav" +
+-      "oredNodes\022#.hbase.pb.UpdateFavoredNodesR" +
+-      "equest\032$.hbase.pb.UpdateFavoredNodesResp" +
+-      "onse\022b\n\023UpdateConfiguration\022$.hbase.pb.U",
+-      "pdateConfigurationRequest\032%.hbase.pb.Upd" +
+-      "ateConfigurationResponse\022P\n\rGetRegionLoa" +
+-      "d\022\036.hbase.pb.GetRegionLoadRequest\032\037.hbas" +
+-      "e.pb.GetRegionLoadResponse\022h\n\025ClearCompa" +
+-      "ctionQueues\022&.hbase.pb.ClearCompactionQu" +
+-      "euesRequest\032\'.hbase.pb.ClearCompactionQu" +
+-      "euesResponse\022k\n\026GetSpaceQuotaSnapshots\022\'" +
+-      ".hbase.pb.GetSpaceQuotaSnapshotsRequest\032" +
+-      "(.hbase.pb.GetSpaceQuotaSnapshotsRespons" +
+-      "e\022\\\n\021ExecuteProcedures\022\".hbase.pb.Execut",
+-      "eProceduresRequest\032#.hbase.pb.ExecutePro" +
+-      "ceduresResponse\022M\n\014MergeRegions\022\035.hbase." +
+-      "pb.MergeRegionsRequest\032\036.hbase.pb.MergeR" +
+-      "egionsResponseBH\n1org.apache.hadoop.hbas" +
+-      "e.shaded.protobuf.generatedB\013AdminProtos" +
+-      "H\001\210\001\001\240\001\001"
++      "on_state\030\002 \001(\010\022\026\n\016best_split_row\030\003 \001(\010\"\252" +
++      "\002\n\025GetRegionInfoResponse\022)\n\013region_info\030" +
++      "\001 \002(\0132\024.hbase.pb.RegionInfo\022I\n\020compactio" +
++      "n_state\030\002 \001(\0162/.hbase.pb.GetRegionInfoRe" +
++      "sponse.CompactionState\022\024\n\014isRecovering\030\003" +
++      " \001(\010\022\022\n\nsplittable\030\004 \001(\010\022\021\n\tmergeable\030\005 ",
++      "\001(\010\022\026\n\016best_split_row\030\006 \001(\014\"F\n\017Compactio" +
++      "nState\022\010\n\004NONE\020\000\022\t\n\005MINOR\020\001\022\t\n\005MAJOR\020\002\022\023" +
++      "\n\017MAJOR_AND_MINOR\020\003\"P\n\023GetStoreFileReque" +
++      "st\022)\n\006region\030\001 \002(\0132\031.hbase.pb.RegionSpec" +
++      "ifier\022\016\n\006family\030\002 \003(\014\"*\n\024GetStoreFileRes" +
++      "ponse\022\022\n\nstore_file\030\001 \003(\t\"\030\n\026GetOnlineRe" +
++      "gionRequest\"D\n\027GetOnlineRegionResponse\022)" +
++      "\n\013region_info\030\001 \003(\0132\024.hbase.pb.RegionInf" +
++      "o\"\263\002\n\021OpenRegionRequest\022=\n\topen_info\030\001 \003" +
++      "(\0132*.hbase.pb.OpenRegionRequest.RegionOp",
++      "enInfo\022\027\n\017serverStartCode\030\002 \001(\004\022\032\n\022maste" +
++      "r_system_time\030\005 \001(\004\032\251\001\n\016RegionOpenInfo\022$" +
++      "\n\006region\030\001 \002(\0132\024.hbase.pb.RegionInfo\022\037\n\027" +
++      "version_of_offline_node\030\002 \001(\r\022+\n\rfavored" +
++      "_nodes\030\003 \003(\0132\024.hbase.pb.ServerName\022#\n\033op" +
++      "enForDistributedLogReplay\030\004 \001(\010\"\246\001\n\022Open" +
++      "RegionResponse\022F\n\ropening_state\030\001 \003(\0162/." +
++      "hbase.pb.OpenRegionResponse.RegionOpenin" +
++      "gState\"H\n\022RegionOpeningState\022\n\n\006OPENED\020\000" +
++      "\022\022\n\016ALREADY_OPENED\020\001\022\022\n\016FAILED_OPENING\020\002",
++      "\"?\n\023WarmupRegionRequest\022(\n\nregionInfo\030\001 " +
++      "\002(\0132\024.hbase.pb.RegionInfo\"\026\n\024WarmupRegio" +
++      "nResponse\"\313\001\n\022CloseRegionRequest\022)\n\006regi" +
++      "on\030\001 \002(\0132\031.hbase.pb.RegionSpecifier\022\037\n\027v" +
++      "ersion_of_closing_node\030\002 \001(\r\022\036\n\020transiti" +
++      "on_in_ZK\030\003 \001(\010:\004true\0220\n\022destination_serv" +
++      "er\030\004 \001(\0132\024.hbase.pb.ServerName\022\027\n\017server" +
++      "StartCode\030\005 \001(\004\"%\n\023CloseRegionResponse\022\016" +
++      "\n\006closed\030\001 \002(\010\"y\n\022FlushRegionRequest\022)\n\006" +
++      "region\030\001 \002(\0132\031.hbase.pb.RegionSpecifier\022",
++      "\030\n\020if_older_than_ts\030\002 \001(\004\022\036\n\026write_flush" +
++      "_wal_marker\030\003 \001(\010\"_\n\023FlushRegionResponse" +
++      "\022\027\n\017last_flush_time\030\001 \002(\004\022\017\n\007flushed\030\002 \001" +
++      "(\010\022\036\n\026wrote_flush_wal_marker\030\003 \001(\010\"T\n\022Sp" +
++      "litRegionRequest\022)\n\006region\030\001 \002(\0132\031.hbase" +
++      ".pb.RegionSpecifier\022\023\n\013split_point\030\002 \001(\014" +
++      "\"\025\n\023SplitRegionResponse\"`\n\024CompactRegion" +
++      "Request\022)\n\006region\030\001 \002(\0132\031.hbase.pb.Regio" +
++      "nSpecifier\022\r\n\005major\030\002 \001(\010\022\016\n\006family\030\003 \001(" +
++      "\014\"\027\n\025CompactRegionResponse\"\315\001\n\031UpdateFav",
++      "oredNodesRequest\022I\n\013update_info\030\001 \003(\01324." +
++      "hbase.pb.UpdateFavoredNodesRequest.Regio" +
++      "nUpdateInfo\032e\n\020RegionUpdateInfo\022$\n\006regio" +
++      "n\030\001 \002(\0132\024.hbase.pb.RegionInfo\022+\n\rfavored" +
++      "_nodes\030\002 \003(\0132\024.hbase.pb.ServerName\".\n\032Up" +
++      "dateFavoredNodesResponse\022\020\n\010response\030\001 \001" +
++      "(\r\"a\n\010WALEntry\022\035\n\003key\030\001 \002(\0132\020.hbase.pb.W" +
++      "ALKey\022\027\n\017key_value_bytes\030\002 \003(\014\022\035\n\025associ" +
++      "ated_cell_count\030\003 \001(\005\"\242\001\n\030ReplicateWALEn" +
++      "tryRequest\022!\n\005entry\030\001 \003(\0132\022.hbase.pb.WAL",
++      "Entry\022\034\n\024replicationClusterId\030\002 \001(\t\022\"\n\032s" +
++      "ourceBaseNamespaceDirPath\030\003 \001(\t\022!\n\031sourc" +
++      "eHFileArchiveDirPath\030\004 \001(\t\"\033\n\031ReplicateW" +
++      "ALEntryResponse\"\026\n\024RollWALWriterRequest\"" +
++      "0\n\025RollWALWriterResponse\022\027\n\017region_to_fl" +
++      "ush\030\001 \003(\014\"#\n\021StopServerRequest\022\016\n\006reason" +
++      "\030\001 \002(\t\"\024\n\022StopServerResponse\"\026\n\024GetServe" +
++      "rInfoRequest\"K\n\nServerInfo\022)\n\013server_nam" +
++      "e\030\001 \002(\0132\024.hbase.pb.ServerName\022\022\n\nwebui_p" +
++      "ort\030\002 \001(\r\"B\n\025GetServerInfoResponse\022)\n\013se",
++      "rver_info\030\001 \002(\0132\024.hbase.pb.ServerInfo\"\034\n" +
++      "\032UpdateConfigurationRequest\"\035\n\033UpdateCon" +
++      "figurationResponse\"?\n\024GetRegionLoadReque" +
++      "st\022\'\n\ntable_name\030\001 \001(\0132\023.hbase.pb.TableN" +
++      "ame\"C\n\025GetRegionLoadResponse\022*\n\014region_l" +
++      "oads\030\001 \003(\0132\024.hbase.pb.RegionLoad\"2\n\034Clea" +
++      "rCompactionQueuesRequest\022\022\n\nqueue_name\030\001" +
++      " \003(\t\"\037\n\035ClearCompactionQueuesResponse\"\200\001" +
++      "\n\030ExecuteProceduresRequest\0220\n\013open_regio" +
++      "n\030\001 \003(\0132\033.hbase.pb.OpenRegionRequest\0222\n\014",
++      "close_region\030\002 \003(\0132\034.hbase.pb.CloseRegio" +
++      "nRequest\"\203\001\n\031ExecuteProceduresResponse\0221" +
++      "\n\013open_region\030\001 \003(\0132\034.hbase.pb.OpenRegio" +
++      "nResponse\0223\n\014close_region\030\002 \003(\0132\035.hbase." +
++      "pb.CloseRegionResponse\"\244\001\n\023MergeRegionsR" +
++      "equest\022+\n\010region_a\030\001 \002(\0132\031.hbase.pb.Regi" +
++      "onSpecifier\022+\n\010region_b\030\002 \002(\0132\031.hbase.pb" +
++      ".RegionSpecifier\022\027\n\010forcible\030\003 \001(\010:\005fals" +
++      "e\022\032\n\022master_system_time\030\004 \001(\004\"\026\n\024MergeRe" +
++      "gionsResponse2\216\016\n\014AdminService\022P\n\rGetReg",
++      "ionInfo\022\036.hbase.pb.GetRegionInfoRequest\032" +
++      "\037.hbase.pb.GetRegionInfoResponse\022M\n\014GetS" +
++      "toreFile\022\035.hbase.pb.GetStoreFileRequest\032" +
++      "\036.hbase.pb.GetStoreFileResponse\022V\n\017GetOn" +
++      "lineRegion\022 .hbase.pb.GetOnlineRegionReq" +
++      "uest\032!.hbase.pb.GetOnlineRegionResponse\022" +
++      "G\n\nOpenRegion\022\033.hbase.pb.OpenRegionReque" +
++      "st\032\034.hbase.pb.OpenRegionResponse\022M\n\014Warm" +
++      "upRegion\022\035.hbase.pb.WarmupRegionRequest\032" +
++      "\036.hbase.pb.WarmupRegionResponse\022J\n\013Close",
++      "Region\022\034.hbase.pb.CloseRegionRequest\032\035.h" +
++      "base.pb.CloseRegionResponse\022J\n\013FlushRegi" +
++      "on\022\034.hbase.pb.FlushRegionRequest\032\035.hbase" +
++      ".pb.FlushRegionResponse\022J\n\013SplitRegion\022\034" +
++      ".hbase.pb.SplitRegionRequest\032\035.hbase.pb." +
++      "SplitRegionResponse\022P\n\rCompactRegion\022\036.h" +
++      "base.pb.CompactRegionRequest\032\037.hbase.pb." +
++      "CompactRegionResponse\022\\\n\021ReplicateWALEnt" +
++      "ry\022\".hbase.pb.ReplicateWALEntryRequest\032#" +
++      ".hbase.pb.ReplicateWALEntryResponse\022Q\n\006R",
++      "eplay\022\".hbase.pb.ReplicateWALEntryReques" +
++      "t\032#.hbase.pb.ReplicateWALEntryResponse\022P" +
++      "\n\rRollWALWriter\022\036.hbase.pb.RollWALWriter" +
++      "Request\032\037.hbase.pb.RollWALWriterResponse" +
++      "\022P\n\rGetServerInfo\022\036.hbase.pb.GetServerIn" +
++      "foRequest\032\037.hbase.pb.GetServerInfoRespon" +
++      "se\022G\n\nStopServer\022\033.hbase.pb.StopServerRe" +
++      "quest\032\034.hbase.pb.StopServerResponse\022_\n\022U" +
++      "pdateFavoredNodes\022#.hbase.pb.UpdateFavor" +
++      "edNodesRequest\032$.hbase.pb.UpdateFavoredN",
++      "odesResponse\022b\n\023UpdateConfiguration\022$.hb" +
++      "ase.pb.UpdateConfigurationRequest\032%.hbas" +
++      "e.pb.UpdateConfigurationResponse\022P\n\rGetR" +
++      "egionLoad\022\036.hbase.pb.GetRegionLoadReques" +
++      "t\032\037.hbase.pb.GetRegionLoadResponse\022h\n\025Cl" +
++      "earCompactionQueues\022&.hbase.pb.ClearComp" +
++      "actionQueuesRequest\032\'.hbase.pb.ClearComp" +
++      "actionQueuesResponse\022k\n\026GetSpaceQuotaSna" +
++      "pshots\022\'.hbase.pb.GetSpaceQuotaSnapshots" +
++      "Request\032(.hbase.pb.GetSpaceQuotaSnapshot",
++      "sResponse\022\\\n\021ExecuteProcedures\022\".hbase.p" +
++      "b.ExecuteProceduresRequest\032#.hbase.pb.Ex" +
++      "ecuteProceduresResponse\022M\n\014MergeRegions\022" +
++      "\035.hbase.pb.MergeRegionsRequest\032\036.hbase.p" +
++      "b.MergeRegionsResponseBH\n1org.apache.had" +
++      "oop.hbase.shaded.protobuf.generatedB\013Adm" +
++      "inProtosH\001\210\001\001\240\001\001"
+     };
+     org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.InternalDescriptorAssigner assigner =
+         new org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.FileDescriptor.    InternalDescriptorAssigner() {
+@@ -30377,13 +30588,13 @@ public final class AdminProtos {
+     internal_static_hbase_pb_GetRegionInfoRequest_fieldAccessorTable = new
+       org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
+         internal_static_hbase_pb_GetRegionInfoRequest_descriptor,
+-        new java.lang.String[] { "Region", "CompactionState", });
++        new java.lang.String[] { "Region", "CompactionState", "BestSplitRow", });
+     internal_static_hbase_pb_GetRegionInfoResponse_descriptor =
+       getDescriptor().getMessageTypes().get(1);
+     internal_static_hbase_pb_GetRegionInfoResponse_fieldAccessorTable = new
+       org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.FieldAccessorTable(
+         internal_static_hbase_pb_GetRegionInfoResponse_descriptor,
+-        new java.lang.String[] { "RegionInfo", "CompactionState", "IsRecovering", "Splittable", "Mergeable", });
++        new java.lang.String[] { "RegionInfo", "CompactionState", "IsRecovering", "Splittable", "Mergeable", "BestSplitRow", });
+     internal_static_hbase_pb_GetStoreFileRequest_descriptor =
+       getDescriptor().getMessageTypes().get(2);
+     internal_static_hbase_pb_GetStoreFileRequest_fieldAccessorTable = new
+diff --git a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ClientProtos.java b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ClientProtos.java
+index b93f6cc..96652b4 100644
+--- a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ClientProtos.java
++++ b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/ClientProtos.java
+@@ -22985,7 +22985,7 @@ public final class ClientProtos {
+        * <code>optional .hbase.pb.Cursor cursor = 12;</code>
+        */
+       private org.apache.hadoop.hbase.shaded.com.google.protobuf.SingleFieldBuilderV3<
+-          org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.Cursor, org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.Cursor.Builder, org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.CursorOrBuilder>
++          org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.Cursor, org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.Cursor.Builder, org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.CursorOrBuilder> 
+           getCursorFieldBuilder() {
+         if (cursorBuilder_ == null) {
+           cursorBuilder_ = new org.apache.hadoop.hbase.shaded.com.google.protobuf.SingleFieldBuilderV3<
+@@ -41831,7 +41831,7 @@ public final class ClientProtos {
+       internal_static_hbase_pb_ScanRequest_fieldAccessorTable;
+   private static final org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.Descriptor
+     internal_static_hbase_pb_Cursor_descriptor;
+-  private static final
++  private static final 
+     org.apache.hadoop.hbase.shaded.com.google.protobuf.GeneratedMessageV3.FieldAccessorTable
+       internal_static_hbase_pb_Cursor_fieldAccessorTable;
+   private static final org.apache.hadoop.hbase.shaded.com.google.protobuf.Descriptors.Descriptor
+diff --git a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
+index 5ea2044..0d2e09f 100644
+--- a/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
++++ b/hbase-protocol-shaded/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/generated/MasterProtos.java
+@@ -11552,11 +11552,11 @@ public final class MasterProtos {
+     org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.RegionInfoOrBuilder getRegionInfoOrBuilder();
+ 
+     /**
+-     * <code>required bytes split_row = 2;</code>
++     * <code>optional bytes split_row = 2;</code>
+      */
+     boolean hasSplitRow();
+     /**
+-     * <code>required bytes split_row = 2;</code>
++     * <code>optional bytes split_row = 2;</code>
+      */
+     org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getSplitRow();
+ 
+@@ -11700,13 +11700,13 @@ public final class MasterProtos {
+     public static final int SPLIT_ROW_FIELD_NUMBER = 2;
+     private org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString splitRow_;
+     /**
+-     * <code>required bytes split_row = 2;</code>
++     * <code>optional bytes split_row = 2;</code>
+      */
+     public boolean hasSplitRow() {
+       return ((bitField0_ & 0x00000002) == 0x00000002);
+     }
+     /**
+-     * <code>required bytes split_row = 2;</code>
++     * <code>optional bytes split_row = 2;</code>
+      */
+     public org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getSplitRow() {
+       return splitRow_;
+@@ -11752,10 +11752,6 @@ public final class MasterProtos {
+         memoizedIsInitialized = 0;
+         return false;
+       }
+-      if (!hasSplitRow()) {
+-        memoizedIsInitialized = 0;
+-        return false;
+-      }
+       if (!getRegionInfo().isInitialized()) {
+         memoizedIsInitialized = 0;
+         return false;
+@@ -12106,9 +12102,6 @@ public final class MasterProtos {
+         if (!hasRegionInfo()) {
+           return false;
+         }
+-        if (!hasSplitRow()) {
+-          return false;
+-        }
+         if (!getRegionInfo().isInitialized()) {
+           return false;
+         }
+@@ -12254,19 +12247,19 @@ public final class MasterProtos {
+ 
+       private org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString splitRow_ = org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString.EMPTY;
+       /**
+-       * <code>required bytes split_row = 2;</code>
++       * <code>optional bytes split_row = 2;</code>
+        */
+       public boolean hasSplitRow() {
+         return ((bitField0_ & 0x00000002) == 0x00000002);
+       }
+       /**
+-       * <code>required bytes split_row = 2;</code>
++       * <code>optional bytes split_row = 2;</code>
+        */
+       public org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString getSplitRow() {
+         return splitRow_;
+       }
+       /**
+-       * <code>required bytes split_row = 2;</code>
++       * <code>optional bytes split_row = 2;</code>
+        */
+       public Builder setSplitRow(org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString value) {
+         if (value == null) {
+@@ -12278,7 +12271,7 @@ public final class MasterProtos {
+         return this;
+       }
+       /**
+-       * <code>required bytes split_row = 2;</code>
++       * <code>optional bytes split_row = 2;</code>
+        */
+       public Builder clearSplitRow() {
+         bitField0_ = (bitField0_ & ~0x00000002);
+@@ -81243,7 +81236,7 @@ public final class MasterProtos {
+       ".pb.RegionSpecifier\"\027\n\025OfflineRegionResp",
+       "onse\"\201\001\n\027SplitTableRegionRequest\022)\n\013regi" +
+       "on_info\030\001 \002(\0132\024.hbase.pb.RegionInfo\022\021\n\ts" +
+-      "plit_row\030\002 \002(\014\022\026\n\013nonce_group\030\003 \001(\004:\0010\022\020" +
++      "plit_row\030\002 \001(\014\022\026\n\013nonce_group\030\003 \001(\004:\0010\022\020" +
+       "\n\005nonce\030\004 \001(\004:\0010\"+\n\030SplitTableRegionResp" +
+       "onse\022\017\n\007proc_id\030\001 \001(\004\"\177\n\022CreateTableRequ" +
+       "est\022+\n\014table_schema\030\001 \002(\0132\025.hbase.pb.Tab" +
+diff --git a/hbase-protocol-shaded/src/main/protobuf/Admin.proto b/hbase-protocol-shaded/src/main/protobuf/Admin.proto
+index fe95fd5..6d67c89 100644
+--- a/hbase-protocol-shaded/src/main/protobuf/Admin.proto
++++ b/hbase-protocol-shaded/src/main/protobuf/Admin.proto
+@@ -33,6 +33,7 @@ import "Quota.proto";
+ message GetRegionInfoRequest {
+   required RegionSpecifier region = 1;
+   optional bool compaction_state = 2;
++  optional bool best_split_row = 3;
+ }
+ 
+ message GetRegionInfoResponse {
+@@ -43,6 +44,8 @@ message GetRegionInfoResponse {
+   optional bool splittable = 4;
+   // True if region is mergeable, false otherwise.
+   optional bool mergeable = 5;
++  // Get bestSplitRow
++  optional bytes best_split_row = 6;
+ 
+   enum CompactionState {
+     NONE = 0;
+diff --git a/hbase-protocol-shaded/src/main/protobuf/Master.proto b/hbase-protocol-shaded/src/main/protobuf/Master.proto
+index 7015fcb..c9c586f 100644
+--- a/hbase-protocol-shaded/src/main/protobuf/Master.proto
++++ b/hbase-protocol-shaded/src/main/protobuf/Master.proto
+@@ -136,7 +136,7 @@ message OfflineRegionResponse {
+ 
+ message SplitTableRegionRequest {
+   required RegionInfo region_info = 1;
+-  required bytes split_row = 2;
++  optional bytes split_row = 2;
+   optional uint64 nonce_group = 3 [default = 0];
+   optional uint64 nonce = 4 [default = 0];
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+index c6397f3..cb201f5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+@@ -636,7 +636,7 @@ public class MasterRpcServices extends RSRpcServices
+     try {
+       long procId = master.splitRegion(
+         HRegionInfo.convert(request.getRegionInfo()),
+-        request.getSplitRow().toByteArray(),
++        request.hasSplitRow() ? request.getSplitRow().toByteArray() : null,
+         request.getNonceGroup(),
+         request.getNonce());
+       return SplitTableRegionResponse.newBuilder().setProcId(procId).build();
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+index a7fb743..124fe25 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+@@ -67,6 +67,7 @@ import org.apache.hadoop.hbase.master.assignment.RegionStates.ServerState;
+ import org.apache.hadoop.hbase.master.assignment.RegionStates.ServerStateNode;
+ // TODO: why are they here?
+ import org.apache.hadoop.hbase.master.normalizer.NormalizationPlan.PlanType;
++import org.apache.hadoop.hbase.master.normalizer.RegionNormalizer;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureScheduler;
+ import org.apache.hadoop.hbase.master.procedure.ProcedureSyncWait;
+@@ -157,6 +158,8 @@ public class AssignmentManager implements ServerListener {
+   // TODO: why is this different from the listeners (carried over from the old AM)
+   private RegionStateListener regionStateListener;
+ 
++  private RegionNormalizer regionNormalizer;
++
+   private final MetricsAssignmentManager metrics;
+   private final RegionInTransitionChore ritChore;
+   private final MasterServices master;
+@@ -198,6 +201,9 @@ public class AssignmentManager implements ServerListener {
+     int ritChoreInterval = conf.getInt(RIT_CHORE_INTERVAL_MSEC_CONF_KEY,
+         DEFAULT_RIT_CHORE_INTERVAL_MSEC);
+     this.ritChore = new RegionInTransitionChore(ritChoreInterval);
++
++    // Used for region related procedure.
++    setRegionNormalizer(master.getRegionNormalizer());
+   }
+ 
+   public void start() throws IOException {
+@@ -301,6 +307,14 @@ public class AssignmentManager implements ServerListener {
+     this.regionStateListener = listener;
+   }
+ 
++  public void setRegionNormalizer(final RegionNormalizer normalizer) {
++    this.regionNormalizer = normalizer;
++  }
++
++  public RegionNormalizer getRegionNormalizer() {
++    return regionNormalizer;
++  }
++
+   public RegionStates getRegionStates() {
+     return regionStates;
+   }
+@@ -761,16 +775,6 @@ public class AssignmentManager implements ServerListener {
+         " hriA=" + hriA + " hriB=" + hriB);
+     }
+ 
+-    try {
+-      if (regionStateListener != null) {
+-        regionStateListener.onRegionSplit(parent);
+-      }
+-    } catch (QuotaExceededException e) {
+-      // TODO: does this really belong here?
+-      master.getRegionNormalizer().planSkipped(parent, PlanType.SPLIT);
+-      throw e;
+-    }
+-
+     // Submit the Split procedure
+     final byte[] splitKey = hriB.getStartKey();
+     if (LOG.isDebugEnabled()) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/MergeTableRegionsProcedure.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/MergeTableRegionsProcedure.java
+index 83d5506..ff5654b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/MergeTableRegionsProcedure.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/MergeTableRegionsProcedure.java
+@@ -49,12 +49,14 @@ import org.apache.hadoop.hbase.master.CatalogJanitor;
+ import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
+ import org.apache.hadoop.hbase.master.MasterFileSystem;
+ import org.apache.hadoop.hbase.master.RegionState;
++import org.apache.hadoop.hbase.master.normalizer.NormalizationPlan;
+ import org.apache.hadoop.hbase.master.procedure.AbstractStateMachineTableProcedure;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil;
+ import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;
+ import org.apache.hadoop.hbase.procedure2.ProcedureYieldException;
+ import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;
++import org.apache.hadoop.hbase.quotas.QuotaExceededException;
+ import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
+ import org.apache.hadoop.hbase.regionserver.HStoreFile;
+ import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
+@@ -529,7 +531,13 @@ public class MergeTableRegionsProcedure
+       }
+     }
+     // TODO: Clean up split and merge. Currently all over the place.
+-    env.getMasterServices().getMasterQuotaManager().onRegionMerged(this.mergedRegion);
++    try {
++      env.getMasterServices().getMasterQuotaManager().onRegionMerged(this.mergedRegion);
++    } catch (QuotaExceededException e) {
++      env.getAssignmentManager().getRegionNormalizer().planSkipped(this.mergedRegion,
++          NormalizationPlan.PlanType.MERGE);
++      throw e;
++    }
+   }
+ 
+   /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java
+index 219b67b..3d4a7a4 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/SplitTableRegionProcedure.java
+@@ -54,10 +54,12 @@ import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
+ import org.apache.hadoop.hbase.master.MasterFileSystem;
+ import org.apache.hadoop.hbase.master.RegionState.State;
+ import org.apache.hadoop.hbase.master.assignment.RegionStates.RegionStateNode;
++import org.apache.hadoop.hbase.master.normalizer.NormalizationPlan;
+ import org.apache.hadoop.hbase.master.procedure.AbstractStateMachineRegionProcedure;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;
+ import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil;
+ import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;
++import org.apache.hadoop.hbase.quotas.QuotaExceededException;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.SplitTableRegionState;
+ import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
+@@ -84,6 +86,7 @@ public class SplitTableRegionProcedure
+   private Boolean traceEnabled = null;
+   private HRegionInfo daughter_1_HRI;
+   private HRegionInfo daughter_2_HRI;
++  private byte[] bestSplitRow;
+ 
+   public SplitTableRegionProcedure() {
+     // Required by the Procedure framework to create the procedure on replay
+@@ -92,27 +95,70 @@ public class SplitTableRegionProcedure
+   public SplitTableRegionProcedure(final MasterProcedureEnv env,
+       final HRegionInfo regionToSplit, final byte[] splitRow) throws IOException {
+     super(env, regionToSplit);
+-
+-    checkSplitRow(regionToSplit, splitRow);
+-
++    this.bestSplitRow = splitRow;
++    checkSplittable(env, regionToSplit, bestSplitRow);
+     final TableName table = regionToSplit.getTable();
+     final long rid = getDaughterRegionIdTimestamp(regionToSplit);
+-    this.daughter_1_HRI = new HRegionInfo(table, regionToSplit.getStartKey(), splitRow, false, rid);
+-    this.daughter_2_HRI = new HRegionInfo(table, splitRow, regionToSplit.getEndKey(), false, rid);
++    this.daughter_1_HRI = new HRegionInfo(table, regionToSplit.getStartKey(), bestSplitRow, false, rid);
++    this.daughter_2_HRI = new HRegionInfo(table, bestSplitRow, regionToSplit.getEndKey(), false, rid);
+   }
+ 
+-  private static void checkSplitRow(final HRegionInfo regionToSplit, final byte[] splitRow)
+-      throws IOException {
+-    if (splitRow == null || splitRow.length == 0) {
+-      throw new DoNotRetryIOException("Split row cannot be null");
++  /**
++   * Check whether the region is splittable
++   * @param env MasterProcedureEnv
++   * @param regionToSplit parent Region to be split
++   * @param splitRow if splitRow is not specified, will first try to get bestSplitRow from RS
++   * @throws IOException
++   */
++  private void checkSplittable(final MasterProcedureEnv env,
++      final HRegionInfo regionToSplit, final byte[] splitRow) throws IOException {
++    // Ask the remote RS if this region is splittable.
++    // If we get an IOE, report it along w/ the failure so can see why we are not splittable at this time.
++    if(regionToSplit.getReplicaId() != HRegionInfo.DEFAULT_REPLICA_ID) {
++      throw new IllegalArgumentException ("Can't invoke split on non-default regions directly");
++    }
++    RegionStateNode node =
++        env.getAssignmentManager().getRegionStates().getRegionNode(getParentRegion());
++    IOException splittableCheckIOE = null;
++    boolean splittable = false;
++    if (node != null) {
++      try {
++        GetRegionInfoResponse response = null;
++        if (bestSplitRow == null || bestSplitRow.length == 0) {
++          LOG.info("splitKey isn't explicitly specified, " + " will try to find a best split key from RS");
++          response =
++              Util.getRegionInfoResponse(env, node.getRegionLocation(), node.getRegionInfo(), true);
++          bestSplitRow =
++              response.hasBestSplitRow() ? response.getBestSplitRow().toByteArray() : null;
++        } else {
++          response = Util.getRegionInfoResponse(env, node.getRegionLocation(), node.getRegionInfo(), false);
++        }
++        splittable = response.hasSplittable() && response.getSplittable();
++
++        if (LOG.isDebugEnabled()) {
++          LOG.debug("Splittable=" + splittable + " " + node.toShortString());
++        }
++      } catch (IOException e) {
++        splittableCheckIOE = e;
++      }
++    }
++
++    if (!splittable) {
++      IOException e = new IOException(regionToSplit.getShortNameToLog() + " NOT splittable");
++      if (splittableCheckIOE != null) e.initCause(splittableCheckIOE);
++      throw e;
++    }
++
++    if(bestSplitRow == null || bestSplitRow.length == 0) {
++      throw new DoNotRetryIOException("Region not splittable because bestSplitPoint = null");
+     }
+ 
+-    if (Bytes.equals(regionToSplit.getStartKey(), splitRow)) {
++    if (Bytes.equals(regionToSplit.getStartKey(), bestSplitRow)) {
+       throw new DoNotRetryIOException(
+         "Split row is equal to startkey: " + Bytes.toStringBinary(splitRow));
+     }
+ 
+-    if (!regionToSplit.containsRow(splitRow)) {
++    if (!regionToSplit.containsRow(bestSplitRow)) {
+       throw new DoNotRetryIOException(
+         "Split row is not inside region key range splitKey:" + Bytes.toStringBinary(splitRow) +
+         " region: " + regionToSplit);
+@@ -198,6 +244,7 @@ public class SplitTableRegionProcedure
+         setFailure(e);
+       }
+     }
++    // if split fails,  need to call ((HRegion)parent).clearSplit() when it is a force split
+     return Flow.HAS_MORE_STATE;
+   }
+ 
+@@ -367,27 +414,6 @@ public class SplitTableRegionProcedure
+             Arrays.toString(EXPECTED_SPLIT_STATES)));
+         return false;
+       }
+-
+-      // Ask the remote regionserver if this region is splittable. If we get an IOE, report it
+-      // along w/ the failure so can see why we are not splittable at this time.
+-      IOException splittableCheckIOE = null;
+-      boolean splittable = false;
+-      try {
+-        GetRegionInfoResponse response =
+-            Util.getRegionInfoResponse(env, node.getRegionLocation(), node.getRegionInfo());
+-        splittable = response.hasSplittable() && response.getSplittable();
+-        if (LOG.isDebugEnabled()) {
+-          LOG.debug("Splittable=" + splittable + " " + this + " " + node.toShortString());
+-        }
+-      } catch (IOException e) {
+-        splittableCheckIOE = e;
+-      }
+-      if (!splittable) {
+-        IOException e = new IOException(parentHRI.getShortNameToLog() + " NOT splittable");
+-        if (splittableCheckIOE != null) e.initCause(splittableCheckIOE);
+-        setFailure(e);
+-        return false;
+-      }
+     }
+ 
+     // Since we have the lock and the master is coordinating the operation
+@@ -414,6 +440,16 @@ public class SplitTableRegionProcedure
+     if (cpHost != null) {
+       cpHost.preSplitRegionAction(getTableName(), getSplitRow(), getUser());
+     }
++
++    // TODO: Clean up split and merge. Currently all over the place.
++    // Notify QuotaManager and RegionNormalizer
++    try {
++      env.getMasterServices().getMasterQuotaManager().onRegionSplit(this.getParentRegion());
++    } catch (QuotaExceededException e) {
++      env.getAssignmentManager().getRegionNormalizer().planSkipped(this.getParentRegion(),
++          NormalizationPlan.PlanType.SPLIT);
++      throw e;
++    }
+   }
+ 
+   /**
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/Util.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/Util.java
+index cb3861a..31e2af8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/Util.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/Util.java
+@@ -45,12 +45,23 @@ class Util {
+   static GetRegionInfoResponse getRegionInfoResponse(final MasterProcedureEnv env,
+       final ServerName regionLocation, final HRegionInfo hri)
+   throws IOException {
++    return getRegionInfoResponse(env, regionLocation, hri, false);
++  }
++
++  static GetRegionInfoResponse getRegionInfoResponse(final MasterProcedureEnv env,
++      final ServerName regionLocation, final HRegionInfo hri, boolean includeBestSplitRow)
++  throws IOException {
+     // TODO: There is no timeout on this controller. Set one!
+     HBaseRpcController controller = env.getMasterServices().getClusterConnection().
+         getRpcControllerFactory().newController();
+     final AdminService.BlockingInterface admin =
+         env.getMasterServices().getClusterConnection().getAdmin(regionLocation);
+-    GetRegionInfoRequest request = RequestConverter.buildGetRegionInfoRequest(hri.getRegionName());
++    GetRegionInfoRequest request = null;
++    if (includeBestSplitRow) {
++      request = RequestConverter.buildGetRegionInfoRequest(hri.getRegionName(), false, true);
++    } else {
++      request = RequestConverter.buildGetRegionInfoRequest(hri.getRegionName());
++    }
+     try {
+       return admin.getRegionInfo(controller, request);
+     } catch (ServiceException e) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 8da34ce..7a7d642 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -1673,6 +1673,16 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       requestCount.increment();
+       Region region = getRegion(request.getRegion());
+       HRegionInfo info = region.getRegionInfo();
++      byte[] bestSplitRow = null;
++      if (request.hasBestSplitRow() && request.getBestSplitRow()) {
++        HRegion r = (HRegion) region;
++        // To run checkSplit(), first need to flush region
++        // set forceSplit, since it is a force split by client
++        region.startRegionOperation(Operation.SPLIT_REGION);
++        r.flush(true);
++        r.forceSplit(null);
++        bestSplitRow = r.checkSplit();
++      }
+       GetRegionInfoResponse.Builder builder = GetRegionInfoResponse.newBuilder();
+       builder.setRegionInfo(HRegionInfo.convert(info));
+       if (request.hasCompactionState() && request.getCompactionState()) {
+@@ -1681,6 +1691,9 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       builder.setSplittable(region.isSplittable());
+       builder.setMergeable(region.isMergeable());
+       builder.setIsRecovering(region.isRecovering());
++      if (request.hasBestSplitRow() && request.getBestSplitRow() && bestSplitRow != null) {
++        builder.setBestSplitRow(UnsafeByteOperations.unsafeWrap(bestSplitRow));
++      }
+       return builder.build();
+     } catch (IOException ie) {
+       throw new ServiceException(ie);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackup.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackup.java
+index 77bed43..25c3d24 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackup.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/backup/TestIncrementalBackup.java
+@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.backup;
+ 
+ import static org.junit.Assert.assertTrue;
+ 
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+@@ -116,7 +117,15 @@ public class TestIncrementalBackup extends TestBackupBase {
+ 
+     byte[] name = regions.get(0).getRegionInfo().getRegionName();
+     long startSplitTime = EnvironmentEdgeManager.currentTime();
+-    admin.splitRegion(name);
++    try {
++      admin.splitRegion(name);
++    } catch (IOException e) {
++      //although split fail, this may not affect following check
++      //In old split without AM2, if region's best split key is not found,
++      //there are not exception thrown. But in current API, exception
++      //will be thrown.
++      LOG.debug("region is not splittable, because " + e);
++    }
+ 
+     while (!admin.isTableAvailable(table1)) {
+       Thread.sleep(100);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
+index c5681b1..ba0c604 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin1.java
+@@ -903,10 +903,12 @@ public class TestAdmin1 {
+     int[] rowCounts = new int[] { 6000 };
+     int numVersions = HColumnDescriptor.DEFAULT_VERSIONS;
+     int blockSize = 256;
+-    splitTest(null, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(null, familyNames, rowCounts, numVersions, blockSize, true);
+ 
+     byte[] splitKey = Bytes.toBytes(3500);
+-    splitTest(splitKey, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(splitKey, familyNames, rowCounts, numVersions, blockSize, true);
++    // test regionSplitSync
++    splitTest(splitKey, familyNames, rowCounts, numVersions, blockSize, false);
+   }
+ 
+   /**
+@@ -963,23 +965,23 @@ public class TestAdmin1 {
+ 
+     // one of the column families isn't splittable
+     int[] rowCounts = new int[] { 6000, 1 };
+-    splitTest(null, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(null, familyNames, rowCounts, numVersions, blockSize, true);
+ 
+     rowCounts = new int[] { 1, 6000 };
+-    splitTest(null, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(null, familyNames, rowCounts, numVersions, blockSize, true);
+ 
+     // one column family has much smaller data than the other
+     // the split key should be based on the largest column family
+     rowCounts = new int[] { 6000, 300 };
+-    splitTest(null, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(null, familyNames, rowCounts, numVersions, blockSize, true);
+ 
+     rowCounts = new int[] { 300, 6000 };
+-    splitTest(null, familyNames, rowCounts, numVersions, blockSize);
++    splitTest(null, familyNames, rowCounts, numVersions, blockSize, true);
+ 
+   }
+ 
+   void splitTest(byte[] splitPoint, byte[][] familyNames, int[] rowCounts,
+-    int numVersions, int blockSize) throws Exception {
++    int numVersions, int blockSize, boolean async) throws Exception {
+     TableName tableName = TableName.valueOf("testForceSplit");
+     StringBuilder sb = new StringBuilder();
+     // Add tail to String so can see better in logs where a test is running.
+@@ -1033,39 +1035,42 @@ public class TestAdmin1 {
+       scanner.next();
+ 
+       // Split the table
+-      this.admin.split(tableName, splitPoint);
+-
+-      final AtomicInteger count = new AtomicInteger(0);
+-      Thread t = new Thread("CheckForSplit") {
+-        @Override
+-        public void run() {
+-          for (int i = 0; i < 45; i++) {
+-            try {
+-              sleep(1000);
+-            } catch (InterruptedException e) {
+-              continue;
++      if (async) {
++        this.admin.split(tableName, splitPoint);
++        final AtomicInteger count = new AtomicInteger(0);
++        Thread t = new Thread("CheckForSplit") {
++          @Override public void run() {
++            for (int i = 0; i < 45; i++) {
++              try {
++                sleep(1000);
++              } catch (InterruptedException e) {
++                continue;
++              }
++              // check again
++              List<HRegionLocation> regions = null;
++              try {
++                regions = locator.getAllRegionLocations();
++              } catch (IOException e) {
++                e.printStackTrace();
++              }
++              if (regions == null) continue;
++              count.set(regions.size());
++              if (count.get() >= 2) {
++                LOG.info("Found: " + regions);
++                break;
++              }
++              LOG.debug("Cycle waiting on split");
+             }
+-            // check again
+-            List<HRegionLocation> regions = null;
+-            try {
+-              regions = locator.getAllRegionLocations();
+-            } catch (IOException e) {
+-              e.printStackTrace();
+-            }
+-            if (regions == null) continue;
+-            count.set(regions.size());
+-            if (count.get() >= 2) {
+-              LOG.info("Found: " + regions);
+-              break;
+-            }
+-            LOG.debug("Cycle waiting on split");
++            LOG.debug("CheckForSplit thread exited, current region count: " + count.get());
+           }
+-          LOG.debug("CheckForSplit thread exited, current region count: " + count.get());
+-        }
+-      };
+-      t.setPriority(Thread.NORM_PRIORITY - 2);
+-      t.start();
+-      t.join();
++        };
++        t.setPriority(Thread.NORM_PRIORITY - 2);
++        t.start();
++        t.join();
++      } else {
++        // Sync split region, no need to create a thread to check
++        ((HBaseAdmin)admin).splitRegionSync(m.get(0).getRegionInfo().getRegionName(), splitPoint);
++      }
+ 
+       // Verify row count
+       rows = 1; // We counted one row above.
+@@ -1166,12 +1171,23 @@ public class TestAdmin1 {
+     // regions). Try splitting that region via a different split API (the difference is
+     // this API goes direct to the regionserver skipping any checks in the admin). Should fail
+     try {
+-      TEST_UTIL.getHBaseAdmin().split(regions.get(1).getSecond(), regions.get(1).getFirst(),
++      TEST_UTIL.getHBaseAdmin().splitRegionAsync(regions.get(1).getFirst(),
+           new byte[]{(byte)'1'});
+     } catch (IOException ex) {
+       gotException = true;
+     }
+     assertTrue(gotException);
++
++    gotException = false;
++    //testing Sync split operation
++    try {
++      TEST_UTIL.getHBaseAdmin().splitRegionSync(regions.get(1).getFirst().getRegionName(),
++          new byte[]{(byte)'1'});
++    } catch (IllegalArgumentException ex) {
++      gotException = true;
++    }
++    assertTrue(gotException);
++
+     gotException = false;
+     // Try merging a replica with another. Should fail.
+     try {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestTablePermissions.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestTablePermissions.java
+index 4d2cb0b..4a16808 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestTablePermissions.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestTablePermissions.java
+@@ -316,7 +316,16 @@ public class TestTablePermissions {
+     table.put(new Put(Bytes.toBytes("row2"))
+             .addColumn(TEST_FAMILY, TEST_QUALIFIER, Bytes.toBytes("v2")));
+     Admin admin = UTIL.getAdmin();
+-    admin.split(TEST_TABLE);
++    try {
++      admin.split(TEST_TABLE);
++    }
++    catch (IOException e) {
++      //although split fail, this may not affect following check
++      //In old Split API without AM2, if region's best split key is not found,
++      //there are not exception thrown. But in current API, exception
++      //will be thrown.
++      LOG.debug("region is not splittable, because " + e);
++    }
+ 
+     // wait for split
+     Thread.sleep(10000);
+-- 
+2.10.1
+

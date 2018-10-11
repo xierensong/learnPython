@@ -1,0 +1,179 @@
+From 15c033901ef806e8f97d41a249a00ee22a1ca8e0 Mon Sep 17 00:00:00 2001
+From: Josh Elser <elserj@apache.org>
+Date: Wed, 13 Jun 2018 16:30:33 -0400
+Subject: [PATCH] HBASE-20706 Prevent MTP from pulling non-OPEN regions to
+ reopen
+
+We know MTP is using MoveProc poorly, but this is a simple
+hack which will help prevent the cluster from getting stuck
+in a fast loop while holding the table's lock.
+---
+ .../hbase/master/assignment/RegionStates.java      | 23 +++++++++++++++++++--
+ .../master/procedure/ModifyTableProcedure.java     | 22 ++++++++++++--------
+ .../master/procedure/TestModifyTableProcedure.java | 24 +++++++++++++---------
+ 3 files changed, 49 insertions(+), 20 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStates.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStates.java
+index 26b340f56e..396e1de4d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStates.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/RegionStates.java
+@@ -34,6 +34,7 @@ import java.util.TreeSet;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentSkipListMap;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.function.Predicate;
+ 
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.ServerName;
+@@ -569,6 +570,17 @@ public class RegionStates {
+     return !getTableRegionStates(tableName).isEmpty();
+   }
+ 
++  /**
++   * @return Return OPEN regions of the table
++   */
++  public List<RegionInfo> getOpenRegionsOfTable(final TableName table) {
++    // We want to get regions which are already open on the cluster or are about to be open.
++    // The use-case is for identifying regions which need to be re-opened to ensure they see some new
++    // configuration. Regions in OPENING now are presently being opened by a RS, so we can assume that they
++    // will imminently be OPEN but may not see our configuration change
++    return getRegionsOfTable(table, (state) -> state.isInState(State.OPEN) || state.isInState(State.OPENING));
++  }
++
+   /**
+    * @return Return online regions of table; does not include OFFLINE or SPLITTING regions.
+    */
+@@ -576,16 +588,23 @@ public class RegionStates {
+     return getRegionsOfTable(table, false);
+   }
+ 
++  /**
++   * @return Return online regions of table; does not include OFFLINE or SPLITTING regions.
++   */
++  public List<RegionInfo> getRegionsOfTable(final TableName table, boolean offline) {
++    return getRegionsOfTable(table, (state) -> include(state, offline));
++  }
++
+   /**
+    * @return Return the regions of the table; does not include OFFLINE unless you set
+    * <code>offline</code> to true. Does not include regions that are in the
+    * {@link State#SPLIT} state.
+    */
+-  public List<RegionInfo> getRegionsOfTable(final TableName table, final boolean offline) {
++  public List<RegionInfo> getRegionsOfTable(final TableName table, Predicate<RegionStateNode> filter) {
+     final ArrayList<RegionStateNode> nodes = getTableRegionStateNodes(table);
+     final ArrayList<RegionInfo> hris = new ArrayList<RegionInfo>(nodes.size());
+     for (RegionStateNode node: nodes) {
+-      if (include(node, offline)) hris.add(node.getRegionInfo());
++      if (filter.test(node)) hris.add(node.getRegionInfo());
+     }
+     return hris;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ModifyTableProcedure.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ModifyTableProcedure.java
+index 6fb9caa2da..2044d6894d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ModifyTableProcedure.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/ModifyTableProcedure.java
+@@ -56,7 +56,6 @@ public class ModifyTableProcedure
+   private TableDescriptor modifiedTableDescriptor;
+   private boolean deleteColumnFamilyInModify;
+ 
+-  private List<RegionInfo> regionInfoList;
+   private Boolean traceEnabled = null;
+ 
+   public ModifyTableProcedure() {
+@@ -80,7 +79,6 @@ public class ModifyTableProcedure
+ 
+   private void initilize() {
+     this.unmodifiedTableDescriptor = null;
+-    this.regionInfoList = null;
+     this.traceEnabled = null;
+     this.deleteColumnFamilyInModify = false;
+   }
+@@ -125,7 +123,7 @@ public class ModifyTableProcedure
+       case MODIFY_TABLE_REOPEN_ALL_REGIONS:
+         if (env.getAssignmentManager().isTableEnabled(getTableName())) {
+           addChildProcedure(env.getAssignmentManager()
+-            .createReopenProcedures(getRegionInfoList(env)));
++            .createReopenProcedures(getOpenRegionInfoList(env)));
+         }
+         return Flow.NO_MORE_STATE;
+       default:
+@@ -433,11 +431,19 @@ public class ModifyTableProcedure
+     }
+   }
+ 
++  /**
++   * Fetches all Regions for a table. Cache the result of this method if you need to use it multiple
++   * times. Be aware that it may change over in between calls to this procedure.
++   */
+   private List<RegionInfo> getRegionInfoList(final MasterProcedureEnv env) throws IOException {
+-    if (regionInfoList == null) {
+-      regionInfoList = env.getAssignmentManager().getRegionStates()
+-          .getRegionsOfTable(getTableName());
+-    }
+-    return regionInfoList;
++    return env.getAssignmentManager().getRegionStates().getRegionsOfTable(getTableName());
++  }
++
++  /**
++   * Fetches all Regions for a table. Cache the result of this method if you need to use it multiple
++   * times. Be aware that it may change over in between calls to this procedure.
++   */
++  private List<RegionInfo> getOpenRegionInfoList(final MasterProcedureEnv env) throws IOException {
++    return env.getAssignmentManager().getRegionStates().getOpenRegionsOfTable(getTableName());
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestModifyTableProcedure.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestModifyTableProcedure.java
+index c519835d75..51d7d2b8d7 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestModifyTableProcedure.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestModifyTableProcedure.java
+@@ -26,7 +26,10 @@ import org.apache.hadoop.hbase.HBaseClassTestRule;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
+ import org.apache.hadoop.hbase.client.RegionInfo;
++import org.apache.hadoop.hbase.client.TableDescriptor;
++import org.apache.hadoop.hbase.client.TableDescriptorBuilder;
+ import org.apache.hadoop.hbase.procedure2.Procedure;
+ import org.apache.hadoop.hbase.procedure2.ProcedureExecutor;
+ import org.apache.hadoop.hbase.procedure2.ProcedureTestingUtility;
+@@ -201,24 +204,25 @@ public class TestModifyTableProcedure extends TestTableDDLProcedureBase {
+     ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec, true);
+ 
+     // Modify multiple properties of the table.
+-    HTableDescriptor htd = new HTableDescriptor(UTIL.getAdmin().getTableDescriptor(tableName));
+-    boolean newCompactionEnableOption = htd.isCompactionEnabled() ? false : true;
+-    htd.setCompactionEnabled(newCompactionEnableOption);
+-    htd.addFamily(new HColumnDescriptor(cf2));
+-    htd.removeFamily(Bytes.toBytes(cf3));
+-    htd.setRegionReplication(3);
++    TableDescriptor oldDescriptor = UTIL.getAdmin().getDescriptor(tableName);
++    TableDescriptor newDescriptor = TableDescriptorBuilder.newBuilder(oldDescriptor)
++        .setCompactionEnabled(!oldDescriptor.isCompactionEnabled())
++        .setColumnFamily(ColumnFamilyDescriptorBuilder.of(cf2))
++        .removeColumnFamily(Bytes.toBytes(cf3))
++        .setRegionReplication(3)
++        .build();
+ 
+     // Start the Modify procedure && kill the executor
+     long procId = procExec.submitProcedure(
+-      new ModifyTableProcedure(procExec.getEnvironment(), htd));
++      new ModifyTableProcedure(procExec.getEnvironment(), newDescriptor));
+ 
+     // Restart the executor and execute the step twice
+     MasterProcedureTestingUtility.testRecoveryAndDoubleExecution(procExec, procId);
+ 
+     // Validate descriptor
+-    HTableDescriptor currentHtd = UTIL.getAdmin().getTableDescriptor(tableName);
+-    assertEquals(newCompactionEnableOption, currentHtd.isCompactionEnabled());
+-    assertEquals(2, currentHtd.getFamiliesKeys().size());
++    TableDescriptor currentDescriptor = UTIL.getAdmin().getDescriptor(tableName);
++    assertEquals(newDescriptor.isCompactionEnabled(), currentDescriptor.isCompactionEnabled());
++    assertEquals(2, newDescriptor.getColumnFamilyNames().size());
+ 
+     // cf2 should be added cf3 should be removed
+     MasterProcedureTestingUtility.validateTableCreation(UTIL.getHBaseCluster().getMaster(),
+-- 
+2.16.3
+

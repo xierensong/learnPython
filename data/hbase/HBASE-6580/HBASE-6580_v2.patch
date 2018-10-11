@@ -1,0 +1,182 @@
+From d318d9980fee51afa18292f0353f5aca050dfecc Mon Sep 17 00:00:00 2001
+From: Adrian Muraru <amuraru@adobe.com>
+Date: Sat, 1 Dec 2012 00:53:58 +0200
+Subject: [PATCH] HBASE-6580 Add HConnection#getTable to create a new HTable
+ instance
+
+---
+ .../apache/hadoop/hbase/client/HConnection.java    | 10 ++++
+ .../hadoop/hbase/client/HConnectionManager.java    | 57 ++++++++++++++++++++++
+ .../hadoop/hbase/client/TestFromClientSide.java    |  7 +--
+ .../org/apache/hadoop/hbase/client/TestHCM.java    | 16 +++---
+ 4 files changed, 74 insertions(+), 16 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnection.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnection.java
+index 17e12cd..32af909 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnection.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnection.java
+@@ -219,6 +219,16 @@ public interface HConnection extends Abortable, Closeable {
+   throws IOException;
+ 
+   /**
++   * Creates a new HTable used to communicate with a single HBase table.
++   *
++   * @return a new HTable instance
++   * @throws IOException
++   *             if a remote or network exception occurs
++   * @see {@link HTable}
++   */
++  public HTable getTable(byte[] tableName) throws IOException;
++
++  /**
+    * Establishes a connection to the region server at the specified address.
+    * @param hostname RegionServer hostname
+    * @param port RegionServer port
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+index e5a3256..4fd2810 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+@@ -44,6 +44,9 @@ import java.util.concurrent.CopyOnWriteArraySet;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
++import java.util.concurrent.SynchronousQueue;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -88,6 +91,7 @@ import org.apache.hadoop.hbase.util.Addressing;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.SoftValueSortedMap;
++import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hbase.util.Triple;
+ import org.apache.hadoop.hbase.zookeeper.MasterAddressTracker;
+ import org.apache.hadoop.hbase.zookeeper.RootRegionTracker;
+@@ -575,6 +579,11 @@ public class HConnectionManager {
+ 
+     // indicates whether this connection's life cycle is managed (by us)
+     private final boolean managed;
++
++    // thread executor shared by all HTableInterface instances created
++    // by this connection
++    private volatile ExecutorService hTableExecutor;
++
+     /**
+      * constructor
+      * @param conf Configuration object
+@@ -1338,6 +1347,53 @@ public class HConnectionManager {
+         clientClass, ClientProtocol.VERSION);
+     }
+ 
++    private void createHTableExecutor() {
++    	int maxThreads = conf.getInt("hbase.htable.threads.max",
++    			Integer.MAX_VALUE);
++    	if (maxThreads == 0) {
++    		maxThreads = 1;
++    	}
++    	long keepAliveTime = conf.getLong(
++    			"hbase.htable.threads.keepalivetime", 60);
++    	this.hTableExecutor = new ThreadPoolExecutor(
++    			1,
++    			maxThreads,
++    			keepAliveTime,
++    			TimeUnit.SECONDS,
++    			new SynchronousQueue<Runnable>(),
++    			Threads.newDaemonThreadFactory("hbase-pool-shared-executor"));
++    	((ThreadPoolExecutor) this.hTableExecutor)
++    	.allowCoreThreadTimeOut(true);
++    }
++    
++    private void shutdownHTableExecutor() {
++    	if (this.hTableExecutor != null
++    			&& !this.hTableExecutor.isShutdown()) {
++    		this.hTableExecutor.shutdown();
++    		try {
++    			if (!this.hTableExecutor.awaitTermination(10,
++    					TimeUnit.SECONDS)) {
++    				this.hTableExecutor.shutdownNow();
++    			}
++    		} catch (InterruptedException e) {
++    			this.hTableExecutor.shutdownNow();
++    		}
++    	}
++    }
++
++    @Override
++    public HTable getTable(byte[] tableName) throws IOException {
++    	if (hTableExecutor == null) {
++    		// shared HTable thread executor not yet initialized
++    		synchronized (this) {
++    			if (hTableExecutor == null) {
++    				createHTableExecutor();
++    			}
++    		}
++    	}
++    	return new HTable(tableName, this, hTableExecutor);
++    }
++
+     @Override
+     public AdminProtocol getAdmin(final String hostname,
+         final int port, final boolean master) throws IOException {
+@@ -2343,6 +2399,7 @@ public class HConnectionManager {
+         }
+       }
+       closeZooKeeperWatcher();
++      shutdownHTableExecutor();
+       this.servers.clear();
+       this.closed = true;
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+index 1bd266d..88b723e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+@@ -3996,12 +3996,7 @@ public class TestFromClientSide {
+   HTable createUnmangedHConnectionHTable(final byte [] tableName) throws IOException {
+     TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY);
+     HConnection conn = HConnectionManager.createConnection(TEST_UTIL.getConfiguration());
+-    ExecutorService pool = new ThreadPoolExecutor(1, Integer.MAX_VALUE,
+-      60, TimeUnit.SECONDS,
+-      new SynchronousQueue<Runnable>(),
+-      Threads.newDaemonThreadFactory("test-from-client"));
+-    ((ThreadPoolExecutor)pool).allowCoreThreadTimeOut(true);
+-    return new HTable(tableName, conn, pool);
++    return conn.getTable(tableName);
+   }
+ 
+   /**
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestHCM.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestHCM.java
+index eba90db..79176aa 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestHCM.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestHCM.java
+@@ -285,20 +285,16 @@ public class TestHCM {
+   public void testConnectionManagement() throws Exception{
+     TEST_UTIL.createTable(TABLE_NAME1, FAM_NAM);
+     HConnection conn = HConnectionManager.createConnection(TEST_UTIL.getConfiguration());
+-    ThreadPoolExecutor pool = new ThreadPoolExecutor(1, 10,
+-        60, TimeUnit.SECONDS,
+-        new SynchronousQueue<Runnable>(),
+-        Threads.newDaemonThreadFactory("test-hcm"));
+-
+-    HTable table = new HTable(TABLE_NAME1, conn, pool);
++    HTable table = conn.getTable(TABLE_NAME1);
+     table.close();
+     assertFalse(conn.isClosed());
+-    assertFalse(pool.isShutdown());
+-    table = new HTable(TEST_UTIL.getConfiguration(), TABLE_NAME1, pool);
++    assertFalse(table.getPool().isShutdown());
++    
++    table = conn.getTable(TABLE_NAME1);
+     table.close();
+-    assertFalse(pool.isShutdown());
++    assertFalse(table.getPool().isShutdown());
+     conn.close();
+-    pool.shutdownNow();
++    assertTrue(table.getPool().isShutdown());
+   }
+ 
+   /**
+-- 
+1.8.0
+

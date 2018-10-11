@@ -1,0 +1,2192 @@
+From 792c7442569a1f6a96c3ae63e338802f84ff2683 Mon Sep 17 00:00:00 2001
+From: anastas <anastas@yahoo-inc.com>
+Date: Wed, 27 Sep 2017 18:30:57 +0800
+Subject: [PATCH] HBASE-18010 Connect CellChunkMap to be used for flattening in
+ CompactingMemStore
+
+---
+ .../org/apache/hadoop/hbase/util/ClassSize.java    |  29 ++-
+ .../hbase/regionserver/CSLMImmutableSegment.java   |  53 ++++++
+ .../regionserver/CellArrayImmutableSegment.java    | 132 ++++++++++++++
+ .../regionserver/CellChunkImmutableSegment.java    | 195 +++++++++++++++++++++
+ .../hadoop/hbase/regionserver/CellChunkMap.java    |  33 ++--
+ .../hadoop/hbase/regionserver/ChunkCreator.java    |  27 +--
+ .../hbase/regionserver/CompactingMemStore.java     |  14 +-
+ .../hbase/regionserver/CompactionPipeline.java     |  28 ++-
+ .../regionserver/CompositeImmutableSegment.java    |  10 ++
+ .../hbase/regionserver/ImmutableMemStoreLAB.java   |   9 +
+ .../hbase/regionserver/ImmutableSegment.java       | 182 ++-----------------
+ .../hbase/regionserver/MemStoreCompactor.java      |  16 +-
+ .../hadoop/hbase/regionserver/MemStoreLAB.java     |   6 +
+ .../hadoop/hbase/regionserver/MemStoreLABImpl.java |  11 ++
+ .../hadoop/hbase/regionserver/MutableSegment.java  |   5 +
+ .../apache/hadoop/hbase/regionserver/Segment.java  |   8 +-
+ .../hadoop/hbase/regionserver/SegmentFactory.java  |  76 +++++---
+ .../org/apache/hadoop/hbase/io/TestHeapSize.java   |  29 ++-
+ .../hadoop/hbase/regionserver/TestCellFlatSet.java |  15 +-
+ .../hbase/regionserver/TestCompactingMemStore.java | 134 +++++++++-----
+ ...va => TestCompactingToCellFlatMapMemStore.java} | 150 ++++++++++++----
+ .../hbase/regionserver/TestDefaultMemStore.java    |   7 +-
+ .../regionserver/TestHRegionReplayEvents.java      |   5 +-
+ .../regionserver/TestPerColumnFamilyFlush.java     |  18 +-
+ .../TestWalAndCompactingMemStoreFlush.java         |  28 +--
+ 25 files changed, 868 insertions(+), 352 deletions(-)
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CSLMImmutableSegment.java
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellArrayImmutableSegment.java
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkImmutableSegment.java
+ rename hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/{TestCompactingToCellArrayMapMemStore.java => TestCompactingToCellFlatMapMemStore.java} (78%)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/ClassSize.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/ClassSize.java
+index 5c793eb8a4..d63b1cf444 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/ClassSize.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/ClassSize.java
+@@ -89,6 +89,15 @@ public class ClassSize {
+   /** Overhead for ConcurrentSkipListMap Entry */
+   public static final int CONCURRENT_SKIPLISTMAP_ENTRY;
+ 
++  /** Overhead for CellFlatMap */
++  public static final int CELL_FLAT_MAP;
++
++  /** Overhead for CellChunkMap */
++  public static final int CELL_CHUNK_MAP;
++
++  /** Overhead for Cell Chunk Map Entry */
++  public static final int CELL_CHUNK_MAP_ENTRY;
++
+   /** Overhead for CellArrayMap */
+   public static final int CELL_ARRAY_MAP;
+ 
+@@ -275,13 +284,17 @@ public class ClassSize {
+     // The size changes from jdk7 to jdk8, estimate the size rather than use a conditional
+     CONCURRENT_SKIPLISTMAP = (int) estimateBase(ConcurrentSkipListMap.class, false);
+ 
+-    // CELL_ARRAY_MAP is the size of an instance of CellArrayMap class, which extends
+-    // CellFlatMap class. CellArrayMap object containing a ref to an Array, so
+-    // OBJECT + REFERENCE + ARRAY
+     // CellFlatMap object contains two integers, one boolean and one reference to object, so
+     // 2*INT + BOOLEAN + REFERENCE
+-    CELL_ARRAY_MAP = align(OBJECT + 2*Bytes.SIZEOF_INT + Bytes.SIZEOF_BOOLEAN
+-        + ARRAY + 2*REFERENCE);
++    CELL_FLAT_MAP = OBJECT + 2*Bytes.SIZEOF_INT + Bytes.SIZEOF_BOOLEAN + REFERENCE;
++
++    // CELL_ARRAY_MAP is the size of an instance of CellArrayMap class, which extends
++    // CellFlatMap class. CellArrayMap object containing a ref to an Array of Cells
++    CELL_ARRAY_MAP = align(CELL_FLAT_MAP + REFERENCE + ARRAY);
++
++    // CELL_CHUNK_MAP is the size of an instance of CellChunkMap class, which extends
++    // CellFlatMap class. CellChunkMap object containing a ref to an Array of Chunks
++    CELL_CHUNK_MAP = align(CELL_FLAT_MAP + REFERENCE + ARRAY);
+ 
+     CONCURRENT_SKIPLISTMAP_ENTRY = align(
+         align(OBJECT + (3 * REFERENCE)) + /* one node per entry */
+@@ -290,6 +303,12 @@ public class ClassSize {
+     // REFERENCE in the CellArrayMap all the rest is counted in KeyValue.heapSize()
+     CELL_ARRAY_MAP_ENTRY = align(REFERENCE);
+ 
++    // The Cell Representation in the CellChunkMap, the Cell object size shouldn't be counted
++    // in KeyValue.heapSize()
++    // each cell-representation requires three integers for chunkID (reference to the ByteBuffer),
++    // offset and length, and one long for seqID
++    CELL_CHUNK_MAP_ENTRY = 3*Bytes.SIZEOF_INT + Bytes.SIZEOF_LONG;
++
+     REENTRANT_LOCK = align(OBJECT + (3 * REFERENCE));
+ 
+     ATOMIC_LONG = align(OBJECT + Bytes.SIZEOF_LONG);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CSLMImmutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CSLMImmutableSegment.java
+new file mode 100644
+index 0000000000..b5fe03397a
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CSLMImmutableSegment.java
+@@ -0,0 +1,53 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.yetus.audience.InterfaceAudience;
++import org.apache.hadoop.hbase.util.ClassSize;
++
++/**
++ * CSLMImmutableSegment is an abstract class that extends the API supported by a {@link Segment},
++ * and {@link ImmutableSegment}. This immutable segment is working with CellSet with
++ * ConcurrentSkipListMap (CSLM) delegatee.
++ */
++@InterfaceAudience.Private
++public class CSLMImmutableSegment extends ImmutableSegment {
++  public static final long DEEP_OVERHEAD_CSLM =
++      ImmutableSegment.DEEP_OVERHEAD + ClassSize.CONCURRENT_SKIPLISTMAP;
++
++  /**------------------------------------------------------------------------
++   * Copy C-tor to be used when new CSLMImmutableSegment is being built from a Mutable one.
++   * This C-tor should be used when active MutableSegment is pushed into the compaction
++   * pipeline and becomes an ImmutableSegment.
++   */
++  protected CSLMImmutableSegment(Segment segment) {
++    super(segment);
++    // update the segment metadata heap size
++    incSize(0, -MutableSegment.DEEP_OVERHEAD + DEEP_OVERHEAD_CSLM);
++  }
++
++  @Override
++  protected long indexEntrySize() {
++    return ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY;
++  }
++
++  @Override protected boolean canBeFlattened() {
++    return true;
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellArrayImmutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellArrayImmutableSegment.java
+new file mode 100644
+index 0000000000..fc3a652ec9
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellArrayImmutableSegment.java
+@@ -0,0 +1,132 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellComparator;
++import org.apache.yetus.audience.InterfaceAudience;
++import org.apache.hadoop.hbase.util.ClassSize;
++
++import java.io.IOException;
++
++/**
++ * CellArrayImmutableSegment extends the API supported by a {@link Segment},
++ * and {@link ImmutableSegment}. This immutable segment is working with CellSet with
++ * CellArrayMap delegatee.
++ */
++@InterfaceAudience.Private
++public class CellArrayImmutableSegment extends ImmutableSegment {
++
++  public static final long DEEP_OVERHEAD_CAM = DEEP_OVERHEAD + ClassSize.CELL_ARRAY_MAP;
++
++  /////////////////////  CONSTRUCTORS  /////////////////////
++  /**------------------------------------------------------------------------
++   * C-tor to be used when new CellArrayImmutableSegment is a result of compaction of a
++   * list of older ImmutableSegments.
++   * The given iterator returns the Cells that "survived" the compaction.
++   */
++  protected CellArrayImmutableSegment(CellComparator comparator, MemStoreSegmentsIterator iterator,
++      MemStoreLAB memStoreLAB, int numOfCells, MemStoreCompactor.Action action) {
++    super(null, comparator, memStoreLAB); // initiailize the CellSet with NULL
++    incSize(0, DEEP_OVERHEAD_CAM);
++    // build the new CellSet based on CellArrayMap and update the CellSet of the new Segment
++    initializeCellSet(numOfCells, iterator, action);
++  }
++
++  /**------------------------------------------------------------------------
++   * C-tor to be used when new CellChunkImmutableSegment is built as a result of flattening
++   * of CSLMImmutableSegment
++   * The given iterator returns the Cells that "survived" the compaction.
++   */
++  protected CellArrayImmutableSegment(CSLMImmutableSegment segment, MemstoreSize memstoreSize) {
++    super(segment); // initiailize the upper class
++    incSize(0, DEEP_OVERHEAD_CAM - CSLMImmutableSegment.DEEP_OVERHEAD_CSLM);
++    int numOfCells = segment.getCellsCount();
++    // build the new CellSet based on CellChunkMap and update the CellSet of this Segment
++    reinitializeCellSet(numOfCells, segment.getScanner(Long.MAX_VALUE), segment.getCellSet());
++    // arrange the meta-data size, decrease all meta-data sizes related to SkipList;
++    // add sizes of CellArrayMap entry (reinitializeCellSet doesn't take the care for the sizes)
++    long newSegmentSizeDelta = numOfCells*(indexEntrySize()-ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY);
++    incSize(0, newSegmentSizeDelta);
++    memstoreSize.incMemstoreSize(0, newSegmentSizeDelta);
++  }
++
++  @Override
++  protected long indexEntrySize() {
++    return ClassSize.CELL_ARRAY_MAP_ENTRY;
++  }
++
++  @Override
++  protected boolean canBeFlattened() {
++    return false;
++  }
++
++  /////////////////////  PRIVATE METHODS  /////////////////////
++  /*------------------------------------------------------------------------*/
++  // Create CellSet based on CellArrayMap from compacting iterator
++  private void initializeCellSet(int numOfCells, MemStoreSegmentsIterator iterator,
++      MemStoreCompactor.Action action) {
++
++    Cell[] cells = new Cell[numOfCells];   // build the Cell Array
++    int i = 0;
++    while (iterator.hasNext()) {
++      Cell c = iterator.next();
++      // The scanner behind the iterator is doing all the elimination logic
++      if (action == MemStoreCompactor.Action.MERGE) {
++        // if this is merge we just move the Cell object without copying MSLAB
++        // the sizes still need to be updated in the new segment
++        cells[i] = c;
++      } else {
++        // now we just copy it to the new segment (also MSLAB copy)
++        cells[i] = maybeCloneWithAllocator(c);
++      }
++      // second parameter true, because in compaction/merge the addition of the cell to new segment
++      // is always successful
++      updateMetaInfo(c, true, null); // updates the size per cell
++      i++;
++    }
++    // build the immutable CellSet
++    CellArrayMap cam = new CellArrayMap(getComparator(), cells, 0, i, false);
++    this.setCellSet(null, new CellSet(cam));   // update the CellSet of this Segment
++  }
++
++  /*------------------------------------------------------------------------*/
++  // Create CellSet based on CellChunkMap from current ConcurrentSkipListMap based CellSet
++  // (without compacting iterator)
++  // We do not consider cells bigger than chunks!
++  private void reinitializeCellSet(
++      int numOfCells, KeyValueScanner segmentScanner, CellSet oldCellSet) {
++    Cell[] cells = new Cell[numOfCells];   // build the Cell Array
++    Cell curCell;
++    int idx = 0;
++    try {
++      while ((curCell = segmentScanner.next()) != null) {
++        cells[idx++] = curCell;
++      }
++    } catch (IOException ie) {
++      throw new IllegalStateException(ie);
++    } finally {
++      segmentScanner.close();
++    }
++    // build the immutable CellSet
++    CellArrayMap cam = new CellArrayMap(CellComparator.COMPARATOR, cells, 0, idx, false);
++    this.setCellSet(oldCellSet, new CellSet(cam));   // update the CellSet of this Segment
++  }
++
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkImmutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkImmutableSegment.java
+new file mode 100644
+index 0000000000..d4667e1c62
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkImmutableSegment.java
+@@ -0,0 +1,195 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.hadoop.hbase.ByteBufferKeyValue;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellComparator;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.KeyValueUtil;
++import org.apache.yetus.audience.InterfaceAudience;
++import org.apache.hadoop.hbase.util.ByteBufferUtils;
++import org.apache.hadoop.hbase.util.ClassSize;
++
++import java.io.IOException;
++import java.nio.ByteBuffer;
++
++/**
++ * CellChunkImmutableSegment extends the API supported by a {@link Segment},
++ * and {@link ImmutableSegment}. This immutable segment is working with CellSet with
++ * CellChunkMap delegatee.
++ */
++@InterfaceAudience.Private
++public class CellChunkImmutableSegment extends ImmutableSegment {
++
++  public static final long DEEP_OVERHEAD_CCM =
++      ImmutableSegment.DEEP_OVERHEAD + ClassSize.CELL_CHUNK_MAP;
++
++  /////////////////////  CONSTRUCTORS  /////////////////////
++  /**------------------------------------------------------------------------
++   * C-tor to be used when new CellChunkImmutableSegment is built as a result of compaction/merge
++   * of a list of older ImmutableSegments.
++   * The given iterator returns the Cells that "survived" the compaction.
++   */
++  protected CellChunkImmutableSegment(CellComparator comparator, MemStoreSegmentsIterator iterator,
++      MemStoreLAB memStoreLAB, int numOfCells, MemStoreCompactor.Action action) {
++    super(null, comparator, memStoreLAB); // initialize the CellSet with NULL
++    incSize(0, DEEP_OVERHEAD_CCM); // initiate the heapSize with the size of the segment metadata
++    // build the new CellSet based on CellArrayMap and update the CellSet of the new Segment
++    initializeCellSet(numOfCells, iterator, action);
++  }
++
++  /**------------------------------------------------------------------------
++   * C-tor to be used when new CellChunkImmutableSegment is built as a result of flattening
++   * of CSLMImmutableSegment
++   * The given iterator returns the Cells that "survived" the compaction.
++   */
++  protected CellChunkImmutableSegment(CSLMImmutableSegment segment, MemstoreSize memstoreSize) {
++    super(segment); // initiailize the upper class
++    incSize(0,-CSLMImmutableSegment.DEEP_OVERHEAD_CSLM+ CellChunkImmutableSegment.DEEP_OVERHEAD_CCM);
++    int numOfCells = segment.getCellsCount();
++    // build the new CellSet based on CellChunkMap
++    reinitializeCellSet(numOfCells, segment.getScanner(Long.MAX_VALUE), segment.getCellSet());
++    // arrange the meta-data size, decrease all meta-data sizes related to SkipList;
++    // add sizes of CellChunkMap entry, decrease also Cell object sizes
++    // (reinitializeCellSet doesn't take the care for the sizes)
++    long newSegmentSizeDelta = numOfCells*(indexEntrySize()-ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY);
++
++    incSize(0, newSegmentSizeDelta);
++    memstoreSize.incMemstoreSize(0, newSegmentSizeDelta);
++  }
++
++  @Override
++  protected long indexEntrySize() {
++    return (ClassSize.CELL_CHUNK_MAP_ENTRY - KeyValue.FIXED_OVERHEAD);
++  }
++
++  @Override
++  protected boolean canBeFlattened() {
++    return false;
++  }
++
++  /////////////////////  PRIVATE METHODS  /////////////////////
++  /*------------------------------------------------------------------------*/
++  // Create CellSet based on CellChunkMap from compacting iterator
++  private void initializeCellSet(int numOfCells, MemStoreSegmentsIterator iterator,
++      MemStoreCompactor.Action action) {
++
++    // calculate how many chunks we will need for index
++    int chunkSize = ChunkCreator.getInstance().getChunkSize();
++    int numOfCellsInChunk = CellChunkMap.NUM_OF_CELL_REPS_IN_CHUNK;
++    int numberOfChunks = calculateNumberOfChunks(numOfCells,numOfCellsInChunk);
++    int numOfCellsAfterCompaction = 0;
++    int currentChunkIdx = 0;
++    int offsetInCurentChunk = ChunkCreator.SIZEOF_CHUNK_HEADER;
++    // all index Chunks are allocated from ChunkCreator
++    Chunk[] chunks = new Chunk[numberOfChunks];
++    for (int i=0; i < numberOfChunks; i++) {
++      chunks[i] = this.getMemStoreLAB().getNewExternalChunk();
++    }
++    while (iterator.hasNext()) {        // the iterator hides the elimination logic for compaction
++      Cell c = iterator.next();
++      numOfCellsAfterCompaction++;
++      assert (c instanceof ByteBufferKeyValue); // shouldn't get here anything but ByteBufferKeyValue
++      if (offsetInCurentChunk + ClassSize.CELL_CHUNK_MAP_ENTRY > chunkSize) {
++        currentChunkIdx++;              // continue to the next index chunk
++        offsetInCurentChunk = ChunkCreator.SIZEOF_CHUNK_HEADER;
++      }
++      if (action == MemStoreCompactor.Action.COMPACT) {
++        c = maybeCloneWithAllocator(c); // for compaction copy cell to the new segment (MSLAB copy)
++      }
++      offsetInCurentChunk = // add the Cell reference to the index chunk
++          createCellReference((ByteBufferKeyValue)c, chunks[currentChunkIdx].getData(),
++              offsetInCurentChunk);
++      // the sizes still need to be updated in the new segment
++      // second parameter true, because in compaction/merge the addition of the cell to new segment
++      // is always successful
++      updateMetaInfo(c, true, null); // updates the size per cell
++    }
++    // build the immutable CellSet
++    CellChunkMap ccm =
++        new CellChunkMap(CellComparator.COMPARATOR,chunks,0,numOfCellsAfterCompaction,false);
++    this.setCellSet(null, new CellSet(ccm));  // update the CellSet of this Segment
++  }
++
++  /*------------------------------------------------------------------------*/
++  // Create CellSet based on CellChunkMap from current ConcurrentSkipListMap based CellSet
++  // (without compacting iterator)
++  // This is a service for not-flat immutable segments
++  // Assumption: cells do not exceed chunk size!
++  private void reinitializeCellSet(
++      int numOfCells, KeyValueScanner segmentScanner, CellSet oldCellSet) {
++    Cell curCell;
++    // calculate how many chunks we will need for metadata
++    int chunkSize = ChunkCreator.getInstance().getChunkSize();
++    int numOfCellsInChunk = CellChunkMap.NUM_OF_CELL_REPS_IN_CHUNK;
++    int numberOfChunks = calculateNumberOfChunks(numOfCells,numOfCellsInChunk);
++    // all index Chunks are allocated from ChunkCreator
++    Chunk[] chunks = new Chunk[numberOfChunks];
++    for (int i=0; i < numberOfChunks; i++) {
++      chunks[i] = this.getMemStoreLAB().getNewExternalChunk();
++    }
++
++    int currentChunkIdx = 0;
++    int offsetInCurentChunk = ChunkCreator.SIZEOF_CHUNK_HEADER;
++
++    try {
++      while ((curCell = segmentScanner.next()) != null) {
++        assert (curCell instanceof ByteBufferKeyValue); // shouldn't get here anything but ByteBufferKeyValue
++        if (offsetInCurentChunk + ClassSize.CELL_CHUNK_MAP_ENTRY > chunkSize) {
++          // continue to the next metadata chunk
++          currentChunkIdx++;
++          offsetInCurentChunk = ChunkCreator.SIZEOF_CHUNK_HEADER;
++        }
++        offsetInCurentChunk =
++            createCellReference((ByteBufferKeyValue) curCell, chunks[currentChunkIdx].getData(),
++                offsetInCurentChunk);
++      }
++    } catch (IOException ie) {
++      throw new IllegalStateException(ie);
++    } finally {
++      segmentScanner.close();
++    }
++
++    CellChunkMap ccm = new CellChunkMap(CellComparator.COMPARATOR,chunks,0,numOfCells,false);
++    this.setCellSet(oldCellSet, new CellSet(ccm)); // update the CellSet of this Segment
++  }
++
++  /*------------------------------------------------------------------------*/
++  // for a given cell, write the cell representation on the index chunk
++  private int createCellReference(ByteBufferKeyValue cell, ByteBuffer idxBuffer, int idxOffset) {
++    int offset = idxOffset;
++    int dataChunkID = cell.getChunkId();
++
++    offset = ByteBufferUtils.putInt(idxBuffer, offset, dataChunkID);    // write data chunk id
++    offset = ByteBufferUtils.putInt(idxBuffer, offset, cell.getOffset());          // offset
++    offset = ByteBufferUtils.putInt(idxBuffer, offset, KeyValueUtil.length(cell)); // length
++    offset = ByteBufferUtils.putLong(idxBuffer, offset, cell.getSequenceId());     // seqId
++
++    return offset;
++  }
++
++  private int calculateNumberOfChunks(int numOfCells, int numOfCellsInChunk) {
++    int numberOfChunks = numOfCells/numOfCellsInChunk;
++    if(numOfCells%numOfCellsInChunk!=0) { // if cells cannot be divided evenly between chunks
++      numberOfChunks++;                   // add one additional chunk
++    }
++    return numberOfChunks;
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkMap.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkMap.java
+index 78315a8180..388b675eb7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkMap.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkMap.java
+@@ -21,11 +21,12 @@ package org.apache.hadoop.hbase.regionserver;
+ 
+ import java.nio.ByteBuffer;
+ 
+-import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
++import com.google.common.annotations.VisibleForTesting;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.ByteBufferUtils;
++import org.apache.hadoop.hbase.util.ClassSize;
+ 
+ import java.util.Comparator;
+ 
+@@ -56,11 +57,12 @@ import java.util.Comparator;
+ public class CellChunkMap extends CellFlatMap {
+ 
+   private final Chunk[] chunks;             // the array of chunks, on which the index is based
+-  private final int numOfCellsInsideChunk;  // constant number of cell-representations in a chunk
+ 
+-  // each cell-representation requires three integers for chunkID (reference to the ByteBuffer),
+-  // offset and length, and one long for seqID
+-  public static final int SIZEOF_CELL_REP = 3*Bytes.SIZEOF_INT + Bytes.SIZEOF_LONG ;
++  // constant number of cell-representations in a chunk
++  // each chunk starts with its own ID following the cells data
++  public static final int NUM_OF_CELL_REPS_IN_CHUNK =
++      (ChunkCreator.getInstance().getChunkSize() - ChunkCreator.SIZEOF_CHUNK_HEADER) /
++          ClassSize.CELL_CHUNK_MAP_ENTRY;
+ 
+   /**
+    * C-tor for creating CellChunkMap from existing Chunk array, which must be ordered
+@@ -75,9 +77,6 @@ public class CellChunkMap extends CellFlatMap {
+       Chunk[] chunks, int min, int max, boolean descending) {
+     super(comparator, min, max, descending);
+     this.chunks = chunks;
+-    this.numOfCellsInsideChunk = // each chunk starts with its own ID following the cells data
+-        (ChunkCreator.getInstance().getChunkSize() - Bytes.SIZEOF_INT) / SIZEOF_CELL_REP;
+-
+   }
+ 
+   /* To be used by base (CellFlatMap) class only to create a sub-CellFlatMap
+@@ -91,20 +90,20 @@ public class CellChunkMap extends CellFlatMap {
+   @Override
+   protected Cell getCell(int i) {
+     // get the index of the relevant chunk inside chunk array
+-    int chunkIndex = (i / numOfCellsInsideChunk);
++    int chunkIndex = (i / NUM_OF_CELL_REPS_IN_CHUNK);
+     ByteBuffer block = chunks[chunkIndex].getData();// get the ByteBuffer of the relevant chunk
+-    int j = i - chunkIndex * numOfCellsInsideChunk; // get the index of the cell-representation
++    int j = i - chunkIndex * NUM_OF_CELL_REPS_IN_CHUNK; // get the index of the cell-representation
+ 
+     // find inside the offset inside the chunk holding the index, skip bytes for chunk id
+-    int offsetInBytes = Bytes.SIZEOF_INT + j* SIZEOF_CELL_REP;
+-
++    int offsetInBytes = ChunkCreator.SIZEOF_CHUNK_HEADER + j* ClassSize.CELL_CHUNK_MAP_ENTRY;
+ 
+     // find the chunk holding the data of the cell, the chunkID is stored first
+     int chunkId = ByteBufferUtils.toInt(block, offsetInBytes);
+     Chunk chunk = ChunkCreator.getInstance().getChunk(chunkId);
+     if (chunk == null) {
+-      // this should not happen, putting an assertion here at least for the testing period
+-      assert false;
++      // this should not happen
++      throw new IllegalArgumentException("In CellChunkMap, cell must be associated with chunk."
++          + ". We were looking for a cell at index " + i);
+     }
+ 
+     // find the offset of the data of the cell, skip integer for chunkID, offset is stored second
+@@ -118,8 +117,10 @@ public class CellChunkMap extends CellFlatMap {
+ 
+     ByteBuffer buf = chunk.getData();   // get the ByteBuffer where the cell data is stored
+     if (buf == null) {
+-      // this should not happen, putting an assertion here at least for the testing period
+-      assert false;
++      // this should not happen
++      throw new IllegalArgumentException("In CellChunkMap, chunk must be associated with ByteBuffer."
++          + " Chunk: " + chunk + " Chunk ID: " + chunk.getId() + ", is from pool: "
++          + chunk.isFromPool() + ". We were looking for a cell at index " + i);
+     }
+ 
+     return new ByteBufferChunkCell(buf, offsetOfCell, lengthOfCell, cellSeqID);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChunkCreator.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChunkCreator.java
+index 6314f39154..551fdb10e8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChunkCreator.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChunkCreator.java
+@@ -1,4 +1,3 @@
+-
+ /**
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+@@ -18,7 +17,7 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
+-import java.lang.ref.SoftReference;
++import java.lang.ref.WeakReference;
+ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.Set;
+@@ -36,10 +35,11 @@ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.hadoop.hbase.regionserver.HeapMemoryManager.HeapMemoryTuneObserver;
++import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.util.StringUtils;
+ 
+-import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.hbase.shaded.com.google.common.util.concurrent.ThreadFactoryBuilder;
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ 
+ /**
+  * Does the management of memstoreLAB chunk creations. A monotonically incrementing id is associated
+@@ -51,7 +51,14 @@ public class ChunkCreator {
+   // monotonically increasing chunkid
+   private AtomicInteger chunkID = new AtomicInteger(1);
+   // maps the chunk against the monotonically increasing chunk id. We need to preserve the
+-  // natural ordering of the key. It also helps to protect from GC.
++  // natural ordering of the key
++  // CellChunkMap creation should convert the weak ref to hard reference
++
++  // chunk id of each chunk is the first integer written on each chunk,
++  // the header size need to be changed in case chunk id size is changed
++  public static final int SIZEOF_CHUNK_HEADER = Bytes.SIZEOF_INT;
++
++  // mapping from chunk IDs to chunks
+   private Map<Integer, Chunk> chunkIdMap = new ConcurrentHashMap<Integer, Chunk>();
+ 
+   private final int chunkSize;
+@@ -137,10 +144,6 @@ public class ChunkCreator {
+     return chunk;
+   }
+ 
+-  private Chunk createChunkForPool() {
+-    return createChunk(true, CompactingMemStore.IndexType.ARRAY_MAP);
+-  }
+-
+   /**
+    * Creates the chunk either onheap or offheap
+    * @param pool indicates if the chunks have to be created which will be used by the Pool
+@@ -226,7 +229,8 @@ public class ChunkCreator {
+       this.reclaimedChunks = new LinkedBlockingQueue<>();
+       for (int i = 0; i < initialCount; i++) {
+         // Chunks from pool are covered with strong references anyway
+-        Chunk chunk = createChunkForPool();
++        // TODO: change to CHUNK_MAP if it is generally defined
++        Chunk chunk = createChunk(true, CompactingMemStore.IndexType.ARRAY_MAP);
+         chunk.init();
+         reclaimedChunks.add(chunk);
+       }
+@@ -258,7 +262,8 @@ public class ChunkCreator {
+           long created = this.chunkCount.get();
+           if (created < this.maxCount) {
+             if (this.chunkCount.compareAndSet(created, created + 1)) {
+-              chunk = createChunkForPool();
++              // TODO: change to CHUNK_MAP if it is generally defined
++              chunk = createChunk(true, CompactingMemStore.IndexType.ARRAY_MAP);
+               break;
+             }
+           } else {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
+index 4f3f15bae8..da502c2fb8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
+@@ -314,7 +314,19 @@ public class CompactingMemStore extends AbstractMemStore {
+    *           The flattening happens only if versions match.
+    */
+   public void flattenOneSegment(long requesterVersion) {
+-    pipeline.flattenYoungestSegment(requesterVersion);
++    pipeline.flattenOneSegment(requesterVersion, indexType);
++  }
++
++  // setter is used only for testability
++  @VisibleForTesting
++  public void setIndexType() {
++    indexType = IndexType.valueOf(getConfiguration().get(
++        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_DEFAULT));
++  }
++
++  public IndexType getIndexType() {
++    return indexType;
+   }
+ 
+   public boolean hasImmutableSegments() {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactionPipeline.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactionPipeline.java
+index 39833753fd..7fb8df410b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactionPipeline.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactionPipeline.java
+@@ -48,7 +48,7 @@ import org.apache.hadoop.hbase.util.ClassSize;
+  * method accesses the read-only copy more than once it makes a local copy of it
+  * to ensure it accesses the same copy.
+  *
+- * The methods getVersionedList(), getVersionedTail(), and flattenYoungestSegment() are also
++ * The methods getVersionedList(), getVersionedTail(), and flattenOneSegment() are also
+  * protected by a lock since they need to have a consistent (atomic) view of the pipeline list
+  * and version number.
+  */
+@@ -183,7 +183,7 @@ public class CompactionPipeline {
+    *
+    * @return true iff a segment was successfully flattened
+    */
+-  public boolean flattenYoungestSegment(long requesterVersion) {
++  public boolean flattenOneSegment(long requesterVersion, CompactingMemStore.IndexType idxType) {
+ 
+     if(requesterVersion != version) {
+       LOG.warn("Segment flattening failed, because versions do not match. Requester version: "
+@@ -196,17 +196,22 @@ public class CompactionPipeline {
+         LOG.warn("Segment flattening failed, because versions do not match");
+         return false;
+       }
+-
++      int i = 0;
+       for (ImmutableSegment s : pipeline) {
+-        // remember the old size in case this segment is going to be flatten
+-        MemstoreSize memstoreSize = new MemstoreSize();
+-        if (s.flatten(memstoreSize)) {
++        if ( s.canBeFlattened() ) {
++          MemstoreSize newMemstoreSize = new MemstoreSize(); // the size to be updated
++          ImmutableSegment newS = SegmentFactory.instance().createImmutableSegmentByFlattening(
++              (CSLMImmutableSegment)s,idxType,newMemstoreSize);
++          replaceAtIndex(i,newS);
+           if(region != null) {
+-            region.addMemstoreSize(memstoreSize);
++            // update the global memstore size counter
++            // upon flattening there is no change in the data size
++            region.addMemstoreSize(new MemstoreSize(0, newMemstoreSize.getHeapSize()));
+           }
+           LOG.debug("Compaction pipeline segment " + s + " was flattened");
+           return true;
+         }
++        i++;
+       }
+ 
+     }
+@@ -271,12 +276,19 @@ public class CompactionPipeline {
+     }
+   }
+ 
++  // replacing one segment in the pipeline with a new one exactly at the same index
++  // need to be called only within synchronized block
++  private void replaceAtIndex(int idx, ImmutableSegment newSegment) {
++    pipeline.set(idx, newSegment);
++    readOnlyCopy = new LinkedList<>(pipeline);
++  }
++
+   public Segment getTail() {
+     List<? extends Segment> localCopy = getSegments();
+     if(localCopy.isEmpty()) {
+       return null;
+     }
+-    return localCopy.get(localCopy.size()-1);
++    return localCopy.get(localCopy.size() - 1);
+   }
+ 
+   private boolean addFirst(ImmutableSegment segment) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompositeImmutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompositeImmutableSegment.java
+index bd5afacf2b..1bae2676b8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompositeImmutableSegment.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompositeImmutableSegment.java
+@@ -184,6 +184,16 @@ public class CompositeImmutableSegment extends ImmutableSegment {
+     throw new IllegalStateException("Not supported by CompositeImmutableScanner");
+   }
+ 
++
++  @Override
++  protected long indexEntrySize() {
++    throw new IllegalStateException("Not supported by CompositeImmutableScanner");
++  }
++
++  @Override protected boolean canBeFlattened() {
++    return false;
++  }
++
+   /**
+    * @return Sum of all cell sizes.
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableMemStoreLAB.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableMemStoreLAB.java
+index 4a14e10793..b035f1b2d7 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableMemStoreLAB.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableMemStoreLAB.java
+@@ -45,6 +45,15 @@ public class ImmutableMemStoreLAB implements MemStoreLAB {
+     throw new IllegalStateException("This is an Immutable MemStoreLAB.");
+   }
+ 
++  @Override
++  // returning a new chunk, without replacing current chunk,
++  // the space on this chunk will be allocated externally
++  // use the first MemStoreLABImpl in the list
++  public Chunk getNewExternalChunk() {
++    MemStoreLAB mslab = this.mslabs.get(0);
++    return mslab.getNewExternalChunk();
++  }
++
+   @Override
+   public void close() {
+     // 'openScannerCount' here tracks the scanners opened on segments which directly refer to this
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableSegment.java
+index c82573dd74..aacd189e83 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableSegment.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableSegment.java
+@@ -19,14 +19,11 @@
+ package org.apache.hadoop.hbase.regionserver;
+ 
+ 
+-import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellComparator;
+-import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.hadoop.hbase.util.ClassSize;
+ import org.apache.hadoop.hbase.io.TimeRange;
+ 
+-import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+@@ -36,21 +33,11 @@ import java.util.List;
+  * and is not needed for a {@link MutableSegment}.
+  */
+ @InterfaceAudience.Private
+-public class ImmutableSegment extends Segment {
++public abstract class ImmutableSegment extends Segment {
+ 
+-  private static final long DEEP_OVERHEAD = Segment.DEEP_OVERHEAD
+-      + (2 * ClassSize.REFERENCE) // Refs to timeRange and type
+-      + ClassSize.TIMERANGE;
+-  public static final long DEEP_OVERHEAD_CSLM = DEEP_OVERHEAD + ClassSize.CONCURRENT_SKIPLISTMAP;
+-  public static final long DEEP_OVERHEAD_CAM = DEEP_OVERHEAD + ClassSize.CELL_ARRAY_MAP;
+-
+-  /**
+-   * Types of ImmutableSegment
+-   */
+-  public enum Type {
+-    SKIPLIST_MAP_BASED,
+-    ARRAY_MAP_BASED,
+-  }
++  public static final long DEEP_OVERHEAD = Segment.DEEP_OVERHEAD
++      + ClassSize.align(ClassSize.REFERENCE // Referent to timeRange
++      + ClassSize.TIMERANGE);
+ 
+   /**
+    * This is an immutable segment so use the read-only TimeRange rather than the heavy-weight
+@@ -58,12 +45,8 @@ public class ImmutableSegment extends Segment {
+    */
+   private final TimeRange timeRange;
+ 
+-  private Type type = Type.SKIPLIST_MAP_BASED;
+-
+-  // whether it is based on CellFlatMap or ConcurrentSkipListMap
+-  private boolean isFlat(){
+-    return (type != Type.SKIPLIST_MAP_BASED);
+-  }
++  // each sub-type of immutable segment knows whether it is flat or not
++  protected abstract boolean canBeFlattened();
+ 
+   /////////////////////  CONSTRUCTORS  /////////////////////
+   /**------------------------------------------------------------------------
+@@ -75,59 +58,25 @@ public class ImmutableSegment extends Segment {
+   }
+ 
+   /**------------------------------------------------------------------------
+-   * Copy C-tor to be used when new ImmutableSegment is being built from a Mutable one.
+-   * This C-tor should be used when active MutableSegment is pushed into the compaction
+-   * pipeline and becomes an ImmutableSegment.
++   * C-tor to be used to build the derived classes
+    */
+-  protected ImmutableSegment(Segment segment) {
+-    super(segment);
+-    this.type = Type.SKIPLIST_MAP_BASED;
++  protected ImmutableSegment(CellSet cs, CellComparator comparator, MemStoreLAB memStoreLAB) {
++    super(cs, comparator, memStoreLAB);
+     this.timeRange = this.timeRangeTracker == null ? null : this.timeRangeTracker.toTimeRange();
+   }
+ 
+   /**------------------------------------------------------------------------
+-   * C-tor to be used when new CELL_ARRAY BASED ImmutableSegment is a result of compaction of a
+-   * list of older ImmutableSegments.
+-   * The given iterator returns the Cells that "survived" the compaction.
+-   * The input parameter "type" exists for future use when more types of flat ImmutableSegments
+-   * are going to be introduced.
++   * Copy C-tor to be used when new CSLMImmutableSegment (derived) is being built from a Mutable one.
++   * This C-tor should be used when active MutableSegment is pushed into the compaction
++   * pipeline and becomes an ImmutableSegment.
+    */
+-  protected ImmutableSegment(CellComparator comparator, MemStoreSegmentsIterator iterator,
+-      MemStoreLAB memStoreLAB, int numOfCells, Type type, boolean merge) {
+-
+-    super(null, // initiailize the CellSet with NULL
+-        comparator, memStoreLAB);
+-    this.type = type;
+-    // build the new CellSet based on CellArrayMap
+-    CellSet cs = createCellArrayMapSet(numOfCells, iterator, merge);
+-
+-    this.setCellSet(null, cs);            // update the CellSet of the new Segment
++  protected ImmutableSegment(Segment segment) {
++    super(segment);
+     this.timeRange = this.timeRangeTracker == null ? null : this.timeRangeTracker.toTimeRange();
+   }
+ 
+-  /**------------------------------------------------------------------------
+-   * C-tor to be used when new SKIP-LIST BASED ImmutableSegment is a result of compaction of a
+-   * list of older ImmutableSegments.
+-   * The given iterator returns the Cells that "survived" the compaction.
+-   */
+-  protected ImmutableSegment(CellComparator comparator, MemStoreSegmentsIterator iterator,
+-      MemStoreLAB memStoreLAB) {
+-    super(new CellSet(comparator), // initiailize the CellSet with empty CellSet
+-        comparator, memStoreLAB);
+-    type = Type.SKIPLIST_MAP_BASED;
+-    while (iterator.hasNext()) {
+-      Cell c = iterator.next();
+-      // The scanner is doing all the elimination logic
+-      // now we just copy it to the new segment
+-      Cell newKV = maybeCloneWithAllocator(c);
+-      boolean usedMSLAB = (newKV != c);
+-      internalAdd(newKV, usedMSLAB, null);
+-    }
+-    this.timeRange = this.timeRangeTracker == null ? null : this.timeRangeTracker.toTimeRange();
+-  }
+ 
+   /////////////////////  PUBLIC METHODS  /////////////////////
+-
+   @Override
+   public boolean shouldSeek(TimeRange tr, long oldestUnexpiredTS) {
+     return this.timeRange.includesTimeRange(tr) &&
+@@ -147,107 +96,4 @@ public class ImmutableSegment extends Segment {
+     List<Segment> res = new ArrayList<>(Arrays.asList(this));
+     return res;
+   }
+-
+-  /**------------------------------------------------------------------------
+-   * Change the CellSet of this ImmutableSegment from one based on ConcurrentSkipListMap to one
+-   * based on CellArrayMap.
+-   * If this ImmutableSegment is not based on ConcurrentSkipListMap , this is NOOP
+-   *
+-   * Synchronization of the CellSet replacement:
+-   * The reference to the CellSet is AtomicReference and is updated only when ImmutableSegment
+-   * is constructed (single thread) or flattened. The flattening happens as part of a single
+-   * thread of compaction, but to be on the safe side the initial CellSet is locally saved
+-   * before the flattening and then replaced using CAS instruction.
+-   */
+-  public boolean flatten(MemstoreSize memstoreSize) {
+-    if (isFlat()) return false;
+-    CellSet oldCellSet = getCellSet();
+-    int numOfCells = getCellsCount();
+-
+-    // build the new (CellSet CellArrayMap based)
+-    CellSet  newCellSet = recreateCellArrayMapSet(numOfCells);
+-    type = Type.ARRAY_MAP_BASED;
+-    setCellSet(oldCellSet,newCellSet);
+-
+-    // arrange the meta-data size, decrease all meta-data sizes related to SkipList
+-    // (recreateCellArrayMapSet doesn't take the care for the sizes)
+-    long newSegmentSizeDelta = -(numOfCells * ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY);
+-    // add size of CellArrayMap and meta-data overhead per Cell
+-    newSegmentSizeDelta = newSegmentSizeDelta + numOfCells * ClassSize.CELL_ARRAY_MAP_ENTRY;
+-    incSize(0, newSegmentSizeDelta);
+-    if (memstoreSize != null) {
+-      memstoreSize.incMemstoreSize(0, newSegmentSizeDelta);
+-    }
+-
+-    return true;
+-  }
+-
+-  /////////////////////  PRIVATE METHODS  /////////////////////
+-  /*------------------------------------------------------------------------*/
+-  // Create CellSet based on CellArrayMap from compacting iterator
+-  private CellSet createCellArrayMapSet(int numOfCells, MemStoreSegmentsIterator iterator,
+-      boolean merge) {
+-
+-    Cell[] cells = new Cell[numOfCells];   // build the Cell Array
+-    int i = 0;
+-    while (iterator.hasNext()) {
+-      Cell c = iterator.next();
+-      // The scanner behind the iterator is doing all the elimination logic
+-      if (merge) {
+-        // if this is merge we just move the Cell object without copying MSLAB
+-        // the sizes still need to be updated in the new segment
+-        cells[i] = c;
+-      } else {
+-        // now we just copy it to the new segment (also MSLAB copy)
+-        cells[i] = maybeCloneWithAllocator(c);
+-      }
+-      boolean useMSLAB = (getMemStoreLAB()!=null);
+-      // second parameter true, because in compaction/merge the addition of the cell to new segment
+-      // is always successful
+-      updateMetaInfo(c, true, useMSLAB, null); // updates the size per cell
+-      i++;
+-    }
+-    // build the immutable CellSet
+-    CellArrayMap cam = new CellArrayMap(getComparator(), cells, 0, i, false);
+-    return new CellSet(cam);
+-  }
+-
+-  @Override
+-  protected long heapSizeChange(Cell cell, boolean succ) {
+-    if (succ) {
+-      switch (this.type) {
+-      case SKIPLIST_MAP_BASED:
+-        return super.heapSizeChange(cell, succ);
+-      case ARRAY_MAP_BASED:
+-        return ClassSize.align(ClassSize.CELL_ARRAY_MAP_ENTRY + CellUtil.estimatedHeapSizeOf(cell));
+-      }
+-    }
+-    return 0;
+-  }
+-
+-  /*------------------------------------------------------------------------*/
+-  // Create CellSet based on CellArrayMap from current ConcurrentSkipListMap based CellSet
+-  // (without compacting iterator)
+-  private CellSet recreateCellArrayMapSet(int numOfCells) {
+-
+-    Cell[] cells = new Cell[numOfCells];   // build the Cell Array
+-    Cell curCell;
+-    int idx = 0;
+-    // create this segment scanner with maximal possible read point, to go over all Cells
+-    KeyValueScanner segmentScanner = this.getScanner(Long.MAX_VALUE);
+-
+-    try {
+-      while ((curCell = segmentScanner.next()) != null) {
+-        cells[idx++] = curCell;
+-      }
+-    } catch (IOException ie) {
+-      throw new IllegalStateException(ie);
+-    } finally {
+-      segmentScanner.close();
+-    }
+-
+-    // build the immutable CellSet
+-    CellArrayMap cam = new CellArrayMap(getComparator(), cells, 0, idx, false);
+-    return new CellSet(cam);
+-  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreCompactor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreCompactor.java
+index 49a057c414..b03c91f3b6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreCompactor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreCompactor.java
+@@ -80,7 +80,7 @@ public class MemStoreCompactor {
+    * Note that every value covers the previous ones, i.e. if MERGE is the action it implies
+    * that the youngest segment is going to be flatten anyway.
+    */
+-  private enum Action {
++  public enum Action {
+     NOOP,
+     FLATTEN,  // flatten the youngest segment in the pipeline
+     MERGE,    // merge all the segments in the pipeline into one
+@@ -160,7 +160,7 @@ public class MemStoreCompactor {
+ 
+     if (action == Action.COMPACT) { // compact according to the user request
+       LOG.debug("In-Memory Compaction Pipeline for store " + compactingMemStore.getFamilyName()
+-          + " is going to be compacted, number of"
++          + " is going to be compacted to the " + compactingMemStore.getIndexType() + ". Number of"
+           + " cells before compaction is " + versionedList.getNumOfCells());
+       return Action.COMPACT;
+     }
+@@ -170,13 +170,15 @@ public class MemStoreCompactor {
+     int numOfSegments = versionedList.getNumOfSegments();
+     if (numOfSegments > pipelineThreshold) {
+       LOG.debug("In-Memory Compaction Pipeline for store " + compactingMemStore.getFamilyName()
+-          + " is going to be merged, as there are " + numOfSegments + " segments");
++          + " is going to be merged to the " + compactingMemStore.getIndexType()
++          + ", as there are " + numOfSegments + " segments");
+       return Action.MERGE;          // to avoid too many segments, merge now
+     }
+ 
+     // if nothing of the above, then just flatten the newly joined segment
+     LOG.debug("The youngest segment in the in-Memory Compaction Pipeline for store "
+-        + compactingMemStore.getFamilyName() + " is going to be flattened");
++        + compactingMemStore.getFamilyName() + " is going to be flattened to the "
++        + compactingMemStore.getIndexType());
+     return Action.FLATTEN;
+   }
+ 
+@@ -250,7 +252,7 @@ public class MemStoreCompactor {
+ 
+         result = SegmentFactory.instance().createImmutableSegmentByCompaction(
+           compactingMemStore.getConfiguration(), compactingMemStore.getComparator(), iterator,
+-          versionedList.getNumOfCells(), ImmutableSegment.Type.ARRAY_MAP_BASED);
++            versionedList.getNumOfCells(), compactingMemStore.getIndexType());
+         iterator.close();
+         break;
+       case MERGE:
+@@ -259,8 +261,8 @@ public class MemStoreCompactor {
+ 
+         result = SegmentFactory.instance().createImmutableSegmentByMerge(
+           compactingMemStore.getConfiguration(), compactingMemStore.getComparator(), iterator,
+-          versionedList.getNumOfCells(), ImmutableSegment.Type.ARRAY_MAP_BASED,
+-          versionedList.getStoreSegments());
++          versionedList.getNumOfCells(), versionedList.getStoreSegments(),
++          compactingMemStore.getIndexType());
+         iterator.close();
+         break;
+       default:
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLAB.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLAB.java
+index da4efc82db..24865e63cb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLAB.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLAB.java
+@@ -83,6 +83,12 @@ public interface MemStoreLAB {
+    */
+   void decScannerCount();
+ 
++  /**
++   * Return a new empty chunk without considering this chunk as current
++   * The space on this chunk will be allocated externally
++   */
++  Chunk getNewExternalChunk();
++
+   public static MemStoreLAB newInstance(Configuration conf) {
+     MemStoreLAB memStoreLAB = null;
+     if (isEnabled(conf)) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+index 8d37aadbf5..c7035eda51 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+@@ -253,6 +253,17 @@ public class MemStoreLABImpl implements MemStoreLAB {
+     return null;
+   }
+ 
++  // Returning a new chunk, without replacing current chunk,
++  // meaning MSLABImpl does not make the returned chunk as CurChunk.
++  // The space on this chunk will be allocated externally
++  // The interface is only for external callers
++  @Override
++  public Chunk getNewExternalChunk() {
++    Chunk c = this.chunkCreator.getChunk();
++    chunks.add(c.getId());
++    return c;
++  }
++
+   @VisibleForTesting
+   Chunk getCurrentChunk() {
+     return this.curChunk.get();
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MutableSegment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MutableSegment.java
+index 1db54c5c33..ea8dfde0c5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MutableSegment.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MutableSegment.java
+@@ -42,6 +42,7 @@ public class MutableSegment extends Segment {
+ 
+   protected MutableSegment(CellSet cellSet, CellComparator comparator, MemStoreLAB memStoreLAB) {
+     super(cellSet, comparator, memStoreLAB);
++    incSize(0,DEEP_OVERHEAD); // update the mutable segment metadata
+   }
+ 
+   /**
+@@ -121,4 +122,8 @@ public class MutableSegment extends Segment {
+   public long getMinTimestamp() {
+     return this.timeRangeTracker.getMin();
+   }
++
++  @Override protected long indexEntrySize() {
++      return ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Segment.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Segment.java
+index fc787183da..e4740ba26c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Segment.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Segment.java
+@@ -305,6 +305,10 @@ public abstract class Segment {
+     }
+   }
+ 
++  protected void updateMetaInfo(Cell cellToAdd, boolean succ, MemstoreSize memstoreSize) {
++    updateMetaInfo(cellToAdd, succ, (getMemStoreLAB()!=null), memstoreSize);
++  }
++
+   /**
+    * @return The increase in heap size because of this cell addition. This includes this cell POJO's
+    *         heap size itself and additional overhead because of addition on to CSLM.
+@@ -312,11 +316,13 @@ public abstract class Segment {
+   protected long heapSizeChange(Cell cell, boolean succ) {
+     if (succ) {
+       return ClassSize
+-          .align(ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + CellUtil.estimatedHeapSizeOf(cell));
++          .align(indexEntrySize() + CellUtil.estimatedHeapSizeOf(cell));
+     }
+     return 0;
+   }
+ 
++  protected abstract long indexEntrySize();
++
+   /**
+    * Returns a subset of the segment cell set, which starts with the given cell
+    * @param firstCell a cell in the segment
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SegmentFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SegmentFactory.java
+index bd2cd29f81..3777f35a94 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SegmentFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SegmentFactory.java
+@@ -18,7 +18,6 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
+-import org.apache.hadoop.hbase.shaded.com.google.common.base.Preconditions;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.CellComparator;
+ import org.apache.yetus.audience.InterfaceAudience;
+@@ -41,42 +40,36 @@ public final class SegmentFactory {
+     return instance;
+   }
+ 
+-  // create skip-list-based (non-flat) immutable segment from compacting old immutable segments
+-  public ImmutableSegment createImmutableSegment(final Configuration conf,
+-      final CellComparator comparator, MemStoreSegmentsIterator iterator) {
+-    return new ImmutableSegment(comparator, iterator, MemStoreLAB.newInstance(conf));
+-  }
+-
+   // create composite immutable segment from a list of segments
++  // for snapshot consisting of multiple segments
+   public CompositeImmutableSegment createCompositeImmutableSegment(
+       final CellComparator comparator, List<ImmutableSegment> segments) {
+     return new CompositeImmutableSegment(comparator, segments);
+-
+   }
+ 
+   // create new flat immutable segment from compacting old immutable segments
++  // for compaction
+   public ImmutableSegment createImmutableSegmentByCompaction(final Configuration conf,
+       final CellComparator comparator, MemStoreSegmentsIterator iterator, int numOfCells,
+-      ImmutableSegment.Type segmentType)
++      CompactingMemStore.IndexType idxType)
+       throws IOException {
+-    Preconditions.checkArgument(segmentType == ImmutableSegment.Type.ARRAY_MAP_BASED,
+-        "wrong immutable segment type");
++
+     MemStoreLAB memStoreLAB = MemStoreLAB.newInstance(conf);
+     return
+-        // the last parameter "false" means not to merge, but to compact the pipeline
+-        // in order to create the new segment
+-        new ImmutableSegment(comparator, iterator, memStoreLAB, numOfCells, segmentType, false);
++        createImmutableSegment(
++            conf,comparator,iterator,memStoreLAB,numOfCells,MemStoreCompactor.Action.COMPACT,idxType);
+   }
+ 
+   // create empty immutable segment
++  // for initializations
+   public ImmutableSegment createImmutableSegment(CellComparator comparator) {
+     MutableSegment segment = generateMutableSegment(null, comparator, null);
+     return createImmutableSegment(segment);
+   }
+ 
+-  // create immutable segment from mutable segment
++  // create not-flat immutable segment from mutable segment
+   public ImmutableSegment createImmutableSegment(MutableSegment segment) {
+-    return new ImmutableSegment(segment);
++    return new CSLMImmutableSegment(segment);
+   }
+ 
+   // create mutable segment
+@@ -86,19 +79,58 @@ public final class SegmentFactory {
+   }
+ 
+   // create new flat immutable segment from merging old immutable segments
++  // for merge
+   public ImmutableSegment createImmutableSegmentByMerge(final Configuration conf,
+       final CellComparator comparator, MemStoreSegmentsIterator iterator, int numOfCells,
+-      ImmutableSegment.Type segmentType, List<ImmutableSegment> segments)
++      List<ImmutableSegment> segments, CompactingMemStore.IndexType idxType)
+       throws IOException {
+-    Preconditions.checkArgument(segmentType == ImmutableSegment.Type.ARRAY_MAP_BASED,
+-        "wrong immutable segment type");
++
+     MemStoreLAB memStoreLAB = getMergedMemStoreLAB(conf, segments);
+     return
+-        // the last parameter "true" means to merge the compaction pipeline
+-        // in order to create the new segment
+-        new ImmutableSegment(comparator, iterator, memStoreLAB, numOfCells, segmentType, true);
++        createImmutableSegment(
++            conf,comparator,iterator,memStoreLAB,numOfCells,MemStoreCompactor.Action.MERGE,idxType);
++
++  }
++
++  // create flat immutable segment from non-flat immutable segment
++  // for flattening
++  public ImmutableSegment createImmutableSegmentByFlattening(
++      CSLMImmutableSegment segment, CompactingMemStore.IndexType idxType, MemstoreSize memstoreSize) {
++    ImmutableSegment res = null;
++    switch (idxType) {
++    case CHUNK_MAP:
++      res = new CellChunkImmutableSegment(segment, memstoreSize);
++      break;
++    case CSLM_MAP:
++      assert false; // non-flat segment can not be the result of flattening
++      break;
++    case ARRAY_MAP:
++      res = new CellArrayImmutableSegment(segment, memstoreSize);
++      break;
++    }
++    return res;
+   }
++
++
+   //****** private methods to instantiate concrete store segments **********//
++  private ImmutableSegment createImmutableSegment(final Configuration conf, final CellComparator comparator,
++      MemStoreSegmentsIterator iterator, MemStoreLAB memStoreLAB, int numOfCells,
++      MemStoreCompactor.Action action, CompactingMemStore.IndexType idxType) {
++
++    ImmutableSegment res = null;
++    switch (idxType) {
++    case CHUNK_MAP:
++      res = new CellChunkImmutableSegment(comparator, iterator, memStoreLAB, numOfCells, action);
++      break;
++    case CSLM_MAP:
++      assert false; // non-flat segment can not be created here
++      break;
++    case ARRAY_MAP:
++      res = new CellArrayImmutableSegment(comparator, iterator, memStoreLAB, numOfCells, action);
++      break;
++    }
++    return res;
++  }
+ 
+   private MutableSegment generateMutableSegment(final Configuration conf, CellComparator comparator,
+       MemStoreLAB memStoreLAB) {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/TestHeapSize.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/TestHeapSize.java
+index 8a6e19b4db..8ef666d99d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/TestHeapSize.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/TestHeapSize.java
+@@ -369,6 +369,7 @@ public class TestHeapSize  {
+     if (expected != actual) {
+       ClassSize.estimateBase(cl, true);
+       ClassSize.estimateBase(AtomicLong.class, true);
++      ClassSize.estimateBase(AtomicLong.class, true);
+       ClassSize.estimateBase(AtomicReference.class, true);
+       ClassSize.estimateBase(CellSet.class, true);
+       ClassSize.estimateBase(TimeRangeTracker.class, true);
+@@ -376,9 +377,28 @@ public class TestHeapSize  {
+       assertEquals(expected, actual);
+     }
+ 
+-    // ImmutableSegment Deep overhead
++    // ImmutableSegments Deep overhead
+     cl = ImmutableSegment.class;
+-    actual = ImmutableSegment.DEEP_OVERHEAD_CSLM;
++    actual = ImmutableSegment.DEEP_OVERHEAD;
++    expected = ClassSize.estimateBase(cl, false);
++    expected += 2 * ClassSize.estimateBase(AtomicLong.class, false);
++    expected += ClassSize.estimateBase(AtomicReference.class, false);
++    expected += ClassSize.estimateBase(CellSet.class, false);
++    expected += ClassSize.estimateBase(TimeRangeTracker.class, false);
++    expected += ClassSize.estimateBase(TimeRange.class, false);
++    if (expected != actual) {
++      ClassSize.estimateBase(cl, true);
++      ClassSize.estimateBase(AtomicLong.class, true);
++      ClassSize.estimateBase(AtomicLong.class, true);
++      ClassSize.estimateBase(AtomicReference.class, true);
++      ClassSize.estimateBase(CellSet.class, true);
++      ClassSize.estimateBase(TimeRangeTracker.class, true);
++      ClassSize.estimateBase(TimeRange.class, true);
++      assertEquals(expected, actual);
++    }
++
++    cl = CSLMImmutableSegment.class;
++    actual = CSLMImmutableSegment.DEEP_OVERHEAD_CSLM;
+     expected = ClassSize.estimateBase(cl, false);
+     expected += 2 * ClassSize.estimateBase(AtomicLong.class, false);
+     expected += ClassSize.estimateBase(AtomicReference.class, false);
+@@ -389,6 +409,7 @@ public class TestHeapSize  {
+     if (expected != actual) {
+       ClassSize.estimateBase(cl, true);
+       ClassSize.estimateBase(AtomicLong.class, true);
++      ClassSize.estimateBase(AtomicLong.class, true);
+       ClassSize.estimateBase(AtomicReference.class, true);
+       ClassSize.estimateBase(CellSet.class, true);
+       ClassSize.estimateBase(TimeRangeTracker.class, true);
+@@ -396,7 +417,8 @@ public class TestHeapSize  {
+       ClassSize.estimateBase(ConcurrentSkipListMap.class, true);
+       assertEquals(expected, actual);
+     }
+-    actual = ImmutableSegment.DEEP_OVERHEAD_CAM;
++    cl = CellArrayImmutableSegment.class;
++    actual = CellArrayImmutableSegment.DEEP_OVERHEAD_CAM;
+     expected = ClassSize.estimateBase(cl, false);
+     expected += 2 * ClassSize.estimateBase(AtomicLong.class, false);
+     expected += ClassSize.estimateBase(AtomicReference.class, false);
+@@ -407,6 +429,7 @@ public class TestHeapSize  {
+     if (expected != actual) {
+       ClassSize.estimateBase(cl, true);
+       ClassSize.estimateBase(AtomicLong.class, true);
++      ClassSize.estimateBase(AtomicLong.class, true);
+       ClassSize.estimateBase(AtomicReference.class, true);
+       ClassSize.estimateBase(CellSet.class, true);
+       ClassSize.estimateBase(TimeRangeTracker.class, true);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCellFlatSet.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCellFlatSet.java
+index 5872d692af..6307d3202a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCellFlatSet.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCellFlatSet.java
+@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.testclassification.RegionServerTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.util.ByteBufferUtils;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ClassSize;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+@@ -286,8 +287,8 @@ public class TestCellFlatSet extends TestCase {
+ 
+     ByteBuffer idxBuffer = idxChunk.getData();  // the buffers of the chunks
+     ByteBuffer dataBuffer = dataChunk.getData();
+-    int dataOffset = Bytes.SIZEOF_INT;          // offset inside data buffer
+-    int idxOffset = Bytes.SIZEOF_INT;           // skip the space for chunk ID
++    int dataOffset = ChunkCreator.SIZEOF_CHUNK_HEADER;          // offset inside data buffer
++    int idxOffset = ChunkCreator.SIZEOF_CHUNK_HEADER;           // skip the space for chunk ID
+ 
+     Cell[] cellArray = asc ? ascCells : descCells;
+ 
+@@ -296,16 +297,16 @@ public class TestCellFlatSet extends TestCase {
+       if (dataOffset + KeyValueUtil.length(kv) > chunkCreator.getChunkSize()) {
+         dataChunk = chunkCreator.getChunk();    // allocate more data chunks if needed
+         dataBuffer = dataChunk.getData();
+-        dataOffset = Bytes.SIZEOF_INT;
++        dataOffset = ChunkCreator.SIZEOF_CHUNK_HEADER;
+       }
+       int dataStartOfset = dataOffset;
+       dataOffset = KeyValueUtil.appendTo(kv, dataBuffer, dataOffset, false); // write deep cell data
+ 
+       // do we have enough space to write the cell-representation on the index chunk?
+-      if (idxOffset + CellChunkMap.SIZEOF_CELL_REP > chunkCreator.getChunkSize()) {
++      if (idxOffset + ClassSize.CELL_CHUNK_MAP_ENTRY > chunkCreator.getChunkSize()) {
+         idxChunk = chunkCreator.getChunk();    // allocate more index chunks if needed
+         idxBuffer = idxChunk.getData();
+-        idxOffset = Bytes.SIZEOF_INT;
++        idxOffset = ChunkCreator.SIZEOF_CHUNK_HEADER;
+         chunkArray[chunkArrayIdx++] = idxChunk;
+       }
+       idxOffset = ByteBufferUtils.putInt(idxBuffer, idxOffset, dataChunk.getId()); // write data chunk id
+@@ -314,8 +315,6 @@ public class TestCellFlatSet extends TestCase {
+       idxOffset = ByteBufferUtils.putLong(idxBuffer, idxOffset, kv.getSequenceId());     // seqId
+     }
+ 
+-    return asc ?
+-        new CellChunkMap(CellComparator.COMPARATOR,chunkArray,0,NUM_OF_CELLS,false) :
+-        new CellChunkMap(CellComparator.COMPARATOR,chunkArray,0,NUM_OF_CELLS,true);
++    return new CellChunkMap(CellComparator.COMPARATOR,chunkArray,0,NUM_OF_CELLS,!asc);
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+index c5570e720d..dc3cf4d902 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+@@ -32,6 +32,7 @@ import org.apache.hadoop.hbase.io.util.MemorySizeUtil;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.testclassification.RegionServerTests;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ClassSize;
+ import org.apache.hadoop.hbase.util.EnvironmentEdge;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.Threads;
+@@ -98,7 +99,7 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
+         .getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf, false));
+     chunkCreator = ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false,
+-      globalMemStoreLimit, 0.2f, MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT, null);
++        globalMemStoreLimit, 0.4f, MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT, null);
+     assertTrue(chunkCreator != null);
+   }
+ 
+@@ -563,16 +564,71 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     assertTrue(chunkCreator.getPoolSize() > 0);
+   }
+ 
++  @Test
++  public void testFlatteningToCellChunkMap() throws IOException {
++
++    // set memstore to flat into CellChunkMap
++    MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.BASIC;
++    memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
++        String.valueOf(compactionType));
++    ((CompactingMemStore)memstore).initiateType(compactionType);
++    memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++        String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
++    ((CompactingMemStore)memstore).setIndexType();
++    int numOfCells = 8;
++    String[] keys1 = { "A", "A", "B", "C", "D", "D", "E", "F" }; //A1, A2, B3, C4, D5, D6, E7, F8
++
++    // make one cell
++    byte[] row = Bytes.toBytes(keys1[0]);
++    byte[] val = Bytes.toBytes(keys1[0] + 0);
++    KeyValue kv =
++        new KeyValue(row, Bytes.toBytes("testfamily"), Bytes.toBytes("testqualifier"),
++            System.currentTimeMillis(), val);
++
++    // test 1 bucket
++    int totalCellsLen = addRowsByKeys(memstore, keys1);
++    long oneCellOnCSLMHeapSize =
++        ClassSize.align(
++            ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + KeyValue.FIXED_OVERHEAD + KeyValueUtil
++                .length(kv));
++
++    long totalHeapSize = numOfCells * oneCellOnCSLMHeapSize + MutableSegment.DEEP_OVERHEAD;
++    assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
++    assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
++
++    ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline and flatten
++    assertEquals(0, memstore.getSnapshot().getCellsCount());
++    // One cell is duplicated, but it shouldn't be compacted because we are in BASIC mode.
++    // totalCellsLen should remain the same
++    long oneCellOnCCMHeapSize =
++        ClassSize.CELL_CHUNK_MAP_ENTRY + ClassSize.align(KeyValueUtil.length(kv));
++    totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellChunkImmutableSegment.DEEP_OVERHEAD_CCM
++        + numOfCells * oneCellOnCCMHeapSize;
++
++    assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
++    assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
++
++    MemstoreSize size = memstore.getFlushableSize();
++    MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
++    region.decrMemstoreSize(size);  // simulate flusher
++    ImmutableSegment s = memstore.getSnapshot();
++    assertEquals(numOfCells, s.getCellsCount());
++    assertEquals(0, regionServicesForStores.getMemstoreSize());
++
++    memstore.clearSnapshot(snapshot.getId());
++  }
++
+   //////////////////////////////////////////////////////////////////////////////
+   // Compaction tests
+   //////////////////////////////////////////////////////////////////////////////
+   @Test
+   public void testCompaction1Bucket() throws IOException {
+ 
+-    // set memstore to do data compaction and not to use the speculative scan
+-    MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.EAGER;
+-    memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+-        String.valueOf(compactionType));
++    // set memstore to do basic structure flattening, the "eager" option is tested in
++    // TestCompactingToCellFlatMapMemStore
++    MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.BASIC;
++    memstore.getConfiguration()
++        .set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY, String.valueOf(compactionType));
+     ((CompactingMemStore)memstore).initiateType(compactionType);
+ 
+     String[] keys1 = { "A", "A", "B", "C" }; //A1, A2, B3, C4
+@@ -581,25 +637,24 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     int totalCellsLen = addRowsByKeys(memstore, keys1);
+     int oneCellOnCSLMHeapSize = 120;
+     int oneCellOnCAHeapSize = 88;
+-    long totalHeapSize = 4 * oneCellOnCSLMHeapSize;
++    long totalHeapSize = MutableSegment.DEEP_OVERHEAD + 4 * oneCellOnCSLMHeapSize;
+     assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+-    MemstoreSize size = memstore.getFlushableSize();
+     ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline and compact
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+-    // One cell is duplicated and the compaction will remove it. All cells of same size so adjusting
+-    // totalCellsLen
+-    totalCellsLen = (totalCellsLen * 3) / 4;
+-    totalHeapSize = 3 * oneCellOnCAHeapSize;
++    // There is no compaction, as the compacting memstore type is basic.
++    // totalCellsLen remains the same
++    totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM
++        + 4 * oneCellOnCAHeapSize;
+     assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+-    size = memstore.getFlushableSize();
++    MemstoreSize size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+     region.decrMemstoreSize(size);  // simulate flusher
+     ImmutableSegment s = memstore.getSnapshot();
+-    assertEquals(3, s.getCellsCount());
++    assertEquals(4, s.getCellsCount());
+     assertEquals(0, regionServicesForStores.getMemstoreSize());
+ 
+     memstore.clearSnapshot(snapshot.getId());
+@@ -608,8 +663,9 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+   @Test
+   public void testCompaction2Buckets() throws IOException {
+ 
+-    // set memstore to do data compaction and not to use the speculative scan
+-    MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.EAGER;
++    // set memstore to do basic structure flattening, the "eager" option is tested in
++    // TestCompactingToCellFlatMapMemStore
++    MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.BASIC;
+     memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+         String.valueOf(compactionType));
+     ((CompactingMemStore)memstore).initiateType(compactionType);
+@@ -619,44 +675,43 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     int totalCellsLen1 = addRowsByKeys(memstore, keys1);
+     int oneCellOnCSLMHeapSize = 120;
+     int oneCellOnCAHeapSize = 88;
+-    long totalHeapSize = 4 * oneCellOnCSLMHeapSize;
++    long totalHeapSize = MutableSegment.DEEP_OVERHEAD + 4 * oneCellOnCSLMHeapSize;
+ 
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+-    MemstoreSize size = memstore.getFlushableSize();
+     ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline and compact
+     int counter = 0;
+     for ( Segment s : memstore.getSegments()) {
+       counter += s.getCellsCount();
+     }
+-    assertEquals(3, counter);
++    assertEquals(4, counter);
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+-    // One cell is duplicated and the compaction will remove it. All cells of same time so adjusting
+-    // totalCellsLen
+-    totalCellsLen1 = (totalCellsLen1 * 3) / 4;
++    // There is no compaction, as the compacting memstore type is basic.
++    // totalCellsLen remains the same
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+-    totalHeapSize = 3 * oneCellOnCAHeapSize;
++    totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM
++        + 4 * oneCellOnCAHeapSize;
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+     int totalCellsLen2 = addRowsByKeys(memstore, keys2);
+     totalHeapSize += 3 * oneCellOnCSLMHeapSize;
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+-    assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
++    assertEquals(totalHeapSize, ((CompactingMemStore) memstore).heapSize());
+ 
+-    size = memstore.getFlushableSize();
++    MemstoreSize size = memstore.getFlushableSize();
+     ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline and compact
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+-    totalCellsLen2 = totalCellsLen2 / 3;// 2 cells duplicated in set 2
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+-    totalHeapSize = 4 * oneCellOnCAHeapSize;
++    totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM
++        + 7 * oneCellOnCAHeapSize;
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+     size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+     region.decrMemstoreSize(size);  // simulate flusher
+     ImmutableSegment s = memstore.getSnapshot();
+-    assertEquals(4, s.getCellsCount());
++    assertEquals(7, s.getCellsCount());
+     assertEquals(0, regionServicesForStores.getMemstoreSize());
+ 
+     memstore.clearSnapshot(snapshot.getId());
+@@ -678,10 +733,8 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     int oneCellOnCSLMHeapSize = 120;
+     int oneCellOnCAHeapSize = 88;
+     assertEquals(totalCellsLen1, region.getMemstoreSize());
+-    long totalHeapSize = 4 * oneCellOnCSLMHeapSize;
++    long totalHeapSize = MutableSegment.DEEP_OVERHEAD + 4 * oneCellOnCSLMHeapSize;
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+-
+-    MemstoreSize size = memstore.getFlushableSize();
+     ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline and compact
+ 
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+@@ -690,29 +743,31 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     totalCellsLen1 = (totalCellsLen1 * 3) / 4;
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+     // In memory flush to make a CellArrayMap instead of CSLM. See the overhead diff.
+-    totalHeapSize = 3 * oneCellOnCAHeapSize;
++    totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM
++        + 3 * oneCellOnCAHeapSize;
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+     int totalCellsLen2 = addRowsByKeys(memstore, keys2);// Adding 3 more cells.
+-    long totalHeapSize2 = 3 * oneCellOnCSLMHeapSize;
++    long totalHeapSize2 = totalHeapSize + 3 * oneCellOnCSLMHeapSize;
+ 
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+-    assertEquals(totalHeapSize + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
++    assertEquals(totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
+ 
+     ((CompactingMemStore) memstore).disableCompaction();
+-    size = memstore.getFlushableSize();
++    MemstoreSize size = memstore.getFlushableSize();
+     ((CompactingMemStore)memstore).flushInMemory(); // push keys to pipeline without compaction
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+     // No change in the cells data size. ie. memstore size. as there is no compaction.
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+-    assertEquals(totalHeapSize + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
++    assertEquals(totalHeapSize2 + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM,
++        ((CompactingMemStore) memstore).heapSize());
+ 
+     int totalCellsLen3 = addRowsByKeys(memstore, keys3);// 3 more cells added
+     assertEquals(totalCellsLen1 + totalCellsLen2 + totalCellsLen3,
+         regionServicesForStores.getMemstoreSize());
+-    long totalHeapSize3 = 3 * oneCellOnCSLMHeapSize;
+-    assertEquals(totalHeapSize + totalHeapSize2 + totalHeapSize3,
+-        ((CompactingMemStore) memstore).heapSize());
++    long totalHeapSize3 = totalHeapSize2 + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM
++        + 3 * oneCellOnCSLMHeapSize;
++    assertEquals(totalHeapSize3, ((CompactingMemStore) memstore).heapSize());
+ 
+     ((CompactingMemStore)memstore).enableCompaction();
+     size = memstore.getFlushableSize();
+@@ -725,7 +780,8 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     assertEquals(totalCellsLen1 + totalCellsLen2 + totalCellsLen3,
+         regionServicesForStores.getMemstoreSize());
+     // Only 4 unique cells left
+-    assertEquals(4 * oneCellOnCAHeapSize, ((CompactingMemStore) memstore).heapSize());
++    assertEquals(4 * oneCellOnCAHeapSize + MutableSegment.DEEP_OVERHEAD
++        + CellArrayImmutableSegment.DEEP_OVERHEAD_CAM, ((CompactingMemStore) memstore).heapSize());
+ 
+     size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellArrayMapMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+similarity index 78%
+rename from hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellArrayMapMemStore.java
+rename to hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+index 66e107ae65..6011af7808 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellArrayMapMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+@@ -25,37 +25,51 @@ import org.apache.hadoop.hbase.*;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+ import org.apache.hadoop.hbase.testclassification.RegionServerTests;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ClassSize;
+ import org.apache.hadoop.hbase.util.Threads;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
+ 
+ import java.io.IOException;
+ import java.util.List;
+ 
+-
+-
+ /**
+  * compacted memstore test case
+  */
+ @Category({RegionServerTests.class, MediumTests.class})
+-public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore {
+-
+-  private static final Log LOG = LogFactory.getLog(TestCompactingToCellArrayMapMemStore.class);
+-
++@RunWith(Parameterized.class)
++public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore {
++  @Parameterized.Parameters
++  public static Object[] data() {
++    return new Object[] { "CHUNK_MAP", "ARRAY_MAP" }; // test different immutable indexes
++  }
++  private static final Log LOG = LogFactory.getLog(TestCompactingToCellFlatMapMemStore.class);
++  public final boolean toCellChunkMap;
++  Configuration conf;
+   //////////////////////////////////////////////////////////////////////////////
+   // Helpers
+   //////////////////////////////////////////////////////////////////////////////
++  public TestCompactingToCellFlatMapMemStore(String type){
++    if (type == "CHUNK_MAP") {
++      toCellChunkMap = true;
++    } else {
++      toCellChunkMap = false;
++    }
++  }
+ 
+   @Override public void tearDown() throws Exception {
+     chunkCreator.clearChunksInPool();
+   }
+ 
+   @Override public void setUp() throws Exception {
++
+     compactingSetUp();
+-    Configuration conf = HBaseConfiguration.create();
++    this.conf = HBaseConfiguration.create();
+ 
+     // set memstore to do data compaction
+     conf.set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+@@ -72,30 +86,41 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+   public void testCompaction1Bucket() throws IOException {
+     int counter = 0;
+     String[] keys1 = { "A", "A", "B", "C" }; //A1, A2, B3, C4
++    if (toCellChunkMap) {
++      // set memstore to flat into CellChunkMap
++      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
++      ((CompactingMemStore)memstore).setIndexType();
++    }
+ 
+     // test 1 bucket
+     long totalCellsLen = addRowsByKeys(memstore, keys1);
+-    int oneCellOnCSLMHeapSize = 120;
+-    int oneCellOnCAHeapSize = 88;
+-    long totalHeapSize = 4 * oneCellOnCSLMHeapSize;
++    long cellBeforeFlushSize = cellBeforeFlushSize();
++    long cellAfterFlushSize  = cellAfterFlushSize();
++    long totalHeapSize = MutableSegment.DEEP_OVERHEAD + 4 * cellBeforeFlushSize;
++
+     assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+ 
+     assertEquals(4, memstore.getActive().getCellsCount());
+-    MemstoreSize size = memstore.getFlushableSize();
+-    ((CompactingMemStore) memstore).flushInMemory(); // push keys to pipeline and compact
++    ((CompactingMemStore) memstore).flushInMemory();    // push keys to pipeline and compact
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+     // One cell is duplicated and the compaction will remove it. All cells of same size so adjusting
+     // totalCellsLen
+     totalCellsLen = (totalCellsLen * 3) / 4;
+     assertEquals(totalCellsLen, regionServicesForStores.getMemstoreSize());
+-    totalHeapSize = 3 * oneCellOnCAHeapSize;
++
++    totalHeapSize =
++        3 * cellAfterFlushSize + MutableSegment.DEEP_OVERHEAD
++            + (toCellChunkMap ?
++            CellChunkImmutableSegment.DEEP_OVERHEAD_CCM :
++            CellArrayImmutableSegment.DEEP_OVERHEAD_CAM);
+     assertEquals(totalHeapSize, ((CompactingMemStore)memstore).heapSize());
+     for ( Segment s : memstore.getSegments()) {
+       counter += s.getCellsCount();
+     }
+     assertEquals(3, counter);
+-    size = memstore.getFlushableSize();
++    MemstoreSize size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+     region.decrMemstoreSize(size);  // simulate flusher
+     ImmutableSegment s = memstore.getSnapshot();
+@@ -106,20 +131,24 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+   }
+ 
+   public void testCompaction2Buckets() throws IOException {
+-
++    if (toCellChunkMap) {
++      // set memstore to flat into CellChunkMap
++      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
++      ((CompactingMemStore)memstore).setIndexType();
++    }
+     String[] keys1 = { "A", "A", "B", "C" };
+     String[] keys2 = { "A", "B", "D" };
+ 
+-    long totalCellsLen1 = addRowsByKeys(memstore, keys1);
+-    int oneCellOnCSLMHeapSize = 120;
+-    int oneCellOnCAHeapSize = 88;
+-    long totalHeapSize1 = 4 * oneCellOnCSLMHeapSize;
++    long totalCellsLen1 = addRowsByKeys(memstore, keys1);     // INSERT 4
++    long cellBeforeFlushSize = cellBeforeFlushSize();
++    long cellAfterFlushSize = cellAfterFlushSize();
++    long totalHeapSize1 = MutableSegment.DEEP_OVERHEAD + 4 * cellBeforeFlushSize;
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1, ((CompactingMemStore) memstore).heapSize());
+-    MemstoreSize size = memstore.getFlushableSize();
+ 
+     ((CompactingMemStore) memstore).flushInMemory(); // push keys to pipeline and compact
+-    int counter = 0;
++    int counter = 0;                                          // COMPACT 4->3
+     for ( Segment s : memstore.getSegments()) {
+       counter += s.getCellsCount();
+     }
+@@ -128,18 +157,20 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     // One cell is duplicated and the compaction will remove it. All cells of same size so adjusting
+     // totalCellsLen
+     totalCellsLen1 = (totalCellsLen1 * 3) / 4;
+-    totalHeapSize1 = 3 * oneCellOnCAHeapSize;
++    totalHeapSize1 = 3 * cellAfterFlushSize + MutableSegment.DEEP_OVERHEAD
++        + (toCellChunkMap ?
++        CellChunkImmutableSegment.DEEP_OVERHEAD_CCM :
++        CellArrayImmutableSegment.DEEP_OVERHEAD_CAM);
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1, ((CompactingMemStore) memstore).heapSize());
+ 
+-    long totalCellsLen2 = addRowsByKeys(memstore, keys2);
+-    long totalHeapSize2 = 3 * oneCellOnCSLMHeapSize;
++    long totalCellsLen2 = addRowsByKeys(memstore, keys2);   // INSERT 3 (3+3=6)
++    long totalHeapSize2 = 3 * cellBeforeFlushSize;
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1 + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
+ 
+-    size = memstore.getFlushableSize();
+     ((CompactingMemStore) memstore).flushInMemory(); // push keys to pipeline and compact
+-    assertEquals(0, memstore.getSnapshot().getCellsCount());
++    assertEquals(0, memstore.getSnapshot().getCellsCount());// COMPACT 6->4
+     counter = 0;
+     for ( Segment s : memstore.getSegments()) {
+       counter += s.getCellsCount();
+@@ -147,10 +178,10 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     assertEquals(4,counter);
+     totalCellsLen2 = totalCellsLen2 / 3;// 2 cells duplicated in set 2
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+-    totalHeapSize2 = 1 * oneCellOnCAHeapSize;
++    totalHeapSize2 = 1 * cellAfterFlushSize;
+     assertEquals(totalHeapSize1 + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
+ 
+-    size = memstore.getFlushableSize();
++    MemstoreSize size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+     region.decrMemstoreSize(size);  // simulate flusher
+     ImmutableSegment s = memstore.getSnapshot();
+@@ -161,15 +192,20 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+   }
+ 
+   public void testCompaction3Buckets() throws IOException {
+-
++    if (toCellChunkMap) {
++      // set memstore to flat into CellChunkMap
++      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
++      ((CompactingMemStore)memstore).setIndexType();
++    }
+     String[] keys1 = { "A", "A", "B", "C" };
+     String[] keys2 = { "A", "B", "D" };
+     String[] keys3 = { "D", "B", "B" };
+ 
+     long totalCellsLen1 = addRowsByKeys(memstore, keys1);
+-    int oneCellOnCSLMHeapSize = 120;
+-    int oneCellOnCAHeapSize = 88;
+-    long totalHeapSize1 = 4 * oneCellOnCSLMHeapSize;
++    long cellBeforeFlushSize = cellBeforeFlushSize();
++    long cellAfterFlushSize = cellAfterFlushSize();
++    long totalHeapSize1 = MutableSegment.DEEP_OVERHEAD + 4 * cellBeforeFlushSize;
+     assertEquals(totalCellsLen1, region.getMemstoreSize());
+     assertEquals(totalHeapSize1, ((CompactingMemStore) memstore).heapSize());
+ 
+@@ -180,12 +216,15 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     // One cell is duplicated and the compaction will remove it. All cells of same size so adjusting
+     // totalCellsLen
+     totalCellsLen1 = (totalCellsLen1 * 3) / 4;
+-    totalHeapSize1 = 3 * oneCellOnCAHeapSize;
++    totalHeapSize1 = 3 * cellAfterFlushSize + MutableSegment.DEEP_OVERHEAD
++        + (toCellChunkMap ?
++        CellChunkImmutableSegment.DEEP_OVERHEAD_CCM :
++        CellArrayImmutableSegment.DEEP_OVERHEAD_CAM);
+     assertEquals(totalCellsLen1, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1, ((CompactingMemStore) memstore).heapSize());
+ 
+     long totalCellsLen2 = addRowsByKeys(memstore, keys2);
+-    long totalHeapSize2 = 3 * oneCellOnCSLMHeapSize;
++    long totalHeapSize2 = 3 * cellBeforeFlushSize;
+ 
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1 + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
+@@ -193,12 +232,13 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     ((CompactingMemStore) memstore).disableCompaction();
+     size = memstore.getFlushableSize();
+     ((CompactingMemStore) memstore).flushInMemory(); // push keys to pipeline without compaction
++    totalHeapSize2 = totalHeapSize2 + CSLMImmutableSegment.DEEP_OVERHEAD_CSLM;
+     assertEquals(0, memstore.getSnapshot().getCellsCount());
+     assertEquals(totalCellsLen1 + totalCellsLen2, regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1 + totalHeapSize2, ((CompactingMemStore) memstore).heapSize());
+ 
+     long totalCellsLen3 = addRowsByKeys(memstore, keys3);
+-    long totalHeapSize3 = 3 * oneCellOnCSLMHeapSize;
++    long totalHeapSize3 = 3 * cellBeforeFlushSize;
+     assertEquals(totalCellsLen1 + totalCellsLen2 + totalCellsLen3,
+         regionServicesForStores.getMemstoreSize());
+     assertEquals(totalHeapSize1 + totalHeapSize2 + totalHeapSize3,
+@@ -218,7 +258,11 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     assertEquals(totalCellsLen1 + totalCellsLen2 + totalCellsLen3,
+         regionServicesForStores.getMemstoreSize());
+     // Only 4 unique cells left
+-    assertEquals(4 * oneCellOnCAHeapSize, ((CompactingMemStore) memstore).heapSize());
++    long totalHeapSize4 = 4 * cellAfterFlushSize + MutableSegment.DEEP_OVERHEAD
++        + (toCellChunkMap ?
++        CellChunkImmutableSegment.DEEP_OVERHEAD_CCM :
++        CellArrayImmutableSegment.DEEP_OVERHEAD_CAM);
++    assertEquals(totalHeapSize4, ((CompactingMemStore) memstore).heapSize());
+ 
+     size = memstore.getFlushableSize();
+     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
+@@ -236,7 +280,12 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+   //////////////////////////////////////////////////////////////////////////////
+   @Test
+   public void testMerging() throws IOException {
+-
++    if (toCellChunkMap) {
++      // set memstore to flat into CellChunkMap
++      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
++          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
++      ((CompactingMemStore)memstore).setIndexType();
++    }
+     String[] keys1 = { "A", "A", "B", "C", "F", "H"};
+     String[] keys2 = { "A", "B", "D", "G", "I", "J"};
+     String[] keys3 = { "D", "B", "B", "E" };
+@@ -349,7 +398,6 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     assertEquals("the count should be ", cnt, 150);
+   }
+ 
+-
+   private void addRowsByKeysWith50Cols(AbstractMemStore hmc, String[] keys) {
+     byte[] fam = Bytes.toBytes("testfamily");
+     for (int i = 0; i < keys.length; i++) {
+@@ -489,4 +537,30 @@ public class TestCompactingToCellArrayMapMemStore extends TestCompactingMemStore
+     regionServicesForStores.addMemstoreSize(memstoreSize);
+     return memstoreSize.getDataSize();
+   }
++
++  private long cellBeforeFlushSize() {
++    // make one cell
++    byte[] row = Bytes.toBytes("A");
++    byte[] val = Bytes.toBytes("A" + 0);
++    KeyValue kv =
++        new KeyValue(row, Bytes.toBytes("testfamily"), Bytes.toBytes("testqualifier"),
++            System.currentTimeMillis(), val);
++    return ClassSize.align(
++        ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + KeyValue.FIXED_OVERHEAD + KeyValueUtil.length(kv));
++  }
++
++  private long cellAfterFlushSize() {
++    // make one cell
++    byte[] row = Bytes.toBytes("A");
++    byte[] val = Bytes.toBytes("A" + 0);
++    KeyValue kv =
++        new KeyValue(row, Bytes.toBytes("testfamily"), Bytes.toBytes("testqualifier"),
++            System.currentTimeMillis(), val);
++
++    return toCellChunkMap ?
++        ClassSize.align(
++        ClassSize.CELL_CHUNK_MAP_ENTRY + KeyValueUtil.length(kv)) :
++        ClassSize.align(
++        ClassSize.CELL_ARRAY_MAP_ENTRY + KeyValue.FIXED_OVERHEAD + KeyValueUtil.length(kv));
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+index c6aa8e4a36..b36b8fe002 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+@@ -953,9 +953,12 @@ public class TestDefaultMemStore {
+         conf, FSTableDescriptors.createMetaTableDescriptor(conf),
+         wFactory.getMetaWAL(HRegionInfo.FIRST_META_REGIONINFO.
+             getEncodedNameAsBytes()));
+-    HRegionInfo hri = new HRegionInfo(TableName.valueOf(name.getMethodName()),
++    // parameterized tests add [#] suffix get rid of [ and ].
++    HRegionInfo hri =
++        new HRegionInfo(TableName.valueOf(name.getMethodName().replaceAll("[\\[\\]]", "_")),
+         Bytes.toBytes("row_0200"), Bytes.toBytes("row_0300"));
+-    HTableDescriptor desc = new HTableDescriptor(TableName.valueOf(name.getMethodName()));
++    HTableDescriptor desc = new HTableDescriptor(TableName.valueOf(
++        name.getMethodName().replaceAll("[\\[\\]]", "_")));
+     desc.addFamily(new HColumnDescriptor("foo".getBytes()));
+     HRegion r =
+         HRegion.createHRegion(hri, testDir, conf, desc,
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
+index 243468f402..f13c5091a8 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
+@@ -787,7 +787,8 @@ public class TestHRegionReplayEvents {
+     Store store = secondaryRegion.getStore(Bytes.toBytes("cf1"));
+     long newFlushableSize = store.getFlushableSize();
+     if (droppableMemstore) {
+-      assertTrue(newFlushableSize == 0); // assert that the memstore is dropped
++      // assert that the memstore is dropped
++      assertTrue(newFlushableSize == MutableSegment.DEEP_OVERHEAD);
+     } else {
+       assertTrue(newFlushableSize > 0); // assert that the memstore is not dropped
+     }
+@@ -877,7 +878,7 @@ public class TestHRegionReplayEvents {
+     }
+     Store store = secondaryRegion.getStore(Bytes.toBytes("cf1"));
+     long newFlushableSize = store.getFlushableSize();
+-    assertTrue(newFlushableSize == 0);
++    assertTrue(newFlushableSize == MutableSegment.DEEP_OVERHEAD);
+ 
+     // assert that the region memstore is empty
+     long newRegionMemstoreSize = secondaryRegion.getMemstoreSize();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
+index 78593664f6..8d4a36ead1 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
+@@ -194,7 +194,7 @@ public class TestPerColumnFamilyFlush {
+     // We should have cleared out only CF1, since we chose the flush thresholds
+     // and number of puts accordingly.
+     assertEquals(0, cf1MemstoreSize.getDataSize());
+-    assertEquals(0, cf1MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf1MemstoreSize.getHeapSize());
+     // Nothing should have happened to CF2, ...
+     assertEquals(cf2MemstoreSize, oldCF2MemstoreSize);
+     // ... or CF3
+@@ -231,9 +231,9 @@ public class TestPerColumnFamilyFlush {
+ 
+     // CF1 and CF2, both should be absent.
+     assertEquals(0, cf1MemstoreSize.getDataSize());
+-    assertEquals(0, cf1MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf1MemstoreSize.getHeapSize());
+     assertEquals(0, cf2MemstoreSize.getDataSize());
+-    assertEquals(0, cf2MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSize.getHeapSize());
+     // CF3 shouldn't have been touched.
+     assertEquals(cf3MemstoreSize, oldCF3MemstoreSize);
+     assertEquals(totalMemstoreSize, cf3MemstoreSize.getDataSize());
+@@ -314,11 +314,11 @@ public class TestPerColumnFamilyFlush {
+ 
+     // Everything should have been cleared
+     assertEquals(0, cf1MemstoreSize.getDataSize());
+-    assertEquals(0, cf1MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf1MemstoreSize.getHeapSize());
+     assertEquals(0, cf2MemstoreSize.getDataSize());
+-    assertEquals(0, cf2MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSize.getHeapSize());
+     assertEquals(0, cf3MemstoreSize.getDataSize());
+-    assertEquals(0, cf3MemstoreSize.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf3MemstoreSize.getHeapSize());
+     assertEquals(0, totalMemstoreSize);
+     assertEquals(HConstants.NO_SEQNUM, smallestSeqInRegionCurrentMemstore);
+     HBaseTestingUtility.closeRegionAndWAL(region);
+@@ -525,9 +525,9 @@ public class TestPerColumnFamilyFlush {
+       });
+       LOG.info("Finished waiting on flush after too many WALs...");
+       // Individual families should have been flushed.
+-      assertEquals(0, desiredRegion.getStore(FAMILY1).getMemStoreSize());
+-      assertEquals(0, desiredRegion.getStore(FAMILY2).getMemStoreSize());
+-      assertEquals(0, desiredRegion.getStore(FAMILY3).getMemStoreSize());
++      assertEquals(MutableSegment.DEEP_OVERHEAD, desiredRegion.getStore(FAMILY1).getMemStoreSize());
++      assertEquals(MutableSegment.DEEP_OVERHEAD, desiredRegion.getStore(FAMILY2).getMemStoreSize());
++      assertEquals(MutableSegment.DEEP_OVERHEAD, desiredRegion.getStore(FAMILY3).getMemStoreSize());
+       // let WAL cleanOldLogs
+       assertNull(getWAL(desiredRegion).rollWriter(true));
+       assertTrue(getNumRolledLogFiles(desiredRegion) < maxLogs);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
+index 3b2ebe2138..63ec13cf77 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
+@@ -241,7 +241,7 @@ public class TestWalAndCompactingMemStoreFlush {
+ 
+     // CF2 should become empty
+     assertEquals(0, cf2MemstoreSizePhaseII.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseII.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseII.getHeapSize());
+ 
+     // verify that CF3 was flushed to memory and was compacted (this is approximation check)
+     assertTrue(cf3MemstoreSizePhaseI.getDataSize() > cf3MemstoreSizePhaseII.getDataSize());
+@@ -302,7 +302,7 @@ public class TestWalAndCompactingMemStoreFlush {
+     // CF2 should be flushed to disk
+     assertTrue(cf1MemstoreSizePhaseIII.getDataSize() > cf1MemstoreSizePhaseIV.getDataSize());
+     assertEquals(0, cf2MemstoreSizePhaseIV.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseIV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseIV.getHeapSize());
+ 
+     // CF3 shouldn't have been touched.
+     assertEquals(cf3MemstoreSizePhaseIV, cf3MemstoreSizePhaseII);
+@@ -326,11 +326,11 @@ public class TestWalAndCompactingMemStoreFlush {
+         .getEarliestMemstoreSeqNum(region.getRegionInfo().getEncodedNameAsBytes());
+ 
+     assertEquals(0, cf1MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf1MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf1MemstoreSizePhaseV.getHeapSize());
+     assertEquals(0, cf2MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseV.getHeapSize());
+     assertEquals(0, cf3MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf3MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf3MemstoreSizePhaseV.getHeapSize());
+ 
+     // What happens when we hit the memstore limit, but we are not able to find
+     // any Column Family above the threshold?
+@@ -476,7 +476,7 @@ public class TestWalAndCompactingMemStoreFlush {
+     assertTrue(cf1MemstoreSizePhaseII.getHeapSize() < cf1MemstoreSizePhaseI.getHeapSize());
+     // CF2 should become empty
+     assertEquals(0, cf2MemstoreSizePhaseII.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseII.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseII.getHeapSize());
+     // verify that CF3 was flushed to memory and was not compacted (this is an approximation check)
+     // if compacted CF# should be at least twice less because its every key was duplicated
+     assertEquals(cf3MemstoreSizePhaseII.getDataSize() , cf3MemstoreSizePhaseI.getDataSize());
+@@ -544,7 +544,7 @@ public class TestWalAndCompactingMemStoreFlush {
+     // CF2 should remain empty
+     assertTrue(cf1MemstoreSizePhaseIII.getDataSize() > cf1MemstoreSizePhaseIV.getDataSize());
+     assertEquals(0, cf2MemstoreSizePhaseIV.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseIV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseIV.getHeapSize());
+     // CF3 shouldn't have been touched.
+     assertEquals(cf3MemstoreSizePhaseIV, cf3MemstoreSizePhaseII);
+     // the smallest LSN of CF3 shouldn't change
+@@ -573,11 +573,11 @@ public class TestWalAndCompactingMemStoreFlush {
+     /*------------------------------------------------------------------------------*/
+     /* PHASE V - validation */
+     assertEquals(0, cf1MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf1MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf1MemstoreSizePhaseV.getHeapSize());
+     assertEquals(0, cf2MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseV.getHeapSize());
+     assertEquals(0, cf3MemstoreSizePhaseV.getDataSize());
+-    assertEquals(0, cf3MemstoreSizePhaseV.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf3MemstoreSizePhaseV.getHeapSize());
+     // The total memstores size should be empty
+     assertEquals(0, totalMemstoreSizePhaseV);
+     // Because there is nothing in any memstore the WAL's LSN should be -1
+@@ -699,7 +699,7 @@ public class TestWalAndCompactingMemStoreFlush {
+ 
+     // CF2 should have been cleared
+     assertEquals(0, cf2MemstoreSizePhaseII.getDataSize());
+-    assertEquals(0, cf2MemstoreSizePhaseII.getHeapSize());
++    assertEquals(MutableSegment.DEEP_OVERHEAD, cf2MemstoreSizePhaseII.getHeapSize());
+ 
+     String s = "\n\n----------------------------------\n"
+         + "Upon initial insert and flush, LSN of CF1 is:"
+@@ -875,9 +875,13 @@ public class TestWalAndCompactingMemStoreFlush {
+     MemstoreSize cf2MemstoreSizePhaseIV = region.getStore(FAMILY2).getSizeOfMemStore();
+ 
+     assertEquals(2*cf1MemstoreSizePhaseI.getDataSize(), cf1MemstoreSizePhaseIV.getDataSize());
++    // the decrease in the heap size due to usage of CellArrayMap instead of CSLM
++    // should be the same in flattening and in merge (first and second in-memory-flush)
++    // but in phase 1 we do not yet have immutable segment
+     assertEquals(
+         cf1MemstoreSizePhaseI.getHeapSize() - cf1MemstoreSizePhaseII.getHeapSize(),
+-        cf1MemstoreSizePhaseIII.getHeapSize() - cf1MemstoreSizePhaseIV.getHeapSize());
++        cf1MemstoreSizePhaseIII.getHeapSize() - cf1MemstoreSizePhaseIV.getHeapSize()
++            - CellArrayImmutableSegment.DEEP_OVERHEAD_CAM);
+     assertEquals(3, // active, one in pipeline, snapshot
+         ((CompactingMemStore) ((HStore)region.getStore(FAMILY1)).memstore).getSegments().size());
+     // CF2 should have been cleared
+-- 
+2.14.1
+

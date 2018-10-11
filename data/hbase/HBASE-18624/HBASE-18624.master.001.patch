@@ -1,0 +1,491 @@
+From 2d603c0af6afea2db29c0bd47f9e168481d4abb9 Mon Sep 17 00:00:00 2001
+From: Ajay Jadhav <jadhavab@amazon.com>
+Date: Tue, 9 May 2017 18:22:36 -0700
+Subject: [PATCH] [HBASE-18624] Added support for clearing BlockCache
+
+---
+ .../java/org/apache/hadoop/hbase/client/Admin.java |   8 ++
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java |  49 ++++++++
+ .../hbase/shaded/protobuf/RequestConverter.java    |  12 ++
+ .../src/main/protobuf/Admin.proto                  |  10 ++
+ .../hadoop/hbase/regionserver/HRegionServer.java   |  10 ++
+ .../hadoop/hbase/regionserver/RSRpcServices.java   |  30 +++--
+ .../hadoop/hbase/master/MockRegionServer.java      |   9 ++
+ .../regionserver/TestClearRegionBlockCache.java    | 129 +++++++++++++++++++++
+ .../replication/regionserver/TestReplicator.java   |   6 +
+ hbase-shell/src/main/ruby/hbase/admin.rb           |   6 +
+ hbase-shell/src/main/ruby/shell.rb                 |   1 +
+ .../main/ruby/shell/commands/clear_block_cache.rb  |  38 ++++++
+ 12 files changed, 300 insertions(+), 8 deletions(-)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestClearRegionBlockCache.java
+ create mode 100644 hbase-shell/src/main/ruby/shell/commands/clear_block_cache.rb
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
+index 2a92409..2c20545 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Admin.java
+@@ -1065,6 +1065,14 @@ public interface Admin extends Abortable, Closeable {
+   boolean isBalancerEnabled() throws IOException;
+ 
+   /**
++   * Clear all the blocks corresponding to this table from block cache.
++   *
++   * @param tableName table to clear block cache
++   * @throws IOException if a remote or network exception occurs
++   */
++  void clearBlockCache(final TableName tableName) throws IOException;
++
++  /**
+    * Invoke region normalizer. Can NOT run for various reasons.  Check logs.
+    *
+    * @return <code>true</code> if region normalizer ran, <code>false</code> otherwise.
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index fac3ef1..0e0d607 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -92,6 +92,7 @@ import org.apache.hadoop.hbase.shaded.protobuf.RequestConverter;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.AdminService;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CompactRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.FlushRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetRegionInfoRequest;
+@@ -1477,6 +1478,54 @@ public class HBaseAdmin implements Admin {
+     });
+   }
+ 
++  /**
++   * {@inheritDoc}
++   */
++  @Override
++  public void clearBlockCache(final TableName tableName) throws IOException {
++    ZooKeeperWatcher zookeeper = null;
++    try {
++      checkTableExists(tableName);
++      zookeeper = new ZooKeeperWatcher(conf, ZK_IDENTIFIER_PREFIX + connection.toString(),
++                                       new ThrowableAbortable());
++      List<Pair<HRegionInfo, ServerName>> pairs =
++        MetaTableAccessor.getTableRegionsAndLocations(connection, tableName);
++      for (Pair<HRegionInfo, ServerName> pair: pairs) {
++        if (pair.getFirst().isOffline()) continue;
++        if (pair.getSecond() == null) continue;
++        try {
++          clearBlockCache(pair.getSecond(), pair.getFirst());
++        } catch (NotServingRegionException e) {
++          if (LOG.isDebugEnabled()) {
++            LOG.debug("Trying to clear block cache for " + pair.getFirst() + ": " +
++                        StringUtils.stringifyException(e));
++          }
++        }
++      }
++    } finally {
++      if (zookeeper != null) {
++        zookeeper.close();
++      }
++    }
++  }
++
++  private void clearBlockCache(final ServerName sn, final HRegionInfo hri) throws IOException {
++    HBaseRpcController controller = rpcControllerFactory.newController();
++    AdminService.BlockingInterface admin = this.connection.getAdmin(sn);
++    ClearRegionBlockCacheRequest request =
++      RequestConverter.buildClearRegionBlockCacheRequest(hri.getRegionName());
++    try {
++      admin.clearRegionBlockCache(controller, request);
++    } catch (ServiceException se) {
++      throw ProtobufUtil.getRemoteException(se);
++    }
++  }
++
++  /**
++   * Invoke region normalizer. Can NOT run for various reasons.  Check logs.
++   *
++   * @return True if region normalizer ran, false otherwise.
++   */
+   @Override
+   public boolean normalize() throws IOException {
+     return executeCallable(new MasterCallable<Boolean>(getConnection(), getRpcControllerFactory()) {
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
+index e5f1848..0a86222 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/shaded/protobuf/RequestConverter.java
+@@ -56,6 +56,7 @@ import org.apache.hadoop.hbase.filter.ByteArrayComparable;
+ import org.apache.hadoop.hbase.replication.ReplicationPeerConfig;
+ import org.apache.hadoop.hbase.shaded.com.google.protobuf.UnsafeByteOperations;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CompactRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.FlushRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.GetOnlineRegionRequest;
+@@ -1514,6 +1515,17 @@ public final class RequestConverter {
+   }
+ 
+   /**
++   * Creates a protocol buffer ClearRegionBlockCacheRequest
++   *
++   * @return a ClearRegionBlockCacheRequest
++   */
++  public static ClearRegionBlockCacheRequest buildClearRegionBlockCacheRequest(final byte[]
++                                                                                 regionName) {
++    RegionSpecifier region = buildRegionSpecifier(RegionSpecifierType.REGION_NAME, regionName);
++    return ClearRegionBlockCacheRequest.newBuilder().setRegion(region).build();
++  }
++
++  /**
+    * Creates a protocol buffer GetClusterStatusRequest
+    *
+    * @return A GetClusterStatusRequest
+diff --git a/hbase-protocol-shaded/src/main/protobuf/Admin.proto b/hbase-protocol-shaded/src/main/protobuf/Admin.proto
+index db5a3be..a2b03b3 100644
+--- a/hbase-protocol-shaded/src/main/protobuf/Admin.proto
++++ b/hbase-protocol-shaded/src/main/protobuf/Admin.proto
+@@ -248,6 +248,13 @@ message ClearCompactionQueuesRequest {
+ message ClearCompactionQueuesResponse {
+ }
+ 
++message ClearRegionBlockCacheRequest {
++  required RegionSpecifier region = 1;
++}
++
++message ClearRegionBlockCacheResponse {
++}
++
+ message ExecuteProceduresRequest {
+   repeated OpenRegionRequest open_region = 1;
+   repeated CloseRegionRequest close_region = 2;
+@@ -310,6 +317,9 @@ service AdminService {
+   rpc ClearCompactionQueues(ClearCompactionQueuesRequest)
+     returns(ClearCompactionQueuesResponse);
+ 
++  rpc ClearRegionBlockCache(ClearRegionBlockCacheRequest)
++    returns(ClearRegionBlockCacheResponse);
++
+   /** Fetches the RegionServer's view of space quotas */
+   rpc GetSpaceQuotaSnapshots(GetSpaceQuotaSnapshotsRequest)
+     returns(GetSpaceQuotaSnapshotsResponse);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index f648c2f..cbe9f50 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -3685,6 +3685,16 @@ public class HRegionServer extends HasThread implements
+     configurationManager.notifyAllObservers(conf);
+   }
+ 
++  public void clearRegionBlockCache(Region region) {
++    CacheConfig cacheConfig = this.getCacheConfig();
++
++    for(Store store : region.getStores()) {
++      for(StoreFile hFile : store.getStorefiles()) {
++        cacheConfig.getBlockCache().evictBlocksByHfileName(hFile.getPath().getName());
++      }
++    }
++  }
++
+   @Override
+   public double getCompactionPressure() {
+     double max = 0;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 61c725b..fe36eb1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -106,6 +106,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.ResponseConverter;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.AdminService;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesResponse;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CloseRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CloseRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CompactRegionRequest;
+@@ -3472,15 +3474,27 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+        ExecuteProceduresRequest request) throws ServiceException {
+     ExecuteProceduresResponse.Builder builder = ExecuteProceduresResponse.newBuilder();
+     if (request.getOpenRegionCount() > 0) {
+-      for (OpenRegionRequest req: request.getOpenRegionList()) {
++      for (OpenRegionRequest req : request.getOpenRegionList()) {
+         builder.addOpenRegion(openRegion(controller, req));
+       }
+-     }
+-     if (request.getCloseRegionCount() > 0) {
+-       for (CloseRegionRequest req: request.getCloseRegionList()) {
+-         builder.addCloseRegion(closeRegion(controller, req));
+-       }
+-     }
+-     return builder.build();
++    }
++    if (request.getCloseRegionCount() > 0) {
++      for (CloseRegionRequest req : request.getCloseRegionList()) {
++        builder.addCloseRegion(closeRegion(controller, req));
++      }
++    }
++    return builder.build();
++  }
++
++  @Override
++  public ClearRegionBlockCacheResponse clearRegionBlockCache(RpcController controller,
++                                                             ClearRegionBlockCacheRequest request)
++    throws ServiceException {
++    try {
++      this.regionServer.clearRegionBlockCache(getRegion(request.getRegion()));
++    } catch (Exception e) {
++      throw new ServiceException(e);
++    }
++    return ClearRegionBlockCacheResponse.newBuilder().build();
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+index ba18299..f9a8dcd 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+@@ -72,6 +72,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearCompactionQueuesResponse;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ClearRegionBlockCacheResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CloseRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CloseRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.CompactRegionRequest;
+@@ -644,6 +646,13 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
+   }
+ 
+   @Override
++  public ClearRegionBlockCacheResponse clearRegionBlockCache(RpcController controller,
++                                                             ClearRegionBlockCacheRequest request)
++    throws ServiceException {
++    return null;
++  }
++
++  @Override
+   public HeapMemoryManager getHeapMemoryManager() {
+     return null;
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestClearRegionBlockCache.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestClearRegionBlockCache.java
+new file mode 100644
+index 0000000..575770a
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestClearRegionBlockCache.java
+@@ -0,0 +1,129 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.MiniHBaseCluster;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.HTable;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.Table;
++import org.apache.hadoop.hbase.io.hfile.BlockCache;
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++
++import java.io.IOException;
++import java.util.ArrayList;
++
++import static org.junit.Assert.assertEquals;
++
++@Category(MediumTests.class)
++@RunWith(Parameterized.class)
++public class TestClearRegionBlockCache {
++  private static final TableName TABLE_NAME = TableName.valueOf("testClearRegionBlockCache");
++  private static final byte[] FAMILY = Bytes.toBytes("family");
++  private static final byte[][] SPLIT_KEY = new byte[][] { Bytes.toBytes("5") };
++  private static final int NUM_MASTERS = 1;
++  private static final int NUM_RS = 2;
++
++  private final HBaseTestingUtility HTU = new HBaseTestingUtility();
++
++  private Configuration CONF = HTU.getConfiguration();
++  private Table table;
++  private HRegionServer rs1, rs2;
++  private MiniHBaseCluster cluster;
++
++  @Parameterized.Parameter public String cacheType;
++
++  @Parameterized.Parameters(name = "{index}: {0}")
++  public static Object[] data() {
++    return new Object[] { "lru", "bucket" };
++  }
++
++  @Before
++  public void setup() throws Exception {
++    if (cacheType.equals("bucket")) {
++      CONF.set(HConstants.BUCKET_CACHE_IOENGINE_KEY, "offheap");
++      CONF.setInt(HConstants.BUCKET_CACHE_SIZE_KEY, 30);
++    }
++
++    cluster = HTU.startMiniCluster(NUM_MASTERS, NUM_RS);
++    rs1 = cluster.getRegionServer(0);
++    rs2 = cluster.getRegionServer(1);
++
++    // Create table
++    table = HTU.createTable(TABLE_NAME, FAMILY, SPLIT_KEY);
++  }
++
++  @After
++  public void teardown() throws Exception {
++    HTU.shutdownMiniCluster();
++  }
++
++  @Test
++  public void testClearBlockCache() throws Exception {
++    HTU.loadNumericRows(table, FAMILY, 1, 10);
++    HTU.flush(TABLE_NAME);
++
++    BlockCache blockCache1 = rs1.getCacheConfig().getBlockCache();
++    BlockCache blockCache2 = rs2.getCacheConfig().getBlockCache();
++
++    long initialBlockCount1 = blockCache1.getBlockCount();
++    long initialBlockCount2 = blockCache2.getBlockCount();
++
++    // scan will cause blocks to be added in BlockCache
++    scanAllRegionsForRS(rs1);
++    assertEquals(blockCache1.getBlockCount() - initialBlockCount1,
++                 HTU.getNumHFilesForRS(rs1, TABLE_NAME, FAMILY));
++    clearRegionBlockCache(rs1);
++
++    scanAllRegionsForRS(rs2);
++    assertEquals(blockCache2.getBlockCount() - initialBlockCount2,
++                 HTU.getNumHFilesForRS(rs2, TABLE_NAME, FAMILY));
++    clearRegionBlockCache(rs2);
++
++    assertEquals(initialBlockCount1, blockCache1.getBlockCount());
++    assertEquals(initialBlockCount2, blockCache2.getBlockCount());
++  }
++
++  private void scanAllRegionsForRS(HRegionServer rs) throws IOException {
++    for (Region region : rs.getOnlineRegions(TABLE_NAME)) {
++      RegionScanner scanner = region.getScanner(new Scan());
++      while (scanner.next(new ArrayList<Cell>()));
++    }
++  }
++
++  private void clearRegionBlockCache(HRegionServer rs) {
++    for (Region region : rs.getOnlineRegions(TABLE_NAME)) {
++      rs.clearRegionBlockCache(region);
++    }
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicator.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicator.java
+index 919c343..1140f72 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicator.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicator.java
+@@ -397,6 +397,12 @@ public class TestReplicator extends TestReplicationBase {
+       throws ServiceException {
+         return null;
+       }
++
++      @Override
++      public ClearRegionBlockCacheResponse clearRegionBlockCache(RpcController controller,
++                                                               ClearRegionBlockCacheRequest request) throws ServiceException {
++        return delegate.clearRegionBlockCache(controller, request);
++      }
+     }
+ 
+     public class FailureInjectingReplicatorForTest extends ReplicatorForTest {
+diff --git a/hbase-shell/src/main/ruby/hbase/admin.rb b/hbase-shell/src/main/ruby/hbase/admin.rb
+index 236fac5..17cc58f 100644
+--- a/hbase-shell/src/main/ruby/hbase/admin.rb
++++ b/hbase-shell/src/main/ruby/hbase/admin.rb
+@@ -196,6 +196,12 @@ module Hbase
+     end
+ 
+     #----------------------------------------------------------------------------------------------
++    # Requests clear block cache for table
++    def clear_block_cache(table_name)
++      @admin.clearBlockCache(org.apache.hadoop.hbase.TableName.valueOf(table_name))
++    end
++
++    #----------------------------------------------------------------------------------------------
+     # Requests region normalization for all configured tables in the cluster
+     # Returns true if normalizer ran successfully
+     def normalize
+diff --git a/hbase-shell/src/main/ruby/shell.rb b/hbase-shell/src/main/ruby/shell.rb
+index 759898b..687af12 100644
+--- a/hbase-shell/src/main/ruby/shell.rb
++++ b/hbase-shell/src/main/ruby/shell.rb
+@@ -360,6 +360,7 @@ Shell.load_command_group(
+     clear_compaction_queues
+     list_deadservers
+     clear_deadservers
++    clear_block_cache
+   ],
+   # TODO: remove older hlog_roll command
+   aliases: {
+diff --git a/hbase-shell/src/main/ruby/shell/commands/clear_block_cache.rb b/hbase-shell/src/main/ruby/shell/commands/clear_block_cache.rb
+new file mode 100644
+index 0000000..387dc96
+--- /dev/null
++++ b/hbase-shell/src/main/ruby/shell/commands/clear_block_cache.rb
+@@ -0,0 +1,38 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++module Shell
++  module Commands
++    class ClearBlockCache < Command
++      def help
++        return <<-EOF
++Clear all the blocks corresponding to this table from block cache.
++For example:
++
++  hbase> clear_block_cache 'TABLENAME'
++
++EOF
++      end
++      def command(table_name)
++        format_simple_command do
++          admin.clear_block_cache(table_name)
++        end
++      end
++    end
++  end
++end
+-- 
+2.10.1 (Apple Git-78)
+

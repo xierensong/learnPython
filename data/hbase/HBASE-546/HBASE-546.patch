@@ -1,0 +1,631 @@
+From 2856ca9aac7d6dbe4cad515188043d574ef5046f Mon Sep 17 00:00:00 2001
+From: nitay <nitayj@gmail.com>
+Date: Tue, 25 Nov 2008 11:08:02 -0800
+Subject: [PATCH] use zookeeper to store root region location
+
+---
+ src/java/org/apache/hadoop/hbase/HConstants.java   |   24 +++
+ .../hadoop/hbase/client/HConnectionManager.java    |   19 ++-
+ .../hadoop/hbase/ipc/HBaseRPCProtocolVersion.java  |    5 +-
+ .../apache/hadoop/hbase/ipc/HMasterInterface.java  |    7 -
+ .../hadoop/hbase/ipc/HMasterRegionInterface.java   |    8 -
+ .../org/apache/hadoop/hbase/master/HMaster.java    |    8 -
+ .../apache/hadoop/hbase/master/RegionManager.java  |   12 +-
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   11 +-
+ .../hadoop/hbase/zookeeper/ConnectionWatcher.java  |   88 +++++++++
+ .../zookeeper/ZooKeeperNotRunningException.java    |   50 ++++++
+ .../hadoop/hbase/zookeeper/ZooKeeperWrapper.java   |  185 ++++++++++++++++++++
+ 11 files changed, 385 insertions(+), 32 deletions(-)
+ create mode 100644 src/java/org/apache/hadoop/hbase/zookeeper/ConnectionWatcher.java
+ create mode 100644 src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperNotRunningException.java
+ create mode 100644 src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+
+diff --git a/src/java/org/apache/hadoop/hbase/HConstants.java b/src/java/org/apache/hadoop/hbase/HConstants.java
+index b68f191..d9a0af0 100644
+--- a/src/java/org/apache/hadoop/hbase/HConstants.java
++++ b/src/java/org/apache/hadoop/hbase/HConstants.java
+@@ -77,6 +77,30 @@ public interface HConstants {
+   /** default port for master web api */
+   static final int DEFAULT_MASTER_INFOPORT = 60010;
+ 
++  /** Parameter name for ZooKeeper servers. */
++  static final String ZOOKEEPER_SERVERS = "zookeeper.servers";
++
++  /** Default ZooKeeper servers. */
++  static final String DEFAULT_ZOOKEEPER_SERVERS = "localhost:2181";
++
++  /** Parameter name for ZooKeeper session timeout (in milliseconds). */
++  static final String ZOOKEEPER_SESSION_TIMEOUT = "zookeeper.session.timeout";
++
++  /** Default ZooKeeper session timeout. In milliseconds. */
++  static final int DEFAULT_ZOOKEEPER_SESSION_TIMEOUT = 10000;
++
++  /** Parameter name for HBase parent ZNode in ZooKeeper. */
++  static final String ZOOKEEPER_PARENT_ZNODE = "zookeeper.znode.parent";
++
++  /** Default HBase parent ZNode in ZooKeeper. */
++  static final String DEFAULT_ZOOKEEPER_PARENT_ZNODE = "/hbase";
++
++  /** Parameter name for ZooKeeper ZNode storing root server location. */
++  static final String ZOOKEEPER_ROOT_SERVER_ZNODE = "zookeeper.znode.root.server";
++
++  /** Default ZooKeeper ZNode storing root server location. */
++  static final String DEFAULT_ZOOKEEPER_ROOT_SERVER_ZNODE = "root-region-server";
++
+   /** Parameter name for hbase.regionserver address. */
+   static final String REGIONSERVER_ADDRESS = "hbase.regionserver";
+   
+diff --git a/src/java/org/apache/hadoop/hbase/client/HConnectionManager.java b/src/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+index 34feb6d..e2a15ad 100644
+--- a/src/java/org/apache/hadoop/hbase/client/HConnectionManager.java
++++ b/src/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+@@ -54,6 +54,7 @@ import org.apache.hadoop.hbase.ipc.HbaseRPC;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.SoftValueSortedMap;
+ import org.apache.hadoop.hbase.util.Writables;
++import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+ import org.apache.hadoop.ipc.RemoteException;
+ 
+ /**
+@@ -138,7 +139,9 @@ public class HConnectionManager implements HConstants {
+     private final Map<Integer, SoftValueSortedMap<byte [], HRegionLocation>> 
+       cachedRegionLocations = Collections.synchronizedMap(
+          new HashMap<Integer, SoftValueSortedMap<byte [], HRegionLocation>>());
+-    
++
++    private ZooKeeperWrapper zooKeeperWrapper;
++
+     /** 
+      * constructor
+      * @param conf Configuration object
+@@ -745,6 +748,13 @@ public class HConnectionManager implements HConstants {
+       return server;
+     }
+ 
++    private ZooKeeperWrapper getZooKeeperWrapper() throws IOException {
++      if (zooKeeperWrapper == null) {
++        zooKeeperWrapper = new ZooKeeperWrapper(conf);
++      }
++      return zooKeeperWrapper;
++    }
++
+     /*
+      * Repeatedly try to find the root region by asking the master for where it is
+      * @return HRegionLocation for root region if found
+@@ -755,13 +765,18 @@ public class HConnectionManager implements HConstants {
+     private HRegionLocation locateRootRegion()
+     throws IOException {
+       getMaster();
++
++      // We lazily instantiate the ZooKeeper object because we don't want to
++      // make the constructor have to throw IOException or handle it itself.
++      ZooKeeperWrapper zooKeeperWrapper = getZooKeeperWrapper();
++
+       HServerAddress rootRegionAddress = null;
+       for (int tries = 0; tries < numRetries; tries++) {
+         int localTimeouts = 0;
+         
+         // ask the master which server has the root region
+         while (rootRegionAddress == null && localTimeouts < numRetries) {
+-          rootRegionAddress = master.findRootRegion();
++          rootRegionAddress = zooKeeperWrapper.readRootRegionLocation();
+           if (rootRegionAddress == null) {
+             try {
+               if (LOG.isDebugEnabled()) {
+diff --git a/src/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java b/src/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java
+index 345fa51..5a2ea91 100644
+--- a/src/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java
++++ b/src/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java
+@@ -61,8 +61,11 @@ public interface HBaseRPCProtocolVersion extends VersionedProtocol {
+    * <ul>
+    * <li>Version 10: initial version (had to be &gt all other RPC versions</li>
+    * <li>Version 11: Changed getClosestRowBefore signature.
++   * <li>Version 12: Removed HMasterRegionInterface.getRootRegionLocation and
++   * HMasterInterface.findRootRegion. We use ZooKeeper to store root region
++   * location instead.
+    * </ul>
+    */
+-  public static final long versionID = 11L;
++  public static final long versionID = 12L;
+ 
+ }
+diff --git a/src/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java b/src/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java
+index daf5bc7..46cf018 100644
+--- a/src/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java
++++ b/src/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java
+@@ -22,7 +22,6 @@ package org.apache.hadoop.hbase.ipc;
+ import java.io.IOException;
+ 
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+-import org.apache.hadoop.hbase.HServerAddress;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.io.Writable;
+ 
+@@ -117,10 +116,4 @@ public interface HMasterInterface extends HBaseRPCProtocolVersion {
+    * @throws IOException
+    */
+   public void shutdown() throws IOException;
+-
+-  /**
+-   * Get the location of the root region
+-   * @return address of server that serves the root region
+-   */
+-  public HServerAddress findRootRegion();
+ }
+diff --git a/src/java/org/apache/hadoop/hbase/ipc/HMasterRegionInterface.java b/src/java/org/apache/hadoop/hbase/ipc/HMasterRegionInterface.java
+index 49871a7..b7e384c 100644
+--- a/src/java/org/apache/hadoop/hbase/ipc/HMasterRegionInterface.java
++++ b/src/java/org/apache/hadoop/hbase/ipc/HMasterRegionInterface.java
+@@ -25,7 +25,6 @@ import org.apache.hadoop.io.MapWritable;
+ import org.apache.hadoop.hbase.HServerInfo;
+ import org.apache.hadoop.hbase.HMsg;
+ import org.apache.hadoop.hbase.HRegionInfo;
+-import org.apache.hadoop.hbase.HServerAddress;
+ 
+ /**
+  * HRegionServers interact with the HMasterRegionInterface to report on local 
+@@ -62,11 +61,4 @@ public interface HMasterRegionInterface extends HBaseRPCProtocolVersion {
+   public HMsg[] regionServerReport(HServerInfo info, HMsg msgs[], 
+     HRegionInfo mostLoadedRegions[])
+   throws IOException;
+-
+-  /**
+-   * @return Root region region server address. Unlike
+-   * HMasterInterface.findRootRegion, does not wait until all regions are 
+-   * assigned.
+-   */
+-  public HServerAddress getRootRegionLocation();
+ }
+\ No newline at end of file
+diff --git a/src/java/org/apache/hadoop/hbase/master/HMaster.java b/src/java/org/apache/hadoop/hbase/master/HMaster.java
+index eaf3cac..7855680 100644
+--- a/src/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/src/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -792,14 +792,6 @@ public class HMaster extends Thread implements HConstants, HMasterInterface,
+     }
+   }
+ 
+-  public HServerAddress findRootRegion() {
+-    HServerAddress rootServer = null;
+-    if (!regionManager.inSafeMode()) {
+-      rootServer = regionManager.getRootRegionLocation();
+-    }
+-    return rootServer;
+-  }
+-
+   /**
+    * @return Server metrics
+    */
+diff --git a/src/java/org/apache/hadoop/hbase/master/RegionManager.java b/src/java/org/apache/hadoop/hbase/master/RegionManager.java
+index 03d76ae..9e42bd7 100644
+--- a/src/java/org/apache/hadoop/hbase/master/RegionManager.java
++++ b/src/java/org/apache/hadoop/hbase/master/RegionManager.java
+@@ -52,6 +52,7 @@ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hbase.io.BatchUpdate;
+ import org.apache.hadoop.hbase.util.Writables;
++import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+ 
+ /**
+  * Class to manage assigning regions to servers, state of root and meta, etc.
+@@ -136,7 +137,9 @@ class RegionManager implements HConstants {
+       new TreeMap<byte[],Pair<HRegionInfo,HServerAddress>>
+       (Bytes.BYTES_COMPARATOR));
+ 
+-  RegionManager(HMaster master) {
++  private ZooKeeperWrapper zooKeeperWrapper;
++
++  RegionManager(HMaster master) throws IOException {
+     this.master = master;
+     this.historian = RegionHistorian.getInstance();
+     this.maxAssignInOneGo = this.master.getConfiguration().
+@@ -149,10 +152,12 @@ class RegionManager implements HConstants {
+ 
+     // Scans the meta table
+     metaScannerThread = new MetaScanner(master, this);
+-    
++
++    zooKeeperWrapper = new ZooKeeperWrapper(this.master.getConfiguration());
++
+     reassignRootRegion();
+   }
+-  
++
+   void start() {
+     Threads.setDaemonThreadRunning(rootScannerThread,
+       "RegionManager.rootScanner");
+@@ -924,6 +929,7 @@ class RegionManager implements HConstants {
+   public void setRootRegionLocation(HServerAddress address) {
+     synchronized (rootRegionLocation) {
+       rootRegionLocation.set(new HServerAddress(address));
++      zooKeeperWrapper.writeRootRegionLocation(address);
+       rootRegionLocation.notifyAll();
+     } 
+   }
+diff --git a/src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 7f10768..e42ef4b 100644
+--- a/src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -92,6 +92,7 @@ import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.InfoServer;
+ import org.apache.hadoop.hbase.util.Sleeper;
+ import org.apache.hadoop.hbase.util.Threads;
++import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+ import org.apache.hadoop.io.MapWritable;
+ import org.apache.hadoop.io.Writable;
+ import org.apache.hadoop.ipc.Server;
+@@ -194,7 +195,9 @@ public class HRegionServer implements HConstants, HRegionInterface, Runnable {
+   
+   // flag set after we're done setting up server threads (used for testing)
+   protected volatile boolean isOnline;
+-    
++
++  private ZooKeeperWrapper zooKeeperWrapper;
++
+   /**
+    * Starts a HRegionServer at the default location
+    * @param conf
+@@ -276,7 +279,9 @@ public class HRegionServer implements HConstants, HRegionInterface, Runnable {
+     for(int i = 0; i < nbBlocks; i++)  {
+       reservedSpace.add(new byte[DEFAULT_SIZE_RESERVATION_BLOCK]);
+     }
+-    
++
++    this.zooKeeperWrapper = new ZooKeeperWrapper(conf);
++
+     // Register shutdown hook for HRegionServer, runs an orderly shutdown
+     // when a kill signal is recieved
+     Runtime.getRuntime().addShutdownHook(new ShutdownThread(this));
+@@ -298,7 +303,7 @@ public class HRegionServer implements HConstants, HRegionInterface, Runnable {
+       for (int tries = 0; !stopRequested.get() && isHealthy();) {
+         // Try to get the root region location from the master.
+         if (!haveRootRegion.get()) {
+-          HServerAddress rootServer = hbaseMaster.getRootRegionLocation();
++          HServerAddress rootServer = zooKeeperWrapper.readRootRegionLocation();
+           if (rootServer != null) {
+             // By setting the root region location, we bypass the wait imposed on
+             // HTable for all regions being assigned.
+diff --git a/src/java/org/apache/hadoop/hbase/zookeeper/ConnectionWatcher.java b/src/java/org/apache/hadoop/hbase/zookeeper/ConnectionWatcher.java
+new file mode 100644
+index 0000000..bc73b87
+--- /dev/null
++++ b/src/java/org/apache/hadoop/hbase/zookeeper/ConnectionWatcher.java
+@@ -0,0 +1,88 @@
++/**
++ * Copyright 2008 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.zookeeper;
++
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import org.apache.zookeeper.WatchedEvent;
++import org.apache.zookeeper.Watcher;
++import org.apache.zookeeper.Watcher.Event.KeeperState;
++
++/**
++ * Watches for events in ZooKeeper that change the connection state. Wraps
++ * another Watcher and passes events off for it to handle. ZooKeeperWrapper
++ * uses this class to wait for a ZooKeeper connection before writing data.
++ */
++public class ConnectionWatcher implements Watcher {
++  private Watcher otherWatcher;
++  private AtomicBoolean isConnected;
++
++  /**
++   * Construct object without a Watcher. Events will be ignored.
++   */
++  public ConnectionWatcher() {
++    this(null);
++  }
++
++  /**
++   * Construct object with a Watcher to pass events to.
++   * @param otherWatcher Watcher to pass events to.
++   */
++  public ConnectionWatcher(Watcher otherWatcher) {
++    this.otherWatcher = otherWatcher;
++    this.isConnected = new AtomicBoolean(false);
++  }
++
++  /**
++   * @param event WatchedEvent from ZooKeeper.
++   */
++  @Override
++  public void process(WatchedEvent event) {
++    KeeperState state = event.getState();
++    synchronized (isConnected) {
++      if (state == KeeperState.SyncConnected) {
++        isConnected.set(true);
++        isConnected.notifyAll();
++      }
++      else {
++        isConnected.set(false);
++      } 
++    }
++
++    if (otherWatcher != null) {
++      otherWatcher.process(event);
++    }
++  }
++
++  /**
++   * Wait for ZooKeeper to be in a connected state. 
++   */
++  public void waitForZooKeeperConnection() {
++    synchronized (isConnected) {
++      while (!isConnected.get()) {
++        try {
++          isConnected.wait();
++        } catch (InterruptedException e) {
++          e.printStackTrace();
++        }
++      }
++    }
++  }
++}
+diff --git a/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperNotRunningException.java b/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperNotRunningException.java
+new file mode 100644
+index 0000000..05ea010
+--- /dev/null
++++ b/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperNotRunningException.java
+@@ -0,0 +1,50 @@
++/**
++ * Copyright 2007 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.zookeeper;
++
++import java.io.IOException;
++
++/**
++ * Thrown if we have a problem connecting to ZooKeeper.
++ */
++public class ZooKeeperNotRunningException extends IOException {
++  private static final long serialVersionUID = 1L << 23 - 1L;
++
++  /** Default constructor. */
++  public ZooKeeperNotRunningException() {
++    super();
++  }
++
++  /**
++   * Constructor.
++   * @param s String message.
++   */
++  public ZooKeeperNotRunningException(String s) {
++    super(s);
++  }
++
++  /**
++   * Copy constructor.
++   * @param e IOException to copy data from.
++   */
++  public ZooKeeperNotRunningException(IOException e) {
++    super(e);
++  }
++}
+diff --git a/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java b/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+new file mode 100644
+index 0000000..53cf6d4
+--- /dev/null
++++ b/src/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+@@ -0,0 +1,185 @@
++/**
++ * Copyright 2008 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.zookeeper;
++
++import java.io.IOException;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.HServerAddress;
++import org.apache.zookeeper.CreateMode;
++import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.Watcher;
++import org.apache.zookeeper.ZooDefs;
++import org.apache.zookeeper.ZooKeeper;
++import org.apache.zookeeper.ZooKeeper.States;
++import org.apache.zookeeper.data.Stat;
++
++/**
++ * Wraps a ZooKeeper instance and adds HBase specific functionality. Uses a
++ * {@link ConnectionWatcher} to monitor the connection state. When writing we
++ * block waiting till there is a ZooKeeper connection. When reading we try to
++ * read regardless of the connection state and fail fast if we don't get a
++ * response.
++ *
++ * This class provides methods to read/write the root region location
++ * in ZooKeeper.
++ */
++public class ZooKeeperWrapper implements HConstants {
++  protected static final Log LOG = LogFactory.getLog(ZooKeeperWrapper.class);
++
++  private ZooKeeper zooKeeper;
++  private ConnectionWatcher connectionWatcher;
++
++  private String parentZNodePath;
++  private String rootRegionZNodePath;
++
++  /**
++   * Create a ZooKeeperWrapper.
++   * @param conf HBaseConfiguration to read settings from.
++   * @throws ZooKeeperNotRunningException If a connection error occurs.
++   */
++  public ZooKeeperWrapper(HBaseConfiguration conf) throws ZooKeeperNotRunningException {
++    this(conf, null);
++  }
++
++  /**
++   * Create a ZooKeeperWrapper.
++   * @param conf HBaseConfiguration to read settings from.
++   * @param watcher ZooKeeper watcher to register.
++   * @throws ZooKeeperNotRunningException If a connection error occurs.
++   */
++  public ZooKeeperWrapper(HBaseConfiguration conf, Watcher watcher) throws ZooKeeperNotRunningException {
++    String zookeeperServers = conf.get(ZOOKEEPER_SERVERS, DEFAULT_ZOOKEEPER_SERVERS);
++    int zookeeperSessionTimeout = conf.getInt(ZOOKEEPER_SESSION_TIMEOUT, DEFAULT_ZOOKEEPER_SESSION_TIMEOUT);
++    connectionWatcher = new ConnectionWatcher(watcher);
++    try {
++      zooKeeper = new ZooKeeper(zookeeperServers, zookeeperSessionTimeout, connectionWatcher);
++    } catch (IOException e) {
++      LOG.error("Failed to create ZooKeeper object: " + e);
++      throw new ZooKeeperNotRunningException(e);
++    }
++
++    parentZNodePath = conf.get(ZOOKEEPER_PARENT_ZNODE, DEFAULT_ZOOKEEPER_PARENT_ZNODE);
++    String rootServerZNodeName = conf.get(ZOOKEEPER_ROOT_SERVER_ZNODE, DEFAULT_ZOOKEEPER_ROOT_SERVER_ZNODE);
++    rootRegionZNodePath = parentZNodePath + "/" + rootServerZNodeName;
++  }
++
++  /** @return String path to HBase's parent ZNode. */
++  public String getZNodeParentPath() {
++    return parentZNodePath;
++  }
++
++  /** @return String path to ZNode containing root region location. */
++  public String getRootRegionZNodePath() {
++    return rootRegionZNodePath;
++  }
++
++  /** @return ZooKeeper object stored. */
++  public ZooKeeper getZooKeeper() {
++    return zooKeeper;
++  }
++
++  /** @return true if currently connected to ZooKeeper, false otherwise. */
++  public boolean isConnected() {
++    return zooKeeper.getState() == States.CONNECTED;
++  }
++
++  /**
++   * Read location of server storing root region.
++   * @return HServerAddress pointing to server serving root region.
++   */
++  public HServerAddress readRootRegionLocation() {
++    byte[] data;
++    try {
++      data = zooKeeper.getData(rootRegionZNodePath, false, null);
++    } catch (InterruptedException e) {
++      return null;
++    } catch (KeeperException e) {
++      return null;
++    }
++    String addressString = new String(data);
++    LOG.debug("Read ZNode: " + rootRegionZNodePath + " got " + addressString);
++    HServerAddress address = new HServerAddress(addressString);
++    return address;
++  }
++
++  /**
++   * Write root region location to ZooKeeper.
++   * @param address HServerAddress to write to ZK.
++   */
++  public void writeRootRegionLocation(HServerAddress address) {
++    waitForZooKeeperConnection();
++
++    // First make sure the parent ZNode exists.
++    try {
++      zooKeeper.create(parentZNodePath, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
++      LOG.debug("Created ZNode: " + parentZNodePath);
++    } catch (KeeperException.NodeExistsException e) {
++      // ok, move on.
++    } catch (KeeperException e) {
++      LOG.error("Could not create parent ZNode: " + e);
++      return;
++    } catch (InterruptedException e) {
++      LOG.error("Could not create parent ZNode: " + e);
++      return;
++    }
++
++    Stat stat = null;
++    try {
++      stat = zooKeeper.exists(rootRegionZNodePath, false);
++    } catch (KeeperException e) {
++    } catch (InterruptedException e) {
++    }
++
++    String addressString = address.toString();
++    byte[] data = addressString.getBytes();
++    if (stat == null) {
++      try {
++        zooKeeper.create(rootRegionZNodePath, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
++        LOG.debug("Created ZNode: " + rootRegionZNodePath + " with data: " + addressString);
++      } catch (KeeperException e) {
++        LOG.error("Could not write root region location to ZK: " + e);
++      } catch (InterruptedException e) {
++        LOG.error("Could not write root region location to ZK: " + e);
++      }
++    } else {
++      try {
++        zooKeeper.setData(rootRegionZNodePath, data, -1);
++        LOG.debug("SetData of ZNode: " + rootRegionZNodePath + " with data: " + addressString);
++      } catch (KeeperException e) {
++        LOG.error("Could not set root region location data in ZK: " + e);
++      } catch (InterruptedException e) {
++        LOG.error("Could not set root region location data in ZK: " + e);
++      }
++    }
++  }
++
++  /**
++   * Wait for ZooKeeper to be in a connected state.
++   * @return ZooKeeper object stored.
++   */
++  public ZooKeeper waitForZooKeeperConnection() {
++    connectionWatcher.waitForZooKeeperConnection();
++    return zooKeeper;
++  }
++}
+-- 
+1.5.6.4
+

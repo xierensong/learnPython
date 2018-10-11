@@ -1,0 +1,247 @@
+From 553476a0a1567af20629ba45da7a26405a707776 Mon Sep 17 00:00:00 2001
+From: Pankaj <pankaj.kr@huawei.com>
+Date: Thu, 9 Jul 2015 12:08:41 +0530
+Subject: [PATCH] HBASE-12015, Not cleaning Mob data when Mob CF is removed
+ from table
+
+---
+ .../hadoop/hbase/master/MasterFileSystem.java      | 29 ++++++++++-
+ .../procedure/DeleteColumnFamilyProcedure.java     | 16 +++----
+ .../java/org/apache/hadoop/hbase/mob/MobUtils.java | 25 ++++++++++
+ .../apache/hadoop/hbase/util/HFileArchiveUtil.java |  4 +-
+ .../hbase/regionserver/TestDeleteMobTable.java     | 56 ++++++++++++++++++++++
+ 5 files changed, 118 insertions(+), 12 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+index de28cdc..3ef859c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+@@ -46,9 +46,10 @@ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.TableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.backup.HFileArchiver;
+-import org.apache.hadoop.hbase.client.TableState;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+ import org.apache.hadoop.hbase.fs.HFileSystem;
++import org.apache.hadoop.hbase.mob.MobConstants;
++import org.apache.hadoop.hbase.mob.MobUtils;
+ import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos.SplitLogTask.RecoveryMode;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.wal.DefaultWALProvider;
+@@ -590,6 +591,32 @@ public class MasterFileSystem {
+             + ")");
+       }
+     }
++    
++    // delete mob store files
++    HTableDescriptor hTableDescriptor = this.services.getTableDescriptors().get(region.getTable());
++    HColumnDescriptor familyDescriptor = hTableDescriptor.getFamily(familyName);
++    if (familyDescriptor.isMobEnabled()) {
++      deleteMobFamilyFromFS(region, familyName);
++    }
++  }
++
++  /**
++   * Archive and delete mob store files.
++   */
++  private void deleteMobFamilyFromFS(HRegionInfo region, byte[] familyName) throws IOException {
++    Path mobTableDir =
++        FSUtils.getTableDir(new Path(getRootDir(), MobConstants.MOB_DIR_NAME), region.getTable());
++    HRegionInfo mobRegionInfo = MobUtils.getMobRegionInfo(region.getTable());
++    Path mobFamilyDir =
++        new Path(mobTableDir, new Path(mobRegionInfo.getEncodedName(), Bytes.toString(familyName)));
++    // archive mob family store files
++    MobUtils.archiveMobStoreFiles(conf, fs, mobRegionInfo, mobFamilyDir, familyName);
++
++    if (!fs.delete(mobFamilyDir, true)) {
++      throw new IOException("Could not delete mob store files for family "
++          + Bytes.toString(familyName) + " from FileSystem region "
++          + mobRegionInfo.getRegionNameAsString() + "(" + mobRegionInfo.getEncodedName() + ")");
++    }
+   }
+ 
+   public void stop() {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DeleteColumnFamilyProcedure.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DeleteColumnFamilyProcedure.java
+index 6e96910..b5cc074 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DeleteColumnFamilyProcedure.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/DeleteColumnFamilyProcedure.java
+@@ -94,14 +94,14 @@ public class DeleteColumnFamilyProcedure
+         break;
+       case DELETE_COLUMN_FAMILY_PRE_OPERATION:
+         preDelete(env, state);
+-        setNextState(DeleteColumnFamilyState.DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR);
+-        break;
+-      case DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR:
+-        updateTableDescriptor(env);
+         setNextState(DeleteColumnFamilyState.DELETE_COLUMN_FAMILY_DELETE_FS_LAYOUT);
+         break;
+       case DELETE_COLUMN_FAMILY_DELETE_FS_LAYOUT:
+         deleteFromFs(env);
++        setNextState(DeleteColumnFamilyState.DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR);
++        break;
++      case DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR:
++        updateTableDescriptor(env);
+         setNextState(DeleteColumnFamilyState.DELETE_COLUMN_FAMILY_POST_OPERATION);
+         break;
+       case DELETE_COLUMN_FAMILY_POST_OPERATION:
+@@ -141,15 +141,15 @@ public class DeleteColumnFamilyProcedure
+       case DELETE_COLUMN_FAMILY_POST_OPERATION:
+         // TODO-MAYBE: call the coprocessor event to undo?
+         break;
++      case DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR:
++        restoreTableDescriptor(env);
++        break;
+       case DELETE_COLUMN_FAMILY_DELETE_FS_LAYOUT:
+         // Once we reach to this state - we could NOT rollback - as it is tricky to undelete
+         // the deleted files. We are not suppose to reach here, throw exception so that we know
+         // there is a code bug to investigate.
+         throw new UnsupportedOperationException(this + " rollback of state=" + state
+-            + " is unsupported.");
+-      case DELETE_COLUMN_FAMILY_UPDATE_TABLE_DESCRIPTOR:
+-        restoreTableDescriptor(env);
+-        break;
++          + " is unsupported.");
+       case DELETE_COLUMN_FAMILY_PRE_OPERATION:
+         // TODO-MAYBE: call the coprocessor event to undo?
+         break;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/mob/MobUtils.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/mob/MobUtils.java
+index 53cd1a1..3be408c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/mob/MobUtils.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/mob/MobUtils.java
+@@ -45,6 +45,7 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.CellComparator;
++import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+@@ -870,4 +871,28 @@ public class MobUtils {
+       return false;
+     }
+   }
++  
++  /**
++   * Archive mob store files
++   * @param conf The current configuration.
++   * @param fs The current file system.
++   * @param mobRegionInfo The mob family region info.
++   * @param mobFamilyDir The mob family directory.
++   * @param family The name of the column family.
++   * @throws IOException
++   */
++  public static void archiveMobStoreFiles(Configuration conf, FileSystem fs,
++      HRegionInfo mobRegionInfo, Path mobFamilyDir, byte[] family) throws IOException {
++    // disable the block cache.
++    Configuration copyOfConf = HBaseConfiguration.create(conf);
++    copyOfConf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY, 0f);
++    CacheConfig cacheConfig = new CacheConfig(copyOfConf);
++
++    FileStatus[] fileStatus = FSUtils.listStatus(fs, mobFamilyDir);
++    List<StoreFile> storeFileList = new ArrayList<StoreFile>();
++    for (FileStatus file : fileStatus) {
++      storeFileList.add(new StoreFile(fs, file.getPath(), conf, cacheConfig, BloomType.NONE));
++    }
++    HFileArchiver.archiveStoreFiles(conf, fs, mobRegionInfo, mobFamilyDir, family, storeFileList);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
+index 937e9b2..a235696 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HFileArchiveUtil.java
+@@ -64,10 +64,8 @@ public class HFileArchiveUtil {
+                                          HRegionInfo region,
+                                          Path tabledir,
+       byte[] family) throws IOException {
+-    TableName tableName =
+-        FSUtils.getTableName(tabledir);
+     Path rootDir = FSUtils.getRootDir(conf);
+-    Path tableArchiveDir = getTableArchivePath(rootDir, tableName);
++    Path tableArchiveDir = getTableArchivePath(rootDir, region.getTable());
+     return HStore.getStoreHomedir(tableArchiveDir, region, family);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDeleteMobTable.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDeleteMobTable.java
+index 6dbcec0..f5c6d0b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDeleteMobTable.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDeleteMobTable.java
+@@ -24,6 +24,7 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.*;
+@@ -161,6 +162,52 @@ public class TestDeleteMobTable {
+       }
+     }
+   }
++  
++  @Test
++  public void testMobFamilyDelete() throws Exception {
++    byte[] tableName = Bytes.toBytes("testMobFamilyDelete");
++    TableName tn = TableName.valueOf(tableName);
++    HTableDescriptor htd = new HTableDescriptor(tn);
++    HColumnDescriptor hcd = new HColumnDescriptor(FAMILY);
++    hcd.setMobEnabled(true);
++    hcd.setMobThreshold(0);
++    htd.addFamily(hcd);
++    HBaseAdmin admin = null;
++    Table table = null;
++    try {
++      admin = TEST_UTIL.getHBaseAdmin();
++      admin.createTable(htd);
++      table = ConnectionFactory.createConnection(TEST_UTIL.getConfiguration()).getTable(tn);
++      byte[] value = generateMobValue(10);
++
++      byte[] row = Bytes.toBytes("row");
++      Put put = new Put(row);
++      put.addColumn(FAMILY, QF, EnvironmentEdgeManager.currentTime(), value);
++      table.put(put);
++
++      admin.flush(tn);
++
++      // the mob file exists
++      Assert.assertEquals(1, countMobFiles(tn, hcd.getNameAsString()));
++      Assert.assertEquals(0, countArchiveMobFiles(tn, hcd.getNameAsString()));
++      String fileName = assertHasOneMobRow(table, tn, hcd.getNameAsString());
++      Assert.assertFalse(mobArchiveExist(tn, hcd.getNameAsString(), fileName));
++      Assert.assertTrue(mobTableDirExist(tn));
++      
++      admin.deleteColumnFamily(tn, FAMILY);
++
++      Assert.assertEquals(0, countMobFiles(tn, hcd.getNameAsString()));
++      Assert.assertEquals(1, countArchiveMobFiles(tn, hcd.getNameAsString()));
++      Assert.assertTrue(mobArchiveExist(tn, hcd.getNameAsString(), fileName));
++      Assert.assertFalse(mobColumnFamilyDirExist(tn));
++    } finally {
++      table.close();
++      if (admin != null) {
++        admin.close();
++      }
++      TEST_UTIL.deleteTable(tableName);
++    }
++  }
+ 
+   private int countMobFiles(TableName tn, String familyName) throws IOException {
+     FileSystem fs = TEST_UTIL.getTestFileSystem();
+@@ -189,6 +236,15 @@ public class TestDeleteMobTable {
+     Path tableDir = FSUtils.getTableDir(MobUtils.getMobHome(TEST_UTIL.getConfiguration()), tn);
+     return fs.exists(tableDir);
+   }
++  
++  private boolean mobColumnFamilyDirExist(TableName tn) throws IOException {
++    FileSystem fs = TEST_UTIL.getTestFileSystem();
++    Path tableDir = FSUtils.getTableDir(MobUtils.getMobHome(TEST_UTIL.getConfiguration()), tn);
++    HRegionInfo mobRegionInfo = MobUtils.getMobRegionInfo(tn);
++    Path mobFamilyDir = new Path(tableDir, new Path(mobRegionInfo.getEncodedName(), Bytes.toString(FAMILY)));
++    
++    return fs.exists(mobFamilyDir);
++  }
+ 
+   private boolean mobArchiveExist(TableName tn, String familyName, String fileName)
+       throws IOException {
+-- 
+1.9.2.msysgit.0
+

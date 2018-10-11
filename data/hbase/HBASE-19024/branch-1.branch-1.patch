@@ -1,0 +1,568 @@
+From 1067ec1edff6bdde0cc514c92c8bb6d7700afd8c Mon Sep 17 00:00:00 2001
+From: Harshal Jain <harshal.jain@hjain-wsl.internal.salesforce.com>
+Date: Fri, 27 Oct 2017 14:55:12 +0530
+Subject: [PATCH] HBASE-19024 - provide a configurable option to hsync WAL
+ edits to the disk for better durability
+
+---
+ .../java/org/apache/hadoop/hbase/HConstants.java   |  2 ++
+ .../apache/hadoop/hbase/regionserver/HRegion.java  | 18 +++++++---
+ .../hadoop/hbase/regionserver/wal/FSHLog.java      | 40 +++++++++++++++-------
+ .../hbase/regionserver/wal/ProtobufLogWriter.java  |  8 +++--
+ .../hadoop/hbase/regionserver/wal/SyncFuture.java  | 11 ++++++
+ .../hadoop/hbase/wal/DisabledWALProvider.java      | 10 ++++++
+ .../main/java/org/apache/hadoop/hbase/wal/WAL.java | 15 ++++++++
+ .../org/apache/hadoop/hbase/wal/WALProvider.java   |  7 +++-
+ .../hbase/client/TestRollbackFromClient.java       | 11 +++++-
+ .../regionserver/TestFailedAppendAndSync.java      |  4 +--
+ .../hadoop/hbase/regionserver/TestHRegion.java     |  4 +--
+ .../hadoop/hbase/regionserver/TestWALLockup.java   |  8 ++---
+ .../regionserver/wal/SequenceFileLogWriter.java    |  5 +--
+ .../regionserver/wal/TestLogRollingNoCluster.java  |  4 +--
+ .../hbase/regionserver/wal/TestProtobufLog.java    |  2 +-
+ .../wal/TestReadOldRootAndMetaEdits.java           |  2 +-
+ .../hbase/regionserver/wal/TestWALReplay.java      |  2 +-
+ .../hbase/replication/TestReplicationSource.java   |  2 +-
+ .../apache/hadoop/hbase/wal/IOTestProvider.java    |  4 +--
+ .../apache/hadoop/hbase/wal/TestWALFactory.java    |  2 +-
+ .../org/apache/hadoop/hbase/wal/TestWALSplit.java  |  6 ++--
+ 21 files changed, 124 insertions(+), 43 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 8df7bd8..848dff3 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -1356,6 +1356,8 @@ public final class HConstants {
+   public static final String DEFAULT_TEMPORARY_HDFS_DIRECTORY = "/user/"
+       + System.getProperty("user.name") + "/hbase-staging";
+ 
++  public static final String WAL_HSYNC_CONF_KEY = "hbase.wal.hsync";
++  public static final boolean DEFAULT_WAL_HSYNC = false;
+   private HConstants() {
+     // Can't be instantiated with this ctor.
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 7a5720a..a4c5941 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -782,9 +782,17 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+      */
+     this.rowProcessorTimeout = conf.getLong(
+         "hbase.hregion.row.processor.timeout", DEFAULT_ROW_PROCESSOR_TIMEOUT);
+-    this.durability = htd.getDurability() == Durability.USE_DEFAULT
+-        ? DEFAULT_DURABILITY
+-        : htd.getDurability();
++
++    boolean forceSync =
++        conf.getBoolean(HConstants.WAL_HSYNC_CONF_KEY, HConstants.DEFAULT_WAL_HSYNC);
++    /**
++     * This is the global default value for durability. All tables/mutations not defining a
++     * durability or using USE_DEFAULT will default to this value.
++     */
++    Durability defaultDurability = forceSync ? Durability.FSYNC_WAL : Durability.SYNC_WAL;
++    this.durability =
++        htd.getDurability() == Durability.USE_DEFAULT ? defaultDurability : htd.getDurability();
++
+     if (rsServices != null) {
+       this.rsAccounting = this.rsServices.getRegionServerAccounting();
+       // don't initialize coprocessors if not running within a regionserver
+@@ -8651,9 +8659,11 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+         // nothing do to
+         break;
+       case SYNC_WAL:
++        this.wal.sync(txid, false);
++        break;
+       case FSYNC_WAL:
+         // sync the WAL edit (SYNC and FSYNC treated the same for now)
+-        this.wal.sync(txid);
++        this.wal.sync(txid, true);
+         break;
+       default:
+         throw new RuntimeException("Unknown durability " + durability);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index d5cf6bb..7744766 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -278,6 +278,8 @@ public class FSHLog implements WAL {
+ 
+   // Minimum tolerable replicas, if the actual value is lower than it, rollWriter will be triggered
+   private final int minTolerableReplication;
++  
++  private final boolean useHsync;
+ 
+   private final int slowSyncNs;
+ 
+@@ -534,6 +536,8 @@ public class FSHLog implements WAL {
+       ", prefix=" + this.logFilePrefix + ", suffix=" + logFileSuffix + ", logDir=" +
+       this.fullPathLogDir + ", archiveDir=" + this.fullPathArchiveDir);
+ 
++    this.useHsync = conf.getBoolean(HConstants.WAL_HSYNC_CONF_KEY, HConstants.DEFAULT_WAL_HSYNC);
++    
+     // rollWriter sets this.hdfs_out if it can.
+     rollWriter();
+ 
+@@ -673,7 +677,7 @@ public class FSHLog implements WAL {
+   private void preemptiveSync(final ProtobufLogWriter nextWriter) {
+     long startTimeNanos = System.nanoTime();
+     try {
+-      nextWriter.sync();
++      nextWriter.sync(useHsync);
+       postSync(System.nanoTime() - startTimeNanos, 0);
+     } catch (IOException e) {
+       // optimization failed, no need to abort here.
+@@ -1280,7 +1284,7 @@ public class FSHLog implements WAL {
+           Throwable lastException = null;
+           try {
+             Trace.addTimelineAnnotation("syncing writer");
+-            writer.sync();
++            writer.sync(takeSyncFuture.isForceSync());
+             Trace.addTimelineAnnotation("writer synced");
+             currentSequence = updateHighestSyncedSequence(currentSequence);
+           } catch (IOException e) {
+@@ -1383,20 +1387,20 @@ public class FSHLog implements WAL {
+   }
+ 
+   private SyncFuture publishSyncOnRingBuffer(long sequence) {
+-    return publishSyncOnRingBuffer(sequence, null);
++    return publishSyncOnRingBuffer(sequence, null, false);
+   }
+ 
+   private long getSequenceOnRingBuffer() {
+     return this.disruptor.getRingBuffer().next();
+   }
+ 
+-  private SyncFuture publishSyncOnRingBuffer(Span span) {
++  private SyncFuture publishSyncOnRingBuffer(Span span, boolean forceSync) {
+     long sequence = this.disruptor.getRingBuffer().next();
+-    return publishSyncOnRingBuffer(sequence, span);
++    return publishSyncOnRingBuffer(sequence, span, forceSync);
+   }
+ 
+-  private SyncFuture publishSyncOnRingBuffer(long sequence, Span span) {
+-    SyncFuture syncFuture = getSyncFuture(sequence, span);
++  private SyncFuture publishSyncOnRingBuffer(long sequence, Span span, boolean forceSync) {
++    SyncFuture syncFuture = getSyncFuture(sequence, span).setForceSync(forceSync);
+     try {
+       RingBufferTruck truck = this.disruptor.getRingBuffer().get(sequence);
+       truck.loadPayload(syncFuture);
+@@ -1407,8 +1411,8 @@ public class FSHLog implements WAL {
+   }
+ 
+   // Sync all known transactions
+-  private Span publishSyncThenBlockOnCompletion(Span span) throws IOException {
+-    return blockOnSync(publishSyncOnRingBuffer(span));
++  private Span publishSyncThenBlockOnCompletion(Span span, boolean forceSync) throws IOException {
++    return blockOnSync(publishSyncOnRingBuffer(span, forceSync));
+   }
+ 
+   private Span blockOnSync(final SyncFuture syncFuture) throws IOException {
+@@ -1503,24 +1507,34 @@ public class FSHLog implements WAL {
+ 
+   @Override
+   public void sync() throws IOException {
++    sync(useHsync);
++  }
++  
++  @Override
++  public void sync(boolean forceSync) throws IOException {
+     TraceScope scope = Trace.startSpan("FSHLog.sync");
+     try {
+-      scope = Trace.continueSpan(publishSyncThenBlockOnCompletion(scope.detach()));
++      scope = Trace.continueSpan(publishSyncThenBlockOnCompletion(scope.detach(), forceSync));
+     } finally {
+       assert scope == NullScope.INSTANCE || !scope.isDetached();
+       scope.close();
+     }
+   }
+-
++  
+   @Override
+   public void sync(long txid) throws IOException {
+-    if (this.highestSyncedSequence.get() >= txid){
++	  sync(txid, useHsync);
++  }
++  
++  @Override
++  public void sync(long txid, boolean forceSync) throws IOException {
++    if (this.highestSyncedSequence.get() >= txid) {
+       // Already sync'd.
+       return;
+     }
+     TraceScope scope = Trace.startSpan("FSHLog.sync");
+     try {
+-      scope = Trace.continueSpan(publishSyncThenBlockOnCompletion(scope.detach()));
++      scope = Trace.continueSpan(publishSyncThenBlockOnCompletion(scope.detach(), forceSync));
+     } finally {
+       assert scope == NullScope.INSTANCE || !scope.isDetached();
+       scope.close();
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
+index 42abeae..cb9e5a5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/ProtobufLogWriter.java
+@@ -164,11 +164,15 @@ public class ProtobufLogWriter extends WriterBase {
+   }
+ 
+   @Override
+-  public void sync() throws IOException {
++  public void sync(boolean forceSync) throws IOException {
+     FSDataOutputStream fsdos = this.output;
+     if (fsdos == null) return; // Presume closed
+     fsdos.flush();
+-    fsdos.hflush();
++    if (forceSync) {
++      fsdos.hsync();
++    } else {
++      fsdos.hflush();
++    }
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SyncFuture.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SyncFuture.java
+index 0720de8..ed471bd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SyncFuture.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/SyncFuture.java
+@@ -79,6 +79,8 @@ class SyncFuture {
+    * Optionally carry a disconnected scope to the SyncRunner.
+    */
+   private Span span;
++  
++  private boolean forceSync;
+ 
+   /**
+    * Call this method to clear old usage and get it ready for new deploy. Call
+@@ -119,6 +121,15 @@ class SyncFuture {
+   synchronized long getRingBufferSequence() {
+     return this.ringBufferSequence;
+   }
++  
++  synchronized boolean isForceSync() {
++    return forceSync;
++  }
++
++  synchronized SyncFuture setForceSync(boolean forceSync) {
++    this.forceSync = forceSync;
++    return this;
++  }
+ 
+   /**
+    * Retrieve the {@code span} instance from this Future. EventHandler calls
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+index 0c0f6dd..d4800ac 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/DisabledWALProvider.java
+@@ -193,6 +193,16 @@ class DisabledWALProvider implements WALProvider {
+     }
+ 
+     @Override
++    public void sync(boolean forceSync) throws IOException {
++      sync();
++    }
++
++    @Override
++    public void sync(long txid, boolean forceSync) throws IOException {
++      sync(txid);
++    }
++    
++    @Override
+     public Long startCacheFlush(final byte[] encodedRegionName, Set<byte[]> flushedFamilyNames) {
+       if (closed.get()) return null;
+       return HConstants.NO_SEQNUM;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WAL.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WAL.java
+index 9e90a0c..607cca9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WAL.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WAL.java
+@@ -138,8 +138,23 @@ public interface WAL extends Closeable {
+    * @throws IOException
+    */
+   void sync(long txid) throws IOException;
++  
++  /**
++   * @param forceSync Flag to force sync rather than flushing to the buffer. Example - Hadoop hflush
++   *          vs hsync.
++   * @throws IOException
++   */
++  void sync(boolean forceSync) throws IOException;
+ 
+   /**
++   * @param txid
++   * @param forceSync Flag to force sync rather than flushing to the buffer. Example - Hadoop hflush
++   *          vs hsync.
++   * @throws IOException
++   */
++  void sync(long txid, boolean forceSync) throws IOException;
++  
++  /**
+    * WAL keeps track of the sequence numbers that are as yet not flushed im memstores
+    * in order to be able to do accounting to figure which WALs can be let go. This method tells WAL
+    * that some region is about to flush. The flush can be the whole region or for a column family
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+index 57ffd6b..cc84306 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALProvider.java
+@@ -80,7 +80,12 @@ public interface WALProvider {
+   // Writers are used internally. Users outside of the WAL should be relying on the
+   // interface provided by WAL.
+   interface Writer extends Closeable {
+-    void sync() throws IOException;
++    /**
++     * @param forceSync Flag to force sync rather than flushing to the buffer. Example - Hadoop hflush
++     *          vs hsync.
++     * @throws IOException
++     */
++    void sync(boolean forceSync) throws IOException;
+     void append(WAL.Entry entry) throws IOException;
+     long getLength() throws IOException;
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRollbackFromClient.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRollbackFromClient.java
+index 9230f31..e6dd53d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRollbackFromClient.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRollbackFromClient.java
+@@ -319,6 +319,16 @@ public class TestRollbackFromClient {
+     }
+ 
+     @Override
++    public void sync(boolean forceSync) throws IOException {
++      delegation.sync(forceSync);
++    }
++
++    @Override
++    public void sync(long txid, boolean forceSync) throws IOException {
++      delegation.sync(txid, forceSync);
++    }
++
++    @Override
+     public Long startCacheFlush(byte[] encodedRegionName, Set<byte[]> families) {
+       return delegation.startCacheFlush(encodedRegionName, families);
+     }
+@@ -347,6 +357,5 @@ public class TestRollbackFromClient {
+     public long getEarliestMemstoreSeqNum(byte[] encodedRegionName, byte[] familyName) {
+       return delegation.getEarliestMemstoreSeqNum(encodedRegionName, familyName);
+     }
+-
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFailedAppendAndSync.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFailedAppendAndSync.java
+index 945361f..0d75679 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFailedAppendAndSync.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFailedAppendAndSync.java
+@@ -134,11 +134,11 @@ public class TestFailedAppendAndSync {
+             }
+ 
+             @Override
+-            public void sync() throws IOException {
++            public void sync(boolean forceSync) throws IOException {
+               if (throwSyncException) {
+                 throw new IOException("FAKE! Failed to replace a bad datanode...");
+               }
+-              w.sync();
++              w.sync(forceSync);
+             }
+ 
+             @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+index 1ec2fe4..9c6a6ce 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+@@ -1168,8 +1168,8 @@ public class TestHRegion {
+           }
+ 
+           @Override
+-          public void sync() throws IOException {
+-            w.sync();
++          public void sync(boolean forceSync) throws IOException {
++            w.sync(forceSync);
+           }
+ 
+           @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWALLockup.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWALLockup.java
+index 0a0393a..f1164b0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWALLockup.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWALLockup.java
+@@ -172,11 +172,11 @@ public class TestWALLockup {
+           }
+ 
+           @Override
+-          public void sync() throws IOException {
++          public void sync(boolean forceSync) throws IOException {
+             if (throwException) {
+               throw new IOException("FAKE! Failed to replace a bad datanode...SYNC");
+             }
+-            w.sync();
++            w.sync(forceSync);
+           }
+ 
+           @Override
+@@ -327,12 +327,12 @@ public class TestWALLockup {
+           }
+ 
+           @Override
+-          public void sync() throws IOException {
++          public void sync(boolean forceSync) throws IOException {
+             if (throwException) {
+               throw new IOException(
+                   "FAKE! Failed to replace a bad datanode...SYNC");
+             }
+-            w.sync();
++            w.sync(forceSync);
+           }
+ 
+           @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
+index 6ebafc9..e0bb5cc 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/SequenceFileLogWriter.java
+@@ -193,7 +193,7 @@ public class SequenceFileLogWriter extends WriterBase {
+   }
+ 
+   @Override
+-  public void sync() throws IOException {
++  public void sync(boolean forceSync) throws IOException {
+     try {
+       this.writer.syncFs();
+     } catch (NullPointerException npe) {
+@@ -201,7 +201,7 @@ public class SequenceFileLogWriter extends WriterBase {
+       throw new IOException(npe);
+     }
+   }
+-
++  
+   @Override
+   public long getLength() throws IOException {
+     try {
+@@ -219,4 +219,5 @@ public class SequenceFileLogWriter extends WriterBase {
+   public FSDataOutputStream getWriterFSDataOutputStream() {
+     return this.writer_out;
+   }
++  
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
+index bca4a7e..f8898c7 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRollingNoCluster.java
+@@ -56,9 +56,9 @@ public class TestLogRollingNoCluster {
+   /** ProtobufLogWriter that simulates higher latencies in sync() call */
+   public static class HighLatencySyncWriter extends  ProtobufLogWriter {
+     @Override
+-    public void sync() throws IOException {
++    public void sync(boolean forceSync) throws IOException {
+       Threads.sleep(ThreadLocalRandom.current().nextInt(10));
+-      super.sync();
++      super.sync(forceSync);
+       Threads.sleep(ThreadLocalRandom.current().nextInt(10));
+     }
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestProtobufLog.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestProtobufLog.java
+index 3d10a39..c8404c4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestProtobufLog.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestProtobufLog.java
+@@ -170,7 +170,7 @@ public class TestProtobufLog {
+         }
+         writer.append(new WAL.Entry(key, edit));
+       }
+-      writer.sync();
++      writer.sync(false);
+       if (withTrailer) writer.close();
+ 
+       // Now read the log using standard means.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestReadOldRootAndMetaEdits.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestReadOldRootAndMetaEdits.java
+index 1138f65..5bdfa3e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestReadOldRootAndMetaEdits.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestReadOldRootAndMetaEdits.java
+@@ -120,7 +120,7 @@ public class TestReadOldRootAndMetaEdits {
+       writer.append(oldMetaEntry);
+ 
+       // sync/close the writer
+-      writer.sync();
++      writer.sync(false);
+       writer.close();
+ 
+       // read the log and see things are okay.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
+index 3a02378..00842ac 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplay.java
+@@ -1254,7 +1254,7 @@ public class TestWALReplay {
+     for (FSWALEntry entry : entries) {
+       writer.append(entry);
+     }
+-    writer.sync();
++    writer.sync(false);
+     writer.close();
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSource.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSource.java
+index 6e6fe9a..5d9059a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSource.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSource.java
+@@ -120,7 +120,7 @@ public class TestReplicationSource {
+       WALKey key = new WALKey(b, TableName.valueOf(b), 0, 0,
+           HConstants.DEFAULT_CLUSTER_ID);
+       writer.append(new WAL.Entry(key, edit));
+-      writer.sync();
++      writer.sync(false);
+     }
+     writer.close();
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+index a044bcf..97fa2c0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+@@ -232,9 +232,9 @@ public class IOTestProvider implements WALProvider {
+     }
+ 
+     @Override
+-    public void sync() throws IOException {
++    public void sync(boolean forceSync) throws IOException {
+       if (doSyncs) {
+-        super.sync();
++        super.sync(forceSync);
+       }
+     }
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
+index 621d092..42ef1a5 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALFactory.java
+@@ -677,7 +677,7 @@ public class TestWALFactory {
+         }
+         sflw.append(new WAL.Entry(key, edit));
+       }
+-      sflw.sync();
++      sflw.sync(false);
+       sflw.close();
+ 
+       // Now read the log using standard means.
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
+index 3ae155c..92fe4db 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplit.java
+@@ -1353,7 +1353,7 @@ public class TestWALSplit {
+     WALKey key = new WALKey(hri.getEncodedNameAsBytes(), TABLE_NAME, 1,
+         EnvironmentEdgeManager.currentTime(), HConstants.DEFAULT_CLUSTER_ID);
+     w.append(new Entry(key, edit));
+-    w.sync();
++    w.sync(false);
+   }
+ 
+   private static void appendRegionEvent(Writer w, String region) throws IOException {
+@@ -1371,7 +1371,7 @@ public class TestWALSplit {
+         HConstants.DEFAULT_CLUSTER_ID);
+     w.append(
+         new Entry(walKey, new WALEdit().add(kv)));
+-    w.sync();
++    w.sync(false);
+   }
+ 
+   public static long appendEntry(Writer writer, TableName table, byte[] region,
+@@ -1381,7 +1381,7 @@ public class TestWALSplit {
+     LOG.info(Thread.currentThread().getName() + " append");
+     writer.append(createTestEntry(table, region, row, family, qualifier, value, seq));
+     LOG.info(Thread.currentThread().getName() + " sync");
+-    writer.sync();
++    writer.sync(false);
+     return seq;
+   }
+ 
+-- 
+2.7.4
+

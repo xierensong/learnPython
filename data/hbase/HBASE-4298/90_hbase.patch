@@ -1,0 +1,315 @@
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java b/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+index ae6b653..0bef287 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+@@ -1156,37 +1156,52 @@ public class AssignmentManager extends ZooKeeperListener {
+   RegionPlan getRegionPlan(final RegionState state,
+       final HServerInfo serverToExclude, final boolean forceNewPlan) {
+     // Pickup existing plan or make a new one
+-    String encodedName = state.getRegion().getEncodedName();
+-    List<HServerInfo> servers = this.serverManager.getOnlineServersList();
+-    // The remove below hinges on the fact that the call to
+-    // serverManager.getOnlineServersList() returns a copy
+-    if (serverToExclude != null) servers.remove(serverToExclude);
++    final String encodedName = state.getRegion().getEncodedName();
++    final List<HServerInfo> servers = this.serverManager.getOnlineServersList();
++    final List<HServerInfo> drainingServers = this.serverManager.getDrainingServersList();
++
++    if (serverToExclude != null) drainingServers.add(serverToExclude);
++    // Loop through the draining server list and remove them from the
++    // server list.
++    LOG.debug("Current draining server list: " + drainingServers);
++
++    if (!drainingServers.isEmpty()) {
++      for (final HServerInfo server: drainingServers) {
++        LOG.debug("Removing server: " + server + " from eligible server pool.");
++        servers.remove(server);
++      }
++    }
++
+     if (servers.isEmpty()) return null;
+-    RegionPlan randomPlan = new RegionPlan(state.getRegion(), null,
++
++    final RegionPlan randomPlan = new RegionPlan(state.getRegion(), null,
+       LoadBalancer.randomAssignment(servers));
+     boolean newPlan = false;
+     RegionPlan existingPlan = null;
++
+     synchronized (this.regionPlans) {
+       existingPlan = this.regionPlans.get(encodedName);
+-      if (forceNewPlan || existingPlan == null 
+-              || existingPlan.getDestination() == null 
+-              || existingPlan.getDestination().equals(serverToExclude)) {
++      if (forceNewPlan
++          || existingPlan == null
++          || existingPlan.getDestination() == null
++          || drainingServers.contains(existingPlan.getDestination())) {
+         newPlan = true;
+         this.regionPlans.put(encodedName, randomPlan);
+       }
+     }
++
+     if (newPlan) {
+       debugLog(state.getRegion(), "No previous transition plan was found (or we are ignoring " +
+         "an existing plan) for " + state.getRegion().getRegionNameAsString() +
+         " so generated a random one; " + randomPlan + "; " +
+         serverManager.countOfRegionServers() +
+         " (online=" + serverManager.getOnlineServers().size() +
+-        ", exclude=" + serverToExclude + ") available servers");
++        ", exclude=" + drainingServers + ") available servers");
+         return randomPlan;
+       }
+-      debugLog(state.getRegion(), "Using pre-existing plan for region " +
+-        state.getRegion().getRegionNameAsString() + "; plan=" + existingPlan);
+-      return existingPlan;
++    debugLog(state.getRegion(), "Using pre-existing plan for region " +
++             state.getRegion().getRegionNameAsString() + "; plan=" + existingPlan);
++    return existingPlan;
+   }
+ 
+   /**
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 7978cd3..87a0a7e 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -84,6 +84,7 @@ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hbase.util.VersionInfo;
+ import org.apache.hadoop.hbase.zookeeper.ClusterStatusTracker;
+ import org.apache.hadoop.hbase.zookeeper.RegionServerTracker;
++import org.apache.hadoop.hbase.zookeeper.DrainingServerTracker;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
+ import org.apache.hadoop.io.MapWritable;
+ import org.apache.hadoop.io.Text;
+@@ -127,6 +128,8 @@ implements HMasterInterface, HMasterRegionInterface, MasterServices, Server {
+   private ActiveMasterManager activeMasterManager;
+   // Region server tracker
+   private RegionServerTracker regionServerTracker;
++  // Draining region server tracker
++  private DrainingServerTracker drainingServerTracker;
+ 
+   // RPC server for the HMaster
+   private final HBaseServer rpcServer;
+@@ -362,6 +365,10 @@ implements HMasterInterface, HMasterRegionInterface, MasterServices, Server {
+       this.serverManager);
+     this.regionServerTracker.start();
+ 
++    this.drainingServerTracker = new DrainingServerTracker(zooKeeper, this,
++      this.serverManager);
++    this.drainingServerTracker.start();
++
+     // Set the cluster as up.  If new RSs, they'll be waiting on this before
+     // going ahead with their startup.
+     this.clusterStatusTracker = new ClusterStatusTracker(getZooKeeper(), this);
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java b/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+index 923f891..c7c7073 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+@@ -81,6 +81,12 @@ public class ServerManager {
+   private final Map<String, HRegionInterface> serverConnections =
+     new HashMap<String, HRegionInterface>();
+ 
++  /** Map of region servers that should not get any more new regions.  This
++   * is a map of Server Names (host,port,startcode) --> Server Info.
++   */
++  private final Map<String, HServerInfo> drainingServers =
++    new ConcurrentHashMap<String, HServerInfo>();
++
+   private final Server master;
+   private final MasterServices services;
+ 
+@@ -540,6 +546,40 @@ public class ServerManager {
+         carryingRoot + ", meta=" + carryingMeta);
+   }
+ 
++  /*
++   * Remove the server from the drain list.
++   */
++  public synchronized void removeServerFromDrainList(final String serverName) {
++    // Warn if the server (serverName) is not online.  ServerName is of the
++    // form: <hostname> , <port> , <startcode>
++    final HServerInfo info = this.onlineServers.get(serverName);
++
++    if (info == null)
++      LOG.warn("Server " + serverName + " is not currently online. " +
++               "Removing from draining list anyway, as requested.");
++    // Remove the server from the draining servers lists.
++    this.drainingServers.remove(serverName);
++    return;
++  }
++
++  /*
++   * Add the server to the drain list.
++   */
++  public synchronized void addServerToDrainList(final String serverName) {
++    // Ignore if server (serverName) is not online.  ServerName is of the
++    // form: <hostname> , <port> , <startcode>
++    final HServerInfo info = this.onlineServers.get(serverName);
++
++    if (info == null) {
++      LOG.warn("Server " + serverName + " is not currently online. " +
++               "Ignoring request to add it to draining list.");
++      return;
++    }
++    // Add the server to the draining servers lists.
++    this.drainingServers.put(serverName, info);
++    return;
++  }
++
+   // RPC methods to region servers
+ 
+   /**
+@@ -687,6 +727,13 @@ public class ServerManager {
+     return new ArrayList<HServerInfo>(onlineServers.values());
+   }
+ 
++  /**
++   * @return A copy of the internal list of draining servers.
++   */
++  public List<HServerInfo> getDrainingServersList() {
++    return new ArrayList<HServerInfo>(drainingServers.values());
++  }
++
+   public boolean isServerOnline(String serverName) {
+     return onlineServers.containsKey(serverName);
+   }
+diff --git a/src/main/java/org/apache/hadoop/hbase/zookeeper/DrainingServerTracker.java b/src/main/java/org/apache/hadoop/hbase/zookeeper/DrainingServerTracker.java
+new file mode 100644
+index 0000000..13a89b6
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/zookeeper/DrainingServerTracker.java
+@@ -0,0 +1,105 @@
++/**
++ * Copyright The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.zookeeper;
++
++import java.util.List;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.Abortable;
++import org.apache.hadoop.hbase.HServerAddress;
++import org.apache.hadoop.hbase.master.ServerManager;
++import org.apache.zookeeper.KeeperException;
++
++/**
++ * Tracks the list of draining region servers via ZK.
++ *
++ * <p>This class is responsible for watching for changes to the draining
++ * servers list.  It handles adds/deletes in the draining RS list and
++ * watches each node.
++ *
++ * <p>If an RS gets deleted from draining list, we call
++ * {@link ServerManager#removeServerFromDrainList(String)}.
++ *
++ * <p>If an RS gets added to the draining list, we add a watcher to it and call
++ * {@link ServerManager#addServerToDrainList(String)}.
++ *
++ */
++public class DrainingServerTracker extends ZooKeeperListener {
++  private static final Log LOG = LogFactory.getLog(DrainingServerTracker.class);
++
++  private ServerManager serverManager;
++  private Abortable abortable;
++
++  public DrainingServerTracker(ZooKeeperWatcher watcher,
++      Abortable abortable, ServerManager serverManager) {
++    super(watcher);
++    this.abortable = abortable;
++    this.serverManager = serverManager;
++  }
++
++  /**
++   * Starts the tracking of draining RegionServers.
++   *
++   * <p>All Draining RSs will be tracked after this method is called.
++   *
++   * @throws KeeperException
++   */
++  public void start() throws KeeperException {
++    watcher.registerListener(this);
++    ZKUtil.watchAndGetNewChildren(watcher, watcher.drainingZNode);
++  }
++
++  @Override
++  public void nodeDeleted(final String path) {
++    if(path.startsWith(watcher.drainingZNode)) {
++      final String serverName = ZKUtil.getNodeName(path);
++      LOG.info("Draining RS ephemeral node deleted, removing from list [" +
++          serverName + "]");
++      serverManager.removeServerFromDrainList(serverName);
++    }
++  }
++
++  @Override
++  public void nodeCreated(final String path) {
++    if(path.startsWith(watcher.drainingZNode)) {
++      final String serverName = ZKUtil.getNodeName(path);
++      LOG.info("Draining RS ephemeral node created, adding it to the list [" +
++          serverName + "]");
++      serverManager.addServerToDrainList(serverName);
++    }
++  }
++
++  @Override
++  public void nodeChildrenChanged(final String path) {
++    if(path.equals(watcher.drainingZNode)) {
++      try {
++        final List<ZKUtil.NodeAndData> newNodes = ZKUtil.watchAndGetNewChildren(watcher,
++                                                         watcher.drainingZNode);
++        for (final ZKUtil.NodeAndData nodeData: newNodes) {
++          nodeCreated(nodeData.getNode());
++        }
++      } catch (KeeperException e) {
++        abortable.abort("Unexpected zk exception getting RS nodes", e);
++      }
++    }
++  }
++
++}
+diff --git a/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java b/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java
+index f277e6a..4a5ed5b 100644
+--- a/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java
++++ b/src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWatcher.java
+@@ -79,6 +79,8 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
+   public String rootServerZNode;
+   // znode containing ephemeral nodes of the regionservers
+   public String rsZNode;
++  // znode containing ephemeral nodes of the draining regionservers
++  public String drainingZNode;
+   // znode of currently active master
+   public String masterAddressZNode;
+   // znode containing the current cluster state
+@@ -162,6 +164,7 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
+       }
+       ZKUtil.createAndFailSilent(this, assignmentZNode);
+       ZKUtil.createAndFailSilent(this, rsZNode);
++      ZKUtil.createAndFailSilent(this, drainingZNode);
+       ZKUtil.createAndFailSilent(this, tableZNode);
+     } catch (KeeperException e) {
+       throw new ZooKeeperConnectionException(
+@@ -198,6 +201,8 @@ public class ZooKeeperWatcher implements Watcher, Abortable {
+         conf.get("zookeeper.znode.rootserver", "root-region-server"));
+     rsZNode = ZKUtil.joinZNode(baseZNode,
+         conf.get("zookeeper.znode.rs", "rs"));
++    drainingZNode = ZKUtil.joinZNode(baseZNode,
++        conf.get("zookeeper.znode.draining.rs", "draining"));
+     masterAddressZNode = ZKUtil.joinZNode(baseZNode,
+         conf.get("zookeeper.znode.master", "master"));
+     clusterStateZNode = ZKUtil.joinZNode(baseZNode,

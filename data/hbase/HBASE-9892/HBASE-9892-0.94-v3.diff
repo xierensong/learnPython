@@ -1,0 +1,439 @@
+Index: src/main/java/org/apache/hadoop/hbase/zookeeper/RegionServerTracker.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/zookeeper/RegionServerTracker.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/zookeeper/RegionServerTracker.java	(working copy)
+@@ -22,14 +22,17 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
+-import java.util.NavigableSet;
+-import java.util.TreeSet;
++import java.util.NavigableMap;
++import java.util.TreeMap;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.Abortable;
+ import org.apache.hadoop.hbase.ServerName;
+ import org.apache.hadoop.hbase.master.ServerManager;
++import org.apache.hadoop.hbase.regionserver.RegionServerInfo;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.zookeeper.KeeperException;
+ 
+ /**
+@@ -44,7 +47,8 @@
+  */
+ public class RegionServerTracker extends ZooKeeperListener {
+   private static final Log LOG = LogFactory.getLog(RegionServerTracker.class);
+-  private NavigableSet<ServerName> regionServers = new TreeSet<ServerName>();
++  private NavigableMap<ServerName, RegionServerInfo> regionServers = 
++		  new TreeMap<ServerName, RegionServerInfo>();
+   private ServerManager serverManager;
+   private Abortable abortable;
+ 
+@@ -75,7 +79,22 @@
+       this.regionServers.clear();
+       for (String n: servers) {
+         ServerName sn = ServerName.parseServerName(ZKUtil.getNodeName(n));
+-        this.regionServers.add(sn);
++        if (regionServers.get(sn) == null) {
++          RegionServerInfo rsInfo = new RegionServerInfo();
++          try {
++            String nodePath = ZKUtil.joinZNode(watcher.rsZNode, n);
++            byte[] data = ZKUtil.getData(watcher, nodePath);
++            LOG.info("Rs node: " + nodePath + " data: " + Bytes.toString(data));
++            if (data != null && data.length > 0) {
++              rsInfo = (RegionServerInfo) Writables.getWritable(data, rsInfo);
++            }
++          } catch (KeeperException e) {
++            LOG.warn("Get Rs info port from ephemeral node", e);
++          } catch (IOException e) {
++            LOG.warn("Illegal data from ephemeral node", e);
++          }
++          this.regionServers.put(sn, rsInfo);
++        }
+       }
+     }
+   }
+@@ -118,13 +137,19 @@
+     }
+   }
+ 
++  public int getRegionServerInfoPort(final ServerName sn) {
++    Integer port = regionServers.get(sn).getInfoPort();
++    if (port != null) return port;
++    return -1;
++  }
++  
+   /**
+    * Gets the online servers.
+    * @return list of online servers
+    */
+   public List<ServerName> getOnlineServers() {
+     synchronized (this.regionServers) {
+-      return new ArrayList<ServerName>(this.regionServers);
++      return new ArrayList<ServerName>(this.regionServers.keySet());
+     }
+   }
+ }
+Index: src/main/java/org/apache/hadoop/hbase/HConstants.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/HConstants.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/HConstants.java	(working copy)
+@@ -167,6 +167,9 @@
+   /** Parameter name for port region server listens on. */
+   public static final String REGIONSERVER_PORT = "hbase.regionserver.port";
+ 
++  /** Parameter name for port region server's info server listens on. */
++  public static final String REGIONSERVER_INFO_PORT = "hbase.regionserver.info.port";
++  
+   /** Default port region server listens on. */
+   public static final int DEFAULT_REGIONSERVER_PORT = 60020;
+ 
+Index: src/main/java/org/apache/hadoop/hbase/LocalHBaseCluster.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/LocalHBaseCluster.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/LocalHBaseCluster.java	(working copy)
+@@ -140,6 +140,8 @@
+     // clash over default ports.
+     conf.set(HConstants.MASTER_PORT, "0");
+     conf.set(HConstants.REGIONSERVER_PORT, "0");
++    conf.set(HConstants.REGIONSERVER_INFO_PORT, "0");
++
+     this.masterClass = (Class<? extends HMaster>)
+       conf.getClass(HConstants.MASTER_IMPL, masterClass);
+     // Start the HMasters.
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(working copy)
+@@ -158,6 +158,7 @@
+ import org.apache.hadoop.hbase.util.Strings;
+ import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hbase.util.VersionInfo;
++import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.hbase.zookeeper.ClusterId;
+ import org.apache.hadoop.hbase.zookeeper.ClusterStatusTracker;
+ import org.apache.hadoop.hbase.zookeeper.ZKAssign;
+@@ -357,8 +358,8 @@
+    */
+   private ServerName serverNameFromMasterPOV;
+ 
+-  // Port we put up the webui on.
+-  private int webuiport = -1;
++  // region server static info like info port
++  private RegionServerInfo rsInfo;
+ 
+   /**
+    * This servers startcode.
+@@ -484,6 +485,10 @@
+         abort("Uncaught exception in service thread " + t.getName(), e);
+       }
+     };
++    this.rsInfo = new RegionServerInfo();
++    // Put up the webui.  Webui may come up on port other than configured if
++    // that port is occupied. Adjust serverInfo if this is the case.
++    this.rsInfo.setInfoPort(putUpWebUI());
+   }
+ 
+   /** Handle all the snapshot requests to this server */
+@@ -1124,9 +1129,9 @@
+     return ZKUtil.joinZNode(this.zooKeeper.rsZNode, getServerName().toString());
+   }
+ 
+-  private void createMyEphemeralNode() throws KeeperException {
++  private void createMyEphemeralNode() throws KeeperException, IOException {
+     ZKUtil.createEphemeralNodeAndWatch(this.zooKeeper, getMyEphemeralNodePath(),
+-      HConstants.EMPTY_BYTE_ARRAY);
++      Writables.getBytes(rsInfo));
+   }
+ 
+   private void deleteMyEphemeralNode() throws KeeperException {
+@@ -1706,10 +1711,6 @@
+     this.leases.setName(n + ".leaseChecker");
+     this.leases.start();
+ 
+-    // Put up the webui.  Webui may come up on port other than configured if
+-    // that port is occupied. Adjust serverInfo if this is the case.
+-    this.webuiport = putUpWebUI();
+-
+     if (this.replicationSourceHandler == this.replicationSinkHandler &&
+         this.replicationSourceHandler != null) {
+       this.replicationSourceHandler.startReplicationService();
+@@ -1762,7 +1763,7 @@
+         port++;
+       }
+     }
+-    return port;
++    return this.infoServer.getPort();
+   }
+ 
+   /*
+@@ -3779,7 +3780,7 @@
+   public HServerInfo getHServerInfo() throws IOException {
+     checkOpen();
+     return new HServerInfo(new HServerAddress(this.isa),
+-      this.startcode, this.webuiport);
++      this.startcode, this.rsInfo.getInfoPort());
+   }
+ 
+   @SuppressWarnings("unchecked")
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/RSStatusServlet.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/RSStatusServlet.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/RSStatusServlet.java	(working copy)
+@@ -40,6 +40,13 @@
+     assert hrs != null : "No RS in context!";
+     
+     resp.setContentType("text/html");
++    
++    if (!hrs.isOnline()) {
++      resp.getWriter().write("The RegionServer is initializing!");
++      resp.getWriter().close();
++      return;
++    }
++    
+     RSStatusTmpl tmpl = new RSStatusTmpl();
+     if (req.getParameter("format") != null)
+       tmpl.setFormat(req.getParameter("format"));
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerInfo.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerInfo.java	(revision 0)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerInfo.java	(revision 0)
+@@ -0,0 +1,64 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++
++import org.apache.hadoop.io.Writable;
++
++/**
++ * Region server's static info like info port. These info will be written on
++ * region server's ephemeral zookeeper node at the startup for Hmaster to watch.
++ */
++
++public class RegionServerInfo implements Writable {
++  private static final short VERSION = 0;
++
++  private int infoPort;
++
++  public RegionServerInfo() {
++  }
++
++  public int getInfoPort() {
++    return infoPort;
++  }
++
++  public void setInfoPort(int infoPort) {
++    this.infoPort = infoPort;
++  }
++
++  @Override
++  public void readFields(DataInput in) throws IOException {
++    int version = in.readInt();
++    if (version != VERSION) {
++      throw new IOException("unsupported version: " + version);
++    }
++    this.infoPort = in.readInt();
++  }
++
++  @Override
++  public void write(DataOutput out) throws IOException {
++    out.writeInt(VERSION);
++    out.writeInt(infoPort);
++  }
++}
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/RSDumpServlet.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/RSDumpServlet.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/RSDumpServlet.java	(working copy)
+@@ -50,6 +50,13 @@
+     assert hrsconf != null : "No RS conf in context";
+ 
+     response.setContentType("text/plain");
++ 
++    if (!hrs.isOnline()) {
++      response.getWriter().write("The RegionServer is initializing!");
++      response.getWriter().close();
++      return;
++    }
++
+     OutputStream os = response.getOutputStream();
+     PrintWriter out = new PrintWriter(os);
+     
+Index: src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/master/HMaster.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/master/HMaster.java	(working copy)
+@@ -1602,6 +1602,14 @@
+     return masterActiveTime;
+   }
+ 
++  public int getRegionServerInfoPort(final ServerName sn) {
++    int port = this.regionServerTracker.getRegionServerInfoPort(sn);
++    if (port == -1) {
++      return this.conf.getInt(HConstants.REGIONSERVER_INFO_PORT, 60030);
++    }
++    return port;
++  }
++  
+   /**
+    * @return array of coprocessor SimpleNames.
+    */
+Index: src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java	(revision 1539286)
++++ src/main/java/org/apache/hadoop/hbase/master/HMasterCommandLine.java	(working copy)
+@@ -143,7 +143,7 @@
+                  Integer.toString(clientPort));
+         // Need to have the zk cluster shutdown when master is shutdown.
+         // Run a subclass that does the zk cluster shutdown on its way out.
+-        LocalHBaseCluster cluster = new LocalHBaseCluster(conf, 1, 1,
++        LocalHBaseCluster cluster = new LocalHBaseCluster(conf, 1, 3,
+                                                           LocalHMaster.class, HRegionServer.class);
+         ((LocalHMaster)cluster.getMaster(0)).setZKCluster(zooKeeperCluster);
+         cluster.startup();
+Index: src/main/jamon/org/apache/hadoop/hbase/tmpl/master/MasterStatusTmpl.jamon
+===================================================================
+--- src/main/jamon/org/apache/hadoop/hbase/tmpl/master/MasterStatusTmpl.jamon	(revision 1539286)
++++ src/main/jamon/org/apache/hadoop/hbase/tmpl/master/MasterStatusTmpl.jamon	(working copy)
+@@ -253,9 +253,7 @@
+    ServerName [] serverNames = servers.toArray(new ServerName[servers.size()]);
+      Arrays.sort(serverNames);
+      for (ServerName serverName: serverNames) {
+-       // TODO: this is incorrect since this conf might differ from RS to RS
+-       // or be set to 0 to get ephemeral ports
+-       int infoPort = master.getConfiguration().getInt("hbase.regionserver.info.port", 60030);
++       int infoPort = master.getRegionServerInfoPort(serverName);
+        String url = "http://" + serverName.getHostname() + ":" + infoPort + "/";
+        HServerLoad hsl = master.getServerManager().getLoad(serverName);
+        String loadStr = hsl == null? "-": hsl.toString();
+@@ -286,7 +284,6 @@
+    ServerName [] deadServerNames = deadServers.toArray(new ServerName[deadServers.size()]);
+      Arrays.sort(deadServerNames);
+      for (ServerName deadServerName: deadServerNames) {
+-       int infoPort = master.getConfiguration().getInt("hbase.regionserver.info.port", 60030);
+ </%java>
+ <tr><td><% deadServerName %></td></tr>
+ <%java>
+Index: src/main/resources/hbase-webapps/master/table.jsp
+===================================================================
+--- src/main/resources/hbase-webapps/master/table.jsp	(revision 1539286)
++++ src/main/resources/hbase-webapps/master/table.jsp	(working copy)
+@@ -18,7 +18,7 @@
+  */
+ --%>
+ <%@ page contentType="text/html;charset=UTF-8"
+-  import="java.util.HashMap"
++  import="java.util.TreeMap"
+   import="org.apache.hadoop.io.Writable"
+   import="org.apache.hadoop.conf.Configuration"
+   import="org.apache.hadoop.hbase.client.HTable"
+@@ -50,9 +50,6 @@
+   if (showFragmentation) {
+       frags = FSUtils.getTableFragmentation(master);
+   }
+-  // HARDCODED FOR NOW TODO: FIX GET FROM ZK
+-  // This port might be wrong if RS actually ended up using something else.
+-  int infoPort = conf.getInt("hbase.regionserver.info.port", 60030);
+ %>
+ 
+ <?xml version="1.0" encoding="UTF-8" ?>
+@@ -114,7 +111,7 @@
+ %>
+ <%= tableHeader %>
+ <%
+-  String url = "http://" + rl.getHostname() + ":" + infoPort + "/";
++  String url = "http://" + rl.getHostname() + ":" + master.getRegionServerInfoPort(rl) + "/";
+ %>
+ <tr>
+   <td><%= tableName %></td>
+@@ -133,11 +130,11 @@
+   HRegionInfo meta = HRegionInfo.FIRST_META_REGIONINFO;
+   ServerName metaLocation = master.getCatalogTracker().waitForMeta(1);
+   for (int i = 0; i < 1; i++) {
+-    String url = "http://" + metaLocation.getHostname() + ":" + infoPort + "/";
++    String url = "http://" + metaLocation.getHostname() + ":" + master.getRegionServerInfoPort(metaLocation) + "/";
+ %>
+ <tr>
+   <td><%= meta.getRegionNameAsString() %></td>
+-    <td><a href="<%= url %>"><%= metaLocation.getHostname().toString() + ":" + infoPort %></a></td>
++    <td><a href="<%= url %>"><%= metaLocation.getHostname().toString() + ":" + metaLocation.getPort() %></a></td>
+     <td>-</td><td><%= Bytes.toString(meta.getStartKey()) %></td><td><%= Bytes.toString(meta.getEndKey()) %></td>
+ </tr>
+ <%  } %>
+@@ -169,7 +166,7 @@
+ <%  } %>
+ </table>
+ <%
+-  Map<String, Integer> regDistribution = new HashMap<String, Integer>();
++  Map<ServerName, Integer> regDistribution = new TreeMap<ServerName, Integer>();
+   Map<HRegionInfo, ServerName> regions = table.getRegionLocations();
+   if(regions != null && regions.size() > 0) { %>
+ <%=     tableHeader %>
+@@ -188,22 +185,20 @@
+         if (map.containsKey(regionInfo.getRegionName())) {
+           req = map.get(regionInfo.getRegionName()).getRequestsCount();
+         }
+-        // This port might be wrong if RS actually ended up using something else.
+-        urlRegionServer =
+-            "http://" + addr.getHostname().toString() + ":" + infoPort + "/";
+-        Integer i = regDistribution.get(urlRegionServer);
++        Integer i = regDistribution.get(addr);
+         if (null == i) i = new Integer(0);
+-        regDistribution.put(urlRegionServer, i+1);
++        regDistribution.put(addr, i+1);
+       }
+     }
+ %>
+ <tr>
+   <td><%= Bytes.toStringBinary(regionInfo.getRegionName())%></td>
+   <%
+-  if (urlRegionServer != null) {
++  if (addr != null) {
++      String url = "http://" + addr.getHostname() + ":" + master.getRegionServerInfoPort(addr) + "/";
+   %>
+   <td>
+-    <a href="<%= urlRegionServer %>"><%= addr.getHostname().toString() + ":" + infoPort %></a>
++    <a href="<%= url %>"><%= addr.getHostname().toString() + ":" + addr.getPort() %></a>
+   </td>
+   <%
+   } else {
+@@ -221,10 +216,12 @@
+ <h2>Regions by Region Server</h2>
+ <table><tr><th>Region Server</th><th>Region Count</th></tr>
+ <%
+-  for (Map.Entry<String, Integer> rdEntry : regDistribution.entrySet()) {
++  for (Map.Entry<ServerName, Integer> rdEntry : regDistribution.entrySet()) {
++      ServerName addr = rdEntry.getKey();
++      String url = "http://" + addr.getHostname() + ":" + master.getRegionServerInfoPort(addr) + "/";
+ %>
+ <tr>
+-  <td><%= rdEntry.getKey()%></td>
++  <td><a href="<%= url %>"><%= addr.getHostname().toString() + ":" + addr.getPort() %></a></td>
+   <td><%= rdEntry.getValue()%></td>
+ </tr>
+ <% } %>

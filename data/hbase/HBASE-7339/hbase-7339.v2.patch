@@ -1,0 +1,428 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+index b697e26..d15c287 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+@@ -396,6 +396,9 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
+       Bytes.equals(tableName, HConstants.META_TABLE_NAME);
+   }
+ 
++  // A non-capture group so that this can be embedded.
++  public static final String VALID_USER_TABLE_REGEX = "(?:[a-zA-Z_0-9][a-zA-Z_0-9.-]*)";
++
+   /**
+    * Check passed byte buffer, "tableName", is legal user-space table name.
+    * @return Returns passed <code>tableName</code> param
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
+index 29f2cc8..c98e71b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
+@@ -59,10 +59,12 @@ public class HalfStoreFileReader extends StoreFile.Reader {
+   private boolean firstKeySeeked = false;
+ 
+   /**
++   * Creates a half file reader for a normal hfile.
+    * @param fs
+    * @param p
+    * @param cacheConf
+    * @param r
++   * @param preferredEncodingInCache
+    * @throws IOException
+    */
+   public HalfStoreFileReader(final FileSystem fs, final Path p,
+@@ -79,6 +81,30 @@ public class HalfStoreFileReader extends StoreFile.Reader {
+     this.top = Reference.isTopFileRegion(r.getFileRegion());
+   }
+ 
++  /**
++   * Creates a half file reader for a hfile referred to by an hfilelink.
++   * @param fs
++   * @param p
++   * @param link
++   * @param cacheConf
++   * @param r
++   * @param preferredEncodingInCache
++   * @throws IOException
++   */
++  public HalfStoreFileReader(final FileSystem fs, final Path p, final HFileLink link,
++      final CacheConfig cacheConf, final Reference r,
++      DataBlockEncoding preferredEncodingInCache) throws IOException {
++    super(fs, p, link, link.getFileStatus(fs).getLen(), cacheConf, preferredEncodingInCache, true);
++    // This is not actual midkey for this half-file; its just border
++    // around which we split top and bottom.  Have to look in files to find
++    // actual last and first keys for bottom and top halves.  Half-files don't
++    // have an actual midkey themselves. No midkey is how we indicate file is
++    // not splittable.
++    this.splitkey = r.getSplitKey();
++    // Is it top or bottom half?
++    this.top = Reference.isTopFileRegion(r.getFileRegion());
++  }
++
+   protected boolean isTop() {
+     return this.top;
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+index e82a101..72fe4b6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+@@ -43,29 +43,29 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HDFSBlocksDistribution;
++import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.KeyValue.KVComparator;
+ import org.apache.hadoop.hbase.client.Scan;
+-import org.apache.hadoop.hbase.io.HFileLink;
+ import org.apache.hadoop.hbase.fs.HFileSystem;
++import org.apache.hadoop.hbase.io.HFileLink;
+ import org.apache.hadoop.hbase.io.HalfStoreFileReader;
+ import org.apache.hadoop.hbase.io.Reference;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+ import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
+-import org.apache.hadoop.hbase.io.hfile.CacheConfig;
+ import org.apache.hadoop.hbase.io.hfile.BlockType;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
+ import org.apache.hadoop.hbase.io.hfile.HFile;
++import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
+ import org.apache.hadoop.hbase.io.hfile.HFileScanner;
+ import org.apache.hadoop.hbase.io.hfile.HFileWriterV1;
+ import org.apache.hadoop.hbase.io.hfile.HFileWriterV2;
+-import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
+ import org.apache.hadoop.hbase.io.hfile.NoOpDataBlockEncoder;
+-import org.apache.hadoop.hbase.util.ChecksumType;
+ import org.apache.hadoop.hbase.util.BloomFilter;
+ import org.apache.hadoop.hbase.util.BloomFilterFactory;
+ import org.apache.hadoop.hbase.util.BloomFilterWriter;
+ import org.apache.hadoop.hbase.util.Bytes;
+-import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.hadoop.hbase.util.ChecksumType;
+ import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.io.RawComparator;
+@@ -200,13 +200,24 @@ public class StoreFile {
+    */
+   private Map<byte[], byte[]> metadataMap;
+ 
+-  /*
+-   * Regex that will work for straight filenames and for reference names.
+-   * If reference, then the regex has more than just one group.  Group 1 is
+-   * this files id.  Group 2 the referenced region name, etc.
++  /**
++   * Regex that will work for straight filenames (<hfile>) and for reference names 
++   * (<hfile>.<parentEncRegion>).  If reference, then the regex has more than just one group.
++   * Group 1 is this file's id.  Group 2 is the reference's parent region name.  The _SeqId_
++   * portion comes from bulk loaded files.
+    */
+-  private static final Pattern REF_NAME_PARSER =
+-    Pattern.compile("^([0-9a-f]+(?:_SeqId_[0-9]+_)?)(?:\\.(.+))?$");
++  public static final String REF_NAME_REGEX = "^([0-9a-f]+(?:_SeqId_[0-9]+_)?)(?:\\.(.+))?$"; 
++  private static final Pattern REF_NAME_PARSER = Pattern.compile(REF_NAME_REGEX);
++
++  /**
++   * Regex strictly for references to hfilelinks.  (<hfile>-<region>-<table>.<parentEncRegion>).
++   * Group 1 is this file's hfilelink name.  Group 2 the referenced parent region name.  The '.'
++   * char is valid in table names but group 2's regex is greedy and interprets the table names
++   * correctly.   The _SeqId_ portion comes from bulk loaded files.
++   */
++  public static final String REF_TO_LINK_REGEX = "^([0-9a-f]+(?:_SeqId_[0-9]+_)?-[0-9a-f]+-"
++      + HTableDescriptor.VALID_USER_TABLE_REGEX + "+)\\.([^.]+)$";
++  private static final Pattern REF_TO_LINK_PARSER = Pattern.compile(REF_TO_LINK_REGEX);
+ 
+   // StoreFile.Reader
+   private volatile Reader reader;
+@@ -256,7 +267,6 @@ public class StoreFile {
+     } else if (isReference(p)) {
+       this.reference = Reference.read(fs, p);
+       this.referencePath = getReferredToFile(this.path);
+-      LOG.debug("Store file " + p + " is a reference");
+     }
+ 
+     if (BloomFilterFactory.isGeneralBloomEnabled(conf)) {
+@@ -334,13 +344,38 @@ public class StoreFile {
+    * hierarchy of <code>${hbase.rootdir}/tablename/regionname/familyname</code>.
+    * @param p Path to a Reference file.
+    * @return Calculated path to parent region file.
+-   * @throws IOException
++   * @throws IllegalArgumentException when path regex fails to match.
+    */
+   static Path getReferredToFile(final Path p) {
+     Matcher m = REF_NAME_PARSER.matcher(p.getName());
+     if (m == null || !m.matches()) {
+       LOG.warn("Failed match of store file name " + p.toString());
+-      throw new RuntimeException("Failed match of store file name " +
++      throw new IllegalArgumentException("Failed match of store file name " +
++          p.toString());
++    }
++    // Other region name is suffix on the passed Reference file name
++    String otherRegion = m.group(2);
++    // Tabledir is up two directories from where Reference was written.
++    Path tableDir = p.getParent().getParent().getParent();
++    String nameStrippedOfSuffix = m.group(1);
++    // Build up new path with the referenced region in place of our current
++    // region in the reference path.  Also strip regionname suffix from name.
++    return new Path(new Path(new Path(tableDir, otherRegion),
++      p.getParent().getName()), nameStrippedOfSuffix);
++  }
++
++  /*
++   * Return path to an hfilelink referred to by a Reference.  Presumes a directory
++   * hierarchy of <code>${hbase.rootdir}/tablename/regionname/familyname</code>.
++   * @param p Path to a Reference to hfilelink file.
++   * @return Calculated path to parent region file.
++   * @throws IllegalArgumentException when path regex fails to match.
++   */
++  static Path getReferredToLink(final Path p) {
++    Matcher m = REF_TO_LINK_PARSER.matcher(p.getName());
++    if (m == null || !m.matches()) {
++      LOG.warn("Failed match of ref to hfilelink name" + p.toString());
++      throw new IllegalArgumentException("Failed match of ref to hfilelink name " +
+           p.toString());
+     }
+     // Other region name is suffix on the passed Reference file name
+@@ -534,9 +569,33 @@ public class StoreFile {
+           this.cacheConf, this.reference,
+           dataBlockEncoder.getEncodingInCache());
+     } else if (isLink()) {
+-      long size = link.getFileStatus(fs).getLen();
+-      this.reader = new Reader(this.fs, this.path, link, size, this.cacheConf,
+-                               dataBlockEncoder.getEncodingInCache(), true);
++      try { 
++        long size = link.getFileStatus(fs).getLen();
++        this.reader = new Reader(this.fs, this.path, link, size, this.cacheConf,
++            dataBlockEncoder.getEncodingInCache(), true);
++      } catch (FileNotFoundException fnfe) {
++        // This didn't actually link to another file!
++
++        // Handles the case where a file with the hfilelink pattern is actually a daughter
++        // reference to a hfile link.  This can occur when a cloned table's hfilelinks get split.
++        FileStatus actualRef = fs.getFileStatus(path);
++        long actualLen = actualRef.getLen();
++        if (actualLen == 0) {
++          LOG.error(path + " is a 0-len file, and actually an hfilelink missing target file!", fnfe);
++          throw fnfe;
++        }
++        LOG.debug("Size of link file is " + actualLen + "!= 0; treating as a reference to" +
++            " HFileLink " + path + "!");
++        this.reference = Reference.read(fs, this.path);
++        this.referencePath = getReferredToLink(this.path);
++        LOG.debug("Reference file "+ path + " referred to " + referencePath + "!");
++        link = new HFileLink(fs.getConf(), referencePath);
++        this.reader = new HalfStoreFileReader(this.fs, this.referencePath, link,
++            this.cacheConf, this.reference,
++            dataBlockEncoder.getEncodingInCache());
++        LOG.debug("Store file " + path + " is loaded " + referencePath + " as a half store file" +
++            " reader to an HFileLink!");
++      }
+     } else {
+       this.reader = new Reader(this.fs, this.path, this.cacheConf,
+           dataBlockEncoder.getEncodingInCache());
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/TestHTableDescriptor.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestHTableDescriptor.java
+index 6a6e1e8..f26cb20 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/TestHTableDescriptor.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/TestHTableDescriptor.java
+@@ -20,10 +20,16 @@ package org.apache.hadoop.hbase;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
+ 
+ import java.io.IOException;
++import java.util.regex.Pattern;
+ 
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.TestHBaseFsck;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+ 
+@@ -32,6 +38,8 @@ import org.junit.experimental.categories.Category;
+  */
+ @Category(SmallTests.class)
+ public class TestHTableDescriptor {
++  final static Log LOG = LogFactory.getLog(TestHTableDescriptor.class);
++  
+   @Test
+   public void testPb() throws DeserializationException, IOException {
+     HTableDescriptor htd = HTableDescriptor.META_TABLEDESC;
+@@ -78,4 +86,42 @@ public class TestHTableDescriptor {
+     desc.remove(key);
+     assertEquals(null, desc.getValue(key));
+   }
++  
++  String legalTableNames[] = { "foo", "with-dash_under.dot", "_under_start_ok",  };
++  String illegalTableNames[] = { ".dot_start_illegal", "-dash_start_illegal", "spaces not ok" };
++
++  @Test
++  public void testLegalHTableNames() {
++    for (String tn : legalTableNames) {
++      HTableDescriptor.isLegalTableName(Bytes.toBytes(tn));
++    }
++  }
++  
++  @Test
++  public void testIllegalHTableNames() {
++    for (String tn : illegalTableNames) {
++      try {
++        HTableDescriptor.isLegalTableName(Bytes.toBytes(tn));
++        fail("invalid tablename " + tn + " should have failed");
++      } catch (Exception e) {
++        // expected
++      }
++    }
++  }
++
++  @Test
++  public void testLegalHTableNamesRegex() {
++    for (String tn : legalTableNames) {
++      LOG.info("Testing: '" + tn + "'");
++      assertTrue(Pattern.matches(HTableDescriptor.VALID_USER_TABLE_REGEX, tn));
++    }
++  }
++  
++  @Test
++  public void testIllegalHTableNamesRegex() {
++    for (String tn : illegalTableNames) {
++      LOG.info("Testing: '" + tn + "'");
++      assertFalse(Pattern.matches(HTableDescriptor.VALID_USER_TABLE_REGEX, tn));
++    }
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+index e7481d3..9dc5c49 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java
+@@ -27,10 +27,12 @@ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.TreeSet;
++import java.util.regex.Pattern;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HBaseTestCase;
+@@ -40,6 +42,8 @@ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.SmallTests;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.io.HFileLink;
++import org.apache.hadoop.hbase.io.HalfStoreFileReader;
++import org.apache.hadoop.hbase.io.Reference;
+ import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
+ import org.apache.hadoop.hbase.io.hfile.BlockCache;
+ import org.apache.hadoop.hbase.io.hfile.CacheConfig;
+@@ -105,6 +109,10 @@ public class TestStoreFile extends HBaseTestCase {
+   private void writeStoreFile(final StoreFile.Writer writer) throws IOException {
+     writeStoreFile(writer, Bytes.toBytes(getName()), Bytes.toBytes(getName()));
+   }
++  
++  // pick an split point (roughly halfway)
++  byte[] SPLITKEY = new byte[] { (LAST_CHAR-FIRST_CHAR)/2, FIRST_CHAR};
++
+   /*
+    * Writes HStoreKey and ImmutableBytes data to passed writer and
+    * then closes it.
+@@ -204,6 +212,99 @@ public class TestStoreFile extends HBaseTestCase {
+     assertEquals((LAST_CHAR - FIRST_CHAR + 1) * (LAST_CHAR - FIRST_CHAR + 1), count);
+   }
+ 
++  /**
++   * Validate that we can handle valid tables with '.', '_', and '-' chars.
++   */
++  public void testRefToHFileRegex() {
++    String[] legal = { "aaaa-bbbb-tablename.cccc", "aaaa-bbbb-table.with.dots.cccc",
++          "aaaa-bbbb-table-with-dashes.cccc", "aaaa-bbbb-table_with_unders.cccc",
++          "aaaa-bbbb-_table_starts_unders.cccc"};
++    for (String refToHFile : legal) {
++      LOG.info("Validating regex for '" + refToHFile + "'");
++      assertTrue(Pattern.matches(StoreFile.REF_TO_LINK_REGEX, refToHFile));
++    }
++    
++    String[] illegal = { "aaaa-bbbb--flkaj.cccc", "aaaa-bbbb-.flkaj.cccc" };
++    for (String bad : illegal) {
++      assertFalse(Pattern.matches(StoreFile.REF_TO_LINK_REGEX, bad));
++    }
++  }
++
++  /**
++   * This test creates an hfile and then the dir structures and files to verify that references
++   * to hfilelinks (created by snapshot clones) can be properly interpreted.
++   */
++  public void testReferenceToHFileLink() throws IOException {
++    final String columnFamily = "f";
++    String tablename = "_original-evil-name"; // adding legal table name chars to verify regex handles it.
++    HRegionInfo hri = new HRegionInfo(Bytes.toBytes(tablename));
++    // store dir = <root>/<tablename>/<rgn>/<cf>
++    Path storedir = new Path(new Path(FSUtils.getRootDir(conf),
++      new Path(hri.getTableNameAsString(), hri.getEncodedName())), columnFamily);
++
++    // Make a store file and write data to it. <root>/<tablename>/<rgn>/<cf>/<file>
++    StoreFile.Writer writer = new StoreFile.WriterBuilder(conf, cacheConf,
++         this.fs, 8 * 1024)
++            .withOutputDir(storedir)
++            .build();
++    Path storeFilePath = writer.getPath();
++    writeStoreFile(writer);
++    writer.close();
++
++    // create link to store file. <root>/clone/region/<cf>/<hfile>-<region>-<table>
++    String target = "clone";
++    Path dstPath = new Path(FSUtils.getRootDir(conf), new Path(new Path(target, "region"), columnFamily));
++    HFileLink.create(conf, this.fs, dstPath, hri, storeFilePath.getName());
++    Path linkFilePath = new Path(dstPath,
++                  HFileLink.createHFileLinkName(hri, storeFilePath.getName()));
++
++    // create splits of the link.
++    // <root>/clone/splitA/<cf>/<reftohfilelink>,
++    // <root>/clone/splitB/<cf>/<reftohfilelink>
++    Path splitDirA = new Path(new Path(FSUtils.getRootDir(conf),
++        new Path(target, "splitA")), columnFamily);
++    Path splitDirB = new Path(new Path(FSUtils.getRootDir(conf),
++        new Path(target, "splitB")), columnFamily);
++    StoreFile f = new StoreFile(fs, linkFilePath, conf, cacheConf, BloomType.NONE,
++        NoOpDataBlockEncoder.INSTANCE);
++    byte[] splitRow = SPLITKEY;
++    Path pathA = StoreFile.split(fs, splitDirA, f, splitRow, true); // top
++    Path pathB = StoreFile.split(fs, splitDirB, f, splitRow, false); // bottom
++
++    // OK test the thing
++    FSUtils.logFileSystemState(fs, FSUtils.getRootDir(conf), LOG);
++
++    // There is a case where a file with the hfilelink pattern is actually a daughter
++    // reference to a hfile link.  This code in StoreFile that handles this case.
++    
++    // Try to open store file from link
++    StoreFile hsfA = new StoreFile(this.fs, pathA,  conf, cacheConf,
++        StoreFile.BloomType.NONE, NoOpDataBlockEncoder.INSTANCE);
++
++    // Now confirm that I can read from the ref to link
++    int count = 1;
++    HFileScanner s = hsfA.createReader().getScanner(false, false);
++    s.seekTo();
++    while (s.next()) {
++      count++;
++    }
++    assertTrue(count > 0); // read some rows here
++    
++    // Try to open store file from link
++    StoreFile hsfB = new StoreFile(this.fs, pathB,  conf, cacheConf,
++        StoreFile.BloomType.NONE, NoOpDataBlockEncoder.INSTANCE);
++
++    // Now confirm that I can read from the ref to link
++    HFileScanner sB = hsfB.createReader().getScanner(false, false);
++    sB.seekTo();
++    while (sB.next()) {
++      count++;
++    }
++
++    // read the rest of the rows
++    assertEquals((LAST_CHAR - FIRST_CHAR + 1) * (LAST_CHAR - FIRST_CHAR + 1), count);
++  }
++
+   private void checkHalfHFile(final StoreFile f)
+   throws IOException {
+     byte [] midkey = f.createReader().midkey();

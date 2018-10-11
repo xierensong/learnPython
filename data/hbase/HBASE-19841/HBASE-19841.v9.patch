@@ -1,0 +1,424 @@
+From 26a097455baba3b5c7bd4ca81a29579d25fb3993 Mon Sep 17 00:00:00 2001
+From: Mike Drob <mdrob@apache.org>
+Date: Mon, 29 Jan 2018 14:32:39 -0600
+Subject: [PATCH] HBASE-19841 Every HTU should be local until DFS starts
+
+---
+ .../apache/hadoop/hbase/util/CommonFSUtils.java    |   8 +-
+ .../hadoop/hbase/HBaseCommonTestingUtility.java    |   4 +-
+ .../org/apache/hadoop/hbase/HBaseTestCase.java     |   2 +-
+ .../apache/hadoop/hbase/HBaseTestingUtility.java   | 116 ++++++++++++---------
+ .../TestRegionObserverScannerOpenHook.java         |   6 +-
+ .../coprocessor/TestRegionObserverStacking.java    |   2 +-
+ .../hbase/io/asyncfs/TestLocalAsyncOutput.java     |   4 +-
+ .../hadoop/hbase/regionserver/TestHStore.java      |   4 +-
+ .../hadoop/hbase/wal/WALPerformanceEvaluation.java |  32 +++---
+ hbase-server/src/test/resources/hbase-site.xml     |   9 --
+ 10 files changed, 98 insertions(+), 89 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/CommonFSUtils.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/CommonFSUtils.java
+index 9efec07915..5b46de9733 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/CommonFSUtils.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/CommonFSUtils.java
+@@ -394,7 +394,13 @@ public abstract class CommonFSUtils {
+ 
+   public static FileSystem getWALFileSystem(final Configuration c) throws IOException {
+     Path p = getWALRootDir(c);
+-    return p.getFileSystem(c);
++    FileSystem fs = p.getFileSystem(c);
++    // hadoop-core does fs caching, so need to propogate this if set
++    String enforceStreamCapability = c.get(UNSAFE_STREAM_CAPABILITY_ENFORCE);
++    if (enforceStreamCapability != null) {
++      fs.getConf().set(UNSAFE_STREAM_CAPABILITY_ENFORCE, enforceStreamCapability);
++    }
++    return fs;
+   }
+ 
+   private static boolean isValidWALRootDir(Path walDir, final Configuration c) throws IOException {
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/HBaseCommonTestingUtility.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/HBaseCommonTestingUtility.java
+index 693f9b2f74..74f653c0da 100644
+--- a/hbase-common/src/test/java/org/apache/hadoop/hbase/HBaseCommonTestingUtility.java
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/HBaseCommonTestingUtility.java
+@@ -63,11 +63,11 @@ public class HBaseCommonTestingUtility {
+   protected Configuration conf;
+ 
+   public HBaseCommonTestingUtility() {
+-    this(HBaseConfiguration.create());
++    this(null);
+   }
+ 
+   public HBaseCommonTestingUtility(Configuration conf) {
+-    this.conf = conf;
++    this.conf = (conf == null ? HBaseConfiguration.create() : conf);
+   }
+ 
+   /**
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestCase.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestCase.java
+index 5f2ffb2f33..96f3d55608 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestCase.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestCase.java
+@@ -72,7 +72,7 @@ public abstract class HBaseTestCase extends TestCase {
+ 
+   protected final HBaseTestingUtility testUtil = new HBaseTestingUtility();
+ 
+-  public volatile Configuration conf = HBaseConfiguration.create();
++  public volatile Configuration conf = testUtil.getConfiguration();
+   public final FSTableDescriptors fsTableDescriptors;
+   {
+     try {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+index 75abd5e219..5a36472f14 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+@@ -119,6 +119,7 @@ import org.apache.hadoop.hbase.security.User;
+ import org.apache.hadoop.hbase.security.visibility.VisibilityLabelsCache;
+ import org.apache.hadoop.hbase.trace.TraceUtil;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.CommonFSUtils;
+ import org.apache.hadoop.hbase.util.FSTableDescriptors;
+ import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.JVMClusterUtil;
+@@ -213,8 +214,6 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
+    */
+   private volatile Connection connection;
+ 
+-  private boolean localMode = false;
+-
+   /** Filesystem URI used for map-reduce mini-cluster setup */
+   private static String FS_URI;
+ 
+@@ -298,57 +297,82 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
+   public static final Collection<Object[]> BLOOM_AND_COMPRESSION_COMBINATIONS =
+       bloomAndCompressionCombinations();
+ 
++
++  /**
++   * <p>Create an HBaseTestingUtility using a default configuration.
++   *
++   * <p>Initially, all tmp files are written to a local test data directory.
++   * Once {@link #startMiniDFSCluster} is called, either directly or via
++   * {@link #startMiniCluster()}, tmp data will be written to the DFS directory instead.
++   *
++   * <p>Previously, there was a distinction between the type of utility returned by
++   * {@link #createLocalHTU()} and this constructor; this is no longer the case. All
++   * HBaseTestingUtility objects will behave as local until a DFS cluster is started,
++   * at which point they will switch to using mini DFS for storage.
++   */
+   public HBaseTestingUtility() {
+     this(HBaseConfiguration.create());
+   }
+ 
+-  public HBaseTestingUtility(Configuration conf) {
++  /**
++   * <p>Create an HBaseTestingUtility using a given configuration.
++   *
++   * <p>Initially, all tmp files are written to a local test data directory.
++   * Once {@link #startMiniDFSCluster} is called, either directly or via
++   * {@link #startMiniCluster()}, tmp data will be written to the DFS directory instead.
++   *
++   * <p>Previously, there was a distinction between the type of utility returned by
++   * {@link #createLocalHTU()} and this constructor; this is no longer the case. All
++   * HBaseTestingUtility objects will behave as local until a DFS cluster is started,
++   * at which point they will switch to using mini DFS for storage.
++   *
++   * @param conf The configuration to use for further operations
++   */
++  public HBaseTestingUtility(@Nullable Configuration conf) {
+     super(conf);
+ 
+     // a hbase checksum verification failure will cause unit tests to fail
+     ChecksumUtil.generateExceptionForChecksumFailureForTest(true);
+ 
+-    // prevent contention for ports if other hbase thread(s) already running
++    // if the provided conf is set, prevent contention for ports if other hbase thread(s) are running
+     if (conf != null) {
+       if (conf.getInt(HConstants.MASTER_INFO_PORT, HConstants.DEFAULT_MASTER_INFOPORT)
+               == HConstants.DEFAULT_MASTER_INFOPORT) {
+         conf.setInt(HConstants.MASTER_INFO_PORT, -1);
+-        LOG.debug("Config property " + HConstants.MASTER_INFO_PORT + " changed to -1");
++        LOG.debug("Config property {} changed to -1", HConstants.MASTER_INFO_PORT);
+       }
+       if (conf.getInt(HConstants.REGIONSERVER_PORT, HConstants.DEFAULT_REGIONSERVER_PORT)
+               == HConstants.DEFAULT_REGIONSERVER_PORT) {
+         conf.setInt(HConstants.REGIONSERVER_PORT, -1);
+-        LOG.debug("Config property " + HConstants.REGIONSERVER_PORT + " changed to -1");
++        LOG.debug("Config property {} changed to -1", HConstants.REGIONSERVER_PORT);
+       }
+     }
++
++    // Every cluster is a local cluster until we start DFS
++    // Note that conf could be null, but this.conf will not be
++    String dataTestDir = getDataTestDir().toString();
++    this.conf.set("fs.defaultFS","file:///");
++    this.conf.set(HConstants.HBASE_DIR, "file://" + dataTestDir);
++    LOG.debug("Setting {} to {}", HConstants.HBASE_DIR, dataTestDir);
++    this.conf.setBoolean(CommonFSUtils.UNSAFE_STREAM_CAPABILITY_ENFORCE,false);
+   }
+ 
+   /**
+-   * Create an HBaseTestingUtility where all tmp files are written to the local test data dir.
+-   * It is needed to properly base FSUtil.getRootDirs so that they drop temp files in the proper
+-   * test dir.  Use this when you aren't using an Mini HDFS cluster.
+-   * @return HBaseTestingUtility that use local fs for temp files.
++   * @deprecated use {@link HBaseTestingUtility#HBaseTestingUtility()} instead
++   * @return a normal HBaseTestingUtility
+    */
++  @Deprecated
+   public static HBaseTestingUtility createLocalHTU() {
+-    Configuration c = HBaseConfiguration.create();
+-    return createLocalHTU(c);
++    return new HBaseTestingUtility();
+   }
+ 
+   /**
+-   * Create an HBaseTestingUtility where all tmp files are written to the local test data dir.
+-   * It is needed to properly base FSUtil.getRootDirs so that they drop temp files in the proper
+-   * test dir.  Use this when you aren't using an Mini HDFS cluster.
+-   * @param c Configuration (will be modified)
+-   * @return HBaseTestingUtility that use local fs for temp files.
++   * @deprecated use {@link HBaseTestingUtility#HBaseTestingUtility(Configuration)} instead
++   * @return a normal HBaseTestingUtility
+    */
++  @Deprecated
+   public static HBaseTestingUtility createLocalHTU(Configuration c) {
+-    HBaseTestingUtility htu = new HBaseTestingUtility(c);
+-    String dataTestDir = htu.getDataTestDir().toString();
+-    htu.getConfiguration().set("fs.defaultFS","file:///");
+-    htu.getConfiguration().set(HConstants.HBASE_DIR, "file://" + dataTestDir);
+-    LOG.debug("Setting " + HConstants.HBASE_DIR + " to " + dataTestDir);
+-    htu.localMode = true;
+-    return htu;
++    return new HBaseTestingUtility(c);
+   }
+ 
+   /**
+@@ -612,30 +636,7 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
+    */
+   public MiniDFSCluster startMiniDFSCluster(int servers, final String hosts[])
+   throws Exception {
+-    createDirsAndSetProperties();
+-    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
+-
+-    // Error level to skip some warnings specific to the minicluster. See HBASE-4709
+-    org.apache.log4j.Logger.getLogger(org.apache.hadoop.metrics2.util.MBeans.class).
+-        setLevel(org.apache.log4j.Level.ERROR);
+-    org.apache.log4j.Logger.getLogger(org.apache.hadoop.metrics2.impl.MetricsSystemImpl.class).
+-        setLevel(org.apache.log4j.Level.ERROR);
+-
+-    TraceUtil.initTracer(conf);
+-
+-    this.dfsCluster = new MiniDFSCluster(0, this.conf, servers, true, true,
+-      true, null, null, hosts, null);
+-
+-    // Set this just-started cluster as our filesystem.
+-    setFs();
+-
+-    // Wait for the cluster to be totally up
+-    this.dfsCluster.waitClusterUp();
+-
+-    //reset the test directory for test file system
+-    dataTestDirOnTestFS = null;
+-
+-    return this.dfsCluster;
++    return startMiniDFSCluster(servers, null, hosts);
+   }
+ 
+   private void setFs() throws IOException {
+@@ -645,23 +646,36 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
+     }
+     FileSystem fs = this.dfsCluster.getFileSystem();
+     FSUtils.setFsDefault(this.conf, new Path(fs.getUri()));
++
++    // re-enable this check with dfs
++    conf.unset(CommonFSUtils.UNSAFE_STREAM_CAPABILITY_ENFORCE);
+   }
+ 
+   public MiniDFSCluster startMiniDFSCluster(int servers, final  String racks[], String hosts[])
+       throws Exception {
+     createDirsAndSetProperties();
++    EditLogFileOutputStream.setShouldSkipFsyncForTesting(true);
++
++    // Error level to skip some warnings specific to the minicluster. See HBASE-4709
++    org.apache.log4j.Logger.getLogger(org.apache.hadoop.metrics2.util.MBeans.class).
++        setLevel(org.apache.log4j.Level.ERROR);
++    org.apache.log4j.Logger.getLogger(org.apache.hadoop.metrics2.impl.MetricsSystemImpl.class).
++        setLevel(org.apache.log4j.Level.ERROR);
++
+     this.dfsCluster = new MiniDFSCluster(0, this.conf, servers, true, true,
+         true, null, racks, hosts, null);
+ 
+     // Set this just-started cluster as our filesystem.
+-    FileSystem fs = this.dfsCluster.getFileSystem();
+-    FSUtils.setFsDefault(this.conf, new Path(fs.getUri()));
++    setFs();
+ 
+     // Wait for the cluster to be totally up
+     this.dfsCluster.waitClusterUp();
+ 
+     //reset the test directory for test file system
+     dataTestDirOnTestFS = null;
++    String dataTestDir = getDataTestDir().toString();
++    conf.set(HConstants.HBASE_DIR, dataTestDir);
++    LOG.debug("Setting {} to {}", HConstants.HBASE_DIR, dataTestDir);
+ 
+     return this.dfsCluster;
+   }
+@@ -957,7 +971,7 @@ public class HBaseTestingUtility extends HBaseZKTestingUtility {
+ 
+     // Bring up mini dfs cluster. This spews a bunch of warnings about missing
+     // scheme. Complaints are 'Scheme is undefined for build/test/data/dfs/name1'.
+-    if(this.dfsCluster == null && !localMode) {
++    if(this.dfsCluster == null) {
+       LOG.info("STARTING DFS");
+       dfsCluster = startMiniDFSCluster(numDataNodes, dataNodeHosts);
+     } else LOG.info("NOT STARTING DFS");
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverScannerOpenHook.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverScannerOpenHook.java
+index e7a9f61ddd..c136cee5a6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverScannerOpenHook.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverScannerOpenHook.java
+@@ -209,7 +209,8 @@ public class TestRegionObserverScannerOpenHook {
+     byte[] A = Bytes.toBytes("A");
+     byte[][] FAMILIES = new byte[][] { A };
+ 
+-    Configuration conf = HBaseConfiguration.create();
++    // Use new HTU to not overlap with the DFS cluster started in #CompactionStacking
++    Configuration conf = new HBaseTestingUtility().getConfiguration();
+     HRegion region = initHRegion(TABLE, getClass().getName(), conf, FAMILIES);
+     RegionCoprocessorHost h = region.getCoprocessorHost();
+     h.load(NoDataFromScan.class, Coprocessor.PRIORITY_HIGHEST, conf);
+@@ -234,7 +235,8 @@ public class TestRegionObserverScannerOpenHook {
+     byte[] A = Bytes.toBytes("A");
+     byte[][] FAMILIES = new byte[][] { A };
+ 
+-    Configuration conf = HBaseConfiguration.create();
++    // Use new HTU to not overlap with the DFS cluster started in #CompactionStacking
++    Configuration conf = new HBaseTestingUtility().getConfiguration();
+     HRegion region = initHRegion(TABLE, getClass().getName(), conf, FAMILIES);
+     RegionCoprocessorHost h = region.getCoprocessorHost();
+     h.load(NoDataFromFlush.class, Coprocessor.PRIORITY_HIGHEST, conf);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverStacking.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverStacking.java
+index cbc00d3f03..5546bfa10d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverStacking.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionObserverStacking.java
+@@ -146,7 +146,7 @@ public class TestRegionObserverStacking extends TestCase {
+     byte[] A = Bytes.toBytes("A");
+     byte[][] FAMILIES = new byte[][] { A } ;
+ 
+-    Configuration conf = HBaseConfiguration.create();
++    Configuration conf = TEST_UTIL.getConfiguration();
+     HRegion region = initHRegion(TABLE, getClass().getName(),
+       conf, FAMILIES);
+     RegionCoprocessorHost h = region.getCoprocessorHost();
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/asyncfs/TestLocalAsyncOutput.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/asyncfs/TestLocalAsyncOutput.java
+index f2f91425a7..406af17b52 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/asyncfs/TestLocalAsyncOutput.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/asyncfs/TestLocalAsyncOutput.java
+@@ -22,7 +22,7 @@ import java.util.concurrent.ExecutionException;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.HBaseClassTestRule;
+-import org.apache.hadoop.hbase.HBaseCommonTestingUtility;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.testclassification.MiscTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.util.FSUtils;
+@@ -47,7 +47,7 @@ public class TestLocalAsyncOutput {
+ 
+   private static Class<? extends Channel> CHANNEL_CLASS = NioSocketChannel.class;
+ 
+-  private static final HBaseCommonTestingUtility TEST_UTIL = new HBaseCommonTestingUtility();
++  private static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
+ 
+   @AfterClass
+   public static void tearDownAfterClass() throws IOException {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHStore.java
+index 9d6aedb4ee..8988d398e1 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHStore.java
+@@ -241,7 +241,7 @@ public class TestHStore {
+   public void testFlushSizeSizing() throws Exception {
+     LOG.info("Setting up a faulty file system that cannot write in " +
+       this.name.getMethodName());
+-    final Configuration conf = HBaseConfiguration.create();
++    final Configuration conf = HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+     // Only retry once.
+     conf.setInt("hbase.hstore.flush.retries.number", 1);
+     User user = User.createUserForTesting(conf, this.name.getMethodName(),
+@@ -668,7 +668,7 @@ public class TestHStore {
+   public void testHandleErrorsInFlush() throws Exception {
+     LOG.info("Setting up a faulty file system that cannot write");
+ 
+-    final Configuration conf = HBaseConfiguration.create();
++    final Configuration conf = HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+     User user = User.createUserForTesting(conf,
+         "testhandleerrorsinflush", new String[]{"foo"});
+     // Inject our faulty LocalFileSystem
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
+index a9bad00272..cf49b4b7d2 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/WALPerformanceEvaluation.java
+@@ -173,29 +173,25 @@ public final class WALPerformanceEvaluation extends Configured implements Tool {
+       Random rand = new Random(Thread.currentThread().getId());
+       WAL wal = region.getWAL();
+ 
+-      try (TraceScope threadScope = TraceUtil.createTrace("WALPerfEval." + Thread.currentThread().getName())) {
++      try {
+         long startTime = System.currentTimeMillis();
+         int lastSync = 0;
+-        TraceUtil.addSampler(loopSampler);
+         for (int i = 0; i < numIterations; ++i) {
+-          assert Tracer.getCurrentSpan() == threadScope.getSpan() : "Span leak detected.";
+-          try (TraceScope loopScope = TraceUtil.createTrace("runLoopIter" + i)) {
+-            long now = System.nanoTime();
+-            Put put = setupPut(rand, key, value, numFamilies);
+-            WALEdit walEdit = new WALEdit();
+-            addFamilyMapToWALEdit(put.getFamilyCellMap(), walEdit);
+-            RegionInfo hri = region.getRegionInfo();
+-            final WALKeyImpl logkey =
+-                new WALKeyImpl(hri.getEncodedNameAsBytes(), hri.getTable(), now, mvcc, scopes);
+-            wal.append(hri, logkey, walEdit, true);
+-            if (!this.noSync) {
+-              if (++lastSync >= this.syncInterval) {
+-                wal.sync();
+-                lastSync = 0;
+-              }
++          long now = System.nanoTime();
++          Put put = setupPut(rand, key, value, numFamilies);
++          WALEdit walEdit = new WALEdit();
++          addFamilyMapToWALEdit(put.getFamilyCellMap(), walEdit);
++          RegionInfo hri = region.getRegionInfo();
++          final WALKeyImpl logkey =
++              new WALKeyImpl(hri.getEncodedNameAsBytes(), hri.getTable(), now, mvcc, scopes);
++          wal.append(hri, logkey, walEdit, true);
++          if (!this.noSync) {
++            if (++lastSync >= this.syncInterval) {
++              wal.sync();
++              lastSync = 0;
+             }
+-            latencyHistogram.update(System.nanoTime() - now);
+           }
++          latencyHistogram.update(System.nanoTime() - now);
+         }
+         long totalTime = (System.currentTimeMillis() - startTime);
+         logBenchmarkResult(Thread.currentThread().getName(), numIterations, totalTime);
+diff --git a/hbase-server/src/test/resources/hbase-site.xml b/hbase-server/src/test/resources/hbase-site.xml
+index dbdf7765d7..64a1964435 100644
+--- a/hbase-server/src/test/resources/hbase-site.xml
++++ b/hbase-server/src/test/resources/hbase-site.xml
+@@ -158,13 +158,4 @@
+     <name>hbase.hconnection.threads.keepalivetime</name>
+     <value>3</value>
+   </property>
+-  <property>
+-    <name>hbase.unsafe.stream.capability.enforce</name>
+-    <value>false</value>
+-    <description>
+-      Controls whether HBase will check for stream capabilities (hflush/hsync).
+-      Disable this if you intend to run on LocalFileSystem.
+-      WARNING: Doing so may expose you to additional risk of data loss!
+-    </description>
+-  </property>
+ </configuration>
+-- 
+2.15.1
+

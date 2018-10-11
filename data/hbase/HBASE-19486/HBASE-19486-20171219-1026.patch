@@ -1,0 +1,491 @@
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
+index 4c6a0ef..c9d83c6 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
+@@ -18,13 +18,12 @@
+  */
+ package org.apache.hadoop.hbase.client;
+ 
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hbase.TableName;
+-import org.apache.yetus.audience.InterfaceAudience;
+-
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.util.List;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.yetus.audience.InterfaceAudience;
+ 
+ /**
+  * <p>Used to communicate with a single HBase table similar to {@link Table} but meant for
+@@ -115,6 +114,26 @@ public interface BufferedMutator extends Closeable {
+   void flush() throws IOException;
+ 
+   /**
++   * Sets the maximum time before the buffer is automatically flushed.
++   * @param milliseconds The maximum number of milliseconds how long records may be buffered
++   *   before they are flushed. Set to 0 to disable.
++   */
++  default void setWriteBufferMaxLinger(long milliseconds) {
++    throw new UnsupportedOperationException(
++            "The BufferedMutator::setWriteBufferMaxLinger has not been implemented");
++  }
++
++  /**
++   * Returns the current automatic flush timeout value in milliseconds.
++   * @return The maximum number of milliseconds how long records may be buffered before they
++   *   are flushed. The value 0 means this auto flush is disabled.
++   */
++  default long getWriteBufferMaxLingerMs() {
++    throw new UnsupportedOperationException(
++            "The BufferedMutator::getWriteBufferMaxLingerMs has not been implemented");
++  }
++
++  /**
+    * Returns the maximum size in bytes of the write buffer for this HTable.
+    * <p>
+    * The default value comes from the configuration parameter {@code hbase.client.write.buffer}.
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
+index b91038d..d38e2b9 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
+@@ -15,26 +15,27 @@
+  */
+ package org.apache.hadoop.hbase.client;
+ 
+-import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.hbase.TableName;
+-import org.apache.yetus.audience.InterfaceAudience;
+-import org.apache.yetus.audience.InterfaceStability;
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.NoSuchElementException;
++import java.util.Timer;
++import java.util.TimerTask;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+-import org.apache.hadoop.hbase.HConstants;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
++import org.apache.yetus.audience.InterfaceAudience;
++import org.apache.yetus.audience.InterfaceStability;
++import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
+ 
+ /**
+  * <p>
+@@ -74,6 +75,12 @@ public class BufferedMutatorImpl implements BufferedMutator {
+    */
+   private final AtomicInteger undealtMutationCount = new AtomicInteger(0);
+   private final long writeBufferSize;
++
++  // A 'max linger' below 100ms will cause too many timer events firing
++  public static final long MIN_WRITE_BUFFER_MAX_LINGER = 100;
++  private long writeBufferMaxLinger;
++  private transient Timer autoFlushTimer = null;
++
+   private final int maxKeyValueSize;
+   private final ExecutorService pool;
+   private final AtomicInteger rpcTimeout;
+@@ -100,13 +107,19 @@ public class BufferedMutatorImpl implements BufferedMutator {
+     ConnectionConfiguration tableConf = new ConnectionConfiguration(conf);
+     this.writeBufferSize = params.getWriteBufferSize() != BufferedMutatorParams.UNSET ?
+         params.getWriteBufferSize() : tableConf.getWriteBufferSize();
++
++    // Set via the setter because it does the value validation and starts the TimerTask
++    this.setWriteBufferMaxLinger(params.getWriteBufferMaxLingerMs() != BufferedMutatorParams.UNSET ?
++            params.getWriteBufferMaxLingerMs() : tableConf.getWriteBufferMaxLingerMs());
++
+     this.maxKeyValueSize = params.getMaxKeyValueSize() != BufferedMutatorParams.UNSET ?
+         params.getMaxKeyValueSize() : tableConf.getMaxKeyValueSize();
+ 
+     this.rpcTimeout = new AtomicInteger(params.getRpcTimeout() != BufferedMutatorParams.UNSET ?
+     params.getRpcTimeout() : conn.getConnectionConfiguration().getWriteRpcTimeout());
+-    this.operationTimeout = new AtomicInteger(params.getOperationTimeout()!= BufferedMutatorParams.UNSET ?
+-    params.getOperationTimeout() : conn.getConnectionConfiguration().getOperationTimeout());
++    this.operationTimeout = new AtomicInteger(
++            params.getOperationTimeout() != BufferedMutatorParams.UNSET ?
++            params.getOperationTimeout() : conn.getConnectionConfiguration().getOperationTimeout());
+     this.ap = ap;
+   }
+   BufferedMutatorImpl(ClusterConnection conn, RpcRetryingCallerFactory rpcCallerFactory,
+@@ -181,6 +194,24 @@ public class BufferedMutatorImpl implements BufferedMutator {
+     }
+   }
+ 
++  @VisibleForTesting
++  long getAutoFlushCount() {
++    return autoFlushCount;
++  }
++  private long autoFlushCount = 0;
++
++  private void autoFlush() {
++    if (currentWriteBufferSize.get() == 0) {
++      return; // No needless flushes
++    }
++    try {
++      autoFlushCount++;
++      flush();
++    } catch (InterruptedIOException | RetriesExhaustedWithDetailsException e) {
++      LOG.error("Exception during autoFlush --> " + e.getMessage());
++    }
++  }
++
+   // validate for well-formedness
+   public void validatePut(final Put put) throws IllegalArgumentException {
+     HTable.validatePut(put, maxKeyValueSize);
+@@ -192,6 +223,11 @@ public class BufferedMutatorImpl implements BufferedMutator {
+       if (this.closed) {
+         return;
+       }
++
++      if (this.autoFlushTimer != null) {
++        autoFlushTimer.cancel();
++        autoFlushTimer = null;
++      }
+       // As we can have an operation in progress even if the buffer is empty, we call
+       // backgroundFlushCommits at least one time.
+       backgroundFlushCommits(true);
+@@ -276,7 +312,8 @@ public class BufferedMutatorImpl implements BufferedMutator {
+   }
+ 
+   /**
+-   * Reuse the AsyncProcessTask when calling {@link BufferedMutatorImpl#backgroundFlushCommits(boolean)}.
++   * Reuse the AsyncProcessTask when calling
++   * {@link BufferedMutatorImpl#backgroundFlushCommits(boolean)}.
+    * @param taker access the inner buffer.
+    * @return An AsyncProcessTask which always returns the latest rpc and operation timeout.
+    */
+@@ -309,6 +346,37 @@ public class BufferedMutatorImpl implements BufferedMutator {
+   }
+ 
+   @Override
++  public void setWriteBufferMaxLinger(long milliseconds) {
++    if (milliseconds > 0) {
++      // If the 'max linger' is set there is a minimal value to obey
++      this.writeBufferMaxLinger = Math.max(MIN_WRITE_BUFFER_MAX_LINGER, milliseconds);
++    } else {
++      // All values must be 0 or higher.
++      this.writeBufferMaxLinger = 0;
++    }
++
++    if (this.writeBufferMaxLinger == 0) {
++      if (autoFlushTimer != null) {
++        autoFlushTimer.cancel();
++        autoFlushTimer = null;
++      }
++    } else {
++      autoFlushTimer = new Timer(true); // Create Timer running as Daemon.
++      autoFlushTimer.schedule(new TimerTask() {
++        @Override
++        public void run() {
++          BufferedMutatorImpl.this.autoFlush();
++        }
++      }, writeBufferMaxLinger, writeBufferMaxLinger);
++    }
++  }
++
++  @Override
++  public long getWriteBufferMaxLingerMs() {
++    return this.writeBufferMaxLinger;
++  }
++
++  @Override
+   public void setRpcTimeout(int rpcTimeout) {
+     this.rpcTimeout.set(rpcTimeout);
+   }
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
+index 0648501..ac613a5 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
+@@ -34,6 +34,7 @@ public class BufferedMutatorParams implements Cloneable {
+ 
+   private final TableName tableName;
+   private long writeBufferSize = UNSET;
++  private long writeBufferMaxLinger = UNSET;
+   private int maxKeyValueSize = UNSET;
+   private ExecutorService pool = null;
+   private String implementationClassName = null;
+@@ -88,6 +89,18 @@ public class BufferedMutatorParams implements Cloneable {
+     return this;
+   }
+ 
++  public long getWriteBufferMaxLingerMs() {
++    return writeBufferMaxLinger;
++  }
++
++  /**
++   * Set the max timeout before the buffer is automatically flushed.
++   */
++  public BufferedMutatorParams writeBufferMaxLinger(long milliseconds) {
++    this.writeBufferMaxLinger = milliseconds;
++    return this;
++  }
++
+   public int getMaxKeyValueSize() {
+     return maxKeyValueSize;
+   }
+@@ -154,11 +167,12 @@ public class BufferedMutatorParams implements Cloneable {
+   @Override
+   public BufferedMutatorParams clone() {
+     BufferedMutatorParams clone = new BufferedMutatorParams(this.tableName);
+-    clone.writeBufferSize = this.writeBufferSize;
+-    clone.maxKeyValueSize = maxKeyValueSize;
+-    clone.pool = this.pool;
+-    clone.listener = this.listener;
+-    clone.implementationClassName = this.implementationClassName;
++    clone.writeBufferSize          = this.writeBufferSize;
++    clone.writeBufferMaxLinger     = this.writeBufferMaxLinger;
++    clone.maxKeyValueSize          = this.maxKeyValueSize;
++    clone.pool                     = this.pool;
++    clone.listener                 = this.listener;
++    clone.implementationClassName  = this.implementationClassName;
+     return clone;
+   }
+ }
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionConfiguration.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionConfiguration.java
+index e4d4911..0a97382 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionConfiguration.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionConfiguration.java
+@@ -14,7 +14,6 @@ package org.apache.hadoop.hbase.client;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.yetus.audience.InterfaceAudience;
+-
+ import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
+ 
+ /**
+@@ -30,10 +29,13 @@ public class ConnectionConfiguration {
+ 
+   public static final String WRITE_BUFFER_SIZE_KEY = "hbase.client.write.buffer";
+   public static final long WRITE_BUFFER_SIZE_DEFAULT = 2097152;
++  public static final String WRITE_BUFFER_MAX_LINGER = "hbase.client.write.buffer.linger";
++  public static final long WRITE_BUFFER_MAX_LINGER_DEFAULT = 0; // Default: Autoflush is disabled
+   public static final String MAX_KEYVALUE_SIZE_KEY = "hbase.client.keyvalue.maxsize";
+   public static final int MAX_KEYVALUE_SIZE_DEFAULT = 10485760;
+ 
+   private final long writeBufferSize;
++  private final long writeBufferMaxLinger;
+   private final int metaOperationTimeout;
+   private final int operationTimeout;
+   private final int scannerCaching;
+@@ -56,6 +58,9 @@ public class ConnectionConfiguration {
+   ConnectionConfiguration(Configuration conf) {
+     this.writeBufferSize = conf.getLong(WRITE_BUFFER_SIZE_KEY, WRITE_BUFFER_SIZE_DEFAULT);
+ 
++    this.writeBufferMaxLinger = conf.getLong(WRITE_BUFFER_MAX_LINGER,
++            WRITE_BUFFER_MAX_LINGER_DEFAULT);
++
+     this.metaOperationTimeout = conf.getInt(HConstants.HBASE_CLIENT_META_OPERATION_TIMEOUT,
+         HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT);
+ 
+@@ -105,6 +110,7 @@ public class ConnectionConfiguration {
+   @VisibleForTesting
+   protected ConnectionConfiguration() {
+     this.writeBufferSize = WRITE_BUFFER_SIZE_DEFAULT;
++    this.writeBufferMaxLinger = WRITE_BUFFER_MAX_LINGER_DEFAULT;
+     this.metaOperationTimeout = HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT;
+     this.operationTimeout = HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT;
+     this.scannerCaching = HConstants.DEFAULT_HBASE_CLIENT_SCANNER_CACHING;
+@@ -133,6 +139,10 @@ public class ConnectionConfiguration {
+     return writeBufferSize;
+   }
+ 
++  public long getWriteBufferMaxLingerMs() {
++    return writeBufferMaxLinger;
++  }
++
+   public int getMetaOperationTimeout() {
+     return metaOperationTimeout;
+   }
+diff --git hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+index 5d71d9c..3f89c96 100644
+--- hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
++++ hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+@@ -365,6 +365,9 @@ class ConnectionImplementation implements ClusterConnection, Closeable {
+     if (params.getWriteBufferSize() == BufferedMutatorParams.UNSET) {
+       params.writeBufferSize(connectionConfig.getWriteBufferSize());
+     }
++    if (params.getWriteBufferMaxLingerMs() == BufferedMutatorParams.UNSET) {
++      params.writeBufferMaxLinger(connectionConfig.getWriteBufferMaxLingerMs());
++    }
+     if (params.getMaxKeyValueSize() == BufferedMutatorParams.UNSET) {
+       params.maxKeyValueSize(connectionConfig.getMaxKeyValueSize());
+     }
+diff --git hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+index ea75ac8..f59af38 100644
+--- hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
++++ hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+@@ -18,10 +18,10 @@
+ 
+ package org.apache.hadoop.hbase.client;
+ 
++import static org.apache.hadoop.hbase.client.BufferedMutatorImpl.MIN_WRITE_BUFFER_MAX_LINGER;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+-
+ import java.io.IOException;
+ import java.io.InterruptedIOException;
+ import java.nio.charset.StandardCharsets;
+@@ -49,7 +49,6 @@ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+-
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+@@ -1103,6 +1102,91 @@ public class TestAsyncProcess {
+   }
+ 
+   @Test
++  public void testSettingAutoFlushParameters() throws Exception {
++    ClusterConnection conn = createHConnection();
++    MyAsyncProcess ap = new MyAsyncProcess(conn, CONF, true);
++
++    checkAutoFlushParameters(conn, ap,     0,    0);
++    checkAutoFlushParameters(conn, ap, -1234,    0);
++    checkAutoFlushParameters(conn, ap,     1,    MIN_WRITE_BUFFER_MAX_LINGER);
++    checkAutoFlushParameters(conn, ap,  1234, 1234);
++  }
++
++  private void checkAutoFlushParameters(ClusterConnection conn,
++                                        MyAsyncProcess ap,
++                                        long set,
++                                        long expect) {
++    BufferedMutatorParams bufferParam = createBufferedMutatorParams(ap, DUMMY_TABLE);
++
++    // The BufferedMutatorParams does nothing with the value
++    bufferParam.writeBufferMaxLinger(set);
++    Assert.assertEquals(set, bufferParam.getWriteBufferMaxLingerMs());
++
++    // The BufferedMutatorImpl corrects illegal values
++    BufferedMutatorImpl ht = new BufferedMutatorImpl(conn, bufferParam, ap);
++    Assert.assertEquals(expect, ht.getWriteBufferMaxLingerMs());
++  }
++
++
++  @Test
++  public void testHTablePutSuccessAutoFlush() throws Exception {
++    ClusterConnection conn = createHConnection();
++    MyAsyncProcess ap = new MyAsyncProcess(conn, CONF, true);
++    BufferedMutatorParams bufferParam = createBufferedMutatorParams(ap, DUMMY_TABLE);
++
++    bufferParam.writeBufferMaxLinger(1); // Autoflush after 100 ms
++    bufferParam.writeBufferSize(10000);  // Write buffer set to much larger than the single record
++
++    BufferedMutatorImpl ht = new BufferedMutatorImpl(conn, bufferParam, ap);
++
++    // Verify if BufferedMutator has the right settings.
++    Assert.assertEquals(10000, ht.getWriteBufferSize());
++    Assert.assertEquals(MIN_WRITE_BUFFER_MAX_LINGER, ht.getWriteBufferMaxLingerMs());
++
++    Put put = createPut(1, true);
++
++    Assert.assertEquals(0, ht.getAutoFlushCount());
++    Assert.assertEquals(0, ht.getCurrentWriteBufferSize());
++
++    // ----- Insert, flush immediately, MUST NOT auto flush
++    ht.mutate(put);
++    ht.flush();
++
++    Thread.sleep(1000);
++    Assert.assertEquals(0, ht.getAutoFlushCount());
++    Assert.assertEquals(0, ht.getCurrentWriteBufferSize());
++
++    // ----- Insert, NO flush, MUST auto flush
++    ht.mutate(put);
++    Assert.assertEquals(0, ht.getAutoFlushCount());
++    Assert.assertTrue(ht.getCurrentWriteBufferSize() > 0);
++
++    // After a little more that 100 ms we should see an automatic flush
++    // Flushing itself seems to take approx 1050 ms, so we wait for 2 seconds.
++    Thread.sleep(2000);
++    Assert.assertEquals(1, ht.getAutoFlushCount());
++    Assert.assertEquals(0, ht.getCurrentWriteBufferSize());
++
++    // ----- DISABLE AUTO FLUSH, Insert, NO flush, MUST NOT auto flush
++    ht.setWriteBufferMaxLinger(0);
++    ht.mutate(put);
++    Assert.assertEquals(1, ht.getAutoFlushCount());
++    Assert.assertTrue(ht.getCurrentWriteBufferSize() > 0);
++
++    // Wait for 2 seconds, we should see NO flushes.
++    Thread.sleep(2000);
++    Assert.assertEquals(1, ht.getAutoFlushCount());
++    Assert.assertTrue(ht.getCurrentWriteBufferSize() > 0);
++
++    // Reenable autoflush, wait and it should have auto flushed.
++    ht.setWriteBufferMaxLinger(1);
++    Thread.sleep(500);
++    Assert.assertEquals(2, ht.getAutoFlushCount());
++    Assert.assertEquals(0, ht.getCurrentWriteBufferSize());
++  }
++
++
++  @Test
+   public void testBufferedMutatorImplWithSharedPool() throws Exception {
+     ClusterConnection conn = createHConnection();
+     MyAsyncProcess ap = new MyAsyncProcess(conn, CONF, true);
+diff --git hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestBufferedMutatorParams.java hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestBufferedMutatorParams.java
+index 0646f41..dac2e7a 100644
+--- hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestBufferedMutatorParams.java
++++ hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestBufferedMutatorParams.java
+@@ -21,7 +21,6 @@ package org.apache.hadoop.hbase.client;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertTrue;
+-
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.concurrent.Callable;
+@@ -30,7 +29,6 @@ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+-
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.testclassification.ClientTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+@@ -136,13 +134,19 @@ public class TestBufferedMutatorParams {
+     BufferedMutatorParams bmp = new BufferedMutatorParams(TableName.valueOf(tableName));
+ 
+     BufferedMutator.ExceptionListener listener = new MockExceptionListener();
+-    bmp.writeBufferSize(17).maxKeyValueSize(13).pool(pool).listener(listener);
++    bmp
++            .writeBufferSize(17)
++            .writeBufferMaxLinger(123)
++            .maxKeyValueSize(13)
++            .pool(pool)
++            .listener(listener);
+     bmp.implementationClassName("someClassName");
+     BufferedMutatorParams clone = bmp.clone();
+ 
+     // Confirm some literals
+     assertEquals(tableName, clone.getTableName().toString());
+     assertEquals(17, clone.getWriteBufferSize());
++    assertEquals(123, clone.getWriteBufferMaxLingerMs());
+     assertEquals(13, clone.getMaxKeyValueSize());
+     assertEquals("someClassName", clone.getImplementationClassName());
+ 
+@@ -168,6 +172,7 @@ public class TestBufferedMutatorParams {
+     assertEquals(some.getTableName().toString(),
+         clone.getTableName().toString());
+     assertEquals(some.getWriteBufferSize(), clone.getWriteBufferSize());
++    assertEquals(some.getWriteBufferMaxLingerMs(), clone.getWriteBufferMaxLingerMs());
+     assertEquals(some.getMaxKeyValueSize(), clone.getMaxKeyValueSize());
+     assertTrue(some.getListener() == clone.getListener());
+     assertTrue(some.getPool() == clone.getPool());

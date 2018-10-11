@@ -1,0 +1,155 @@
+Index: src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+===================================================================
+--- src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(revision 821960)
++++ src/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(working copy)
+@@ -454,11 +454,14 @@
+           LOG.warn("unable to report to master for " + (now - lastMsg) +
+             " milliseconds - retrying");
+         }
+-        if ((now - lastMsg) >= msgInterval) {
++        // Send messages to the master IF this.msgInterval has elapsed OR if
++        // we have something to tell (and we didn't just fail sending master).
++        if ((now - lastMsg) >= msgInterval ||
++            (outboundArray.length == 0 && !this.outboundMsgs.isEmpty())) {
+           try {
+             doMetrics();
+             MemoryUsage memory =
+-                ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
++              ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+             HServerLoad hsl = new HServerLoad(requestCount.get(),
+               (int)(memory.getUsed()/1024/1024),
+               (int)(memory.getMax()/1024/1024));
+@@ -1449,7 +1452,7 @@
+   /*
+    * Data structure to hold a HMsg and retries count.
+    */
+-  private static final class ToDoEntry {
++  static final class ToDoEntry {
+     protected final AtomicInteger tries = new AtomicInteger(0);
+     protected final HMsg msg;
+ 
+Index: src/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+===================================================================
+--- src/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java	(revision 821960)
++++ src/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java	(working copy)
+@@ -30,10 +30,13 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.HMsg;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.regionserver.HRegionServer.ToDoEntry;
++import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -217,8 +220,8 @@
+         newRegions[i].getRegionInfo()));
+       t.put(put);
+     }
+-        
+-    // Now tell the master about the new regions
++    // Now tell the master about the new regions.  Note that we'll online 
++    // the A region ourselves on this server.  Master only has to online B.
+     server.reportSplit(oldRegionInfo, newRegions[0].getRegionInfo(),
+       newRegions[1].getRegionInfo());
+     LOG.info("region split, META updated, and report to master all" +
+@@ -226,8 +229,15 @@
+       ", new regions: " + newRegions[0].toString() + ", " +
+       newRegions[1].toString() + ". Split took " +
+       StringUtils.formatTimeDiff(System.currentTimeMillis(), startTime));
+-    
+-    // Do not serve the new regions. Let the Master assign them.
++    // Server region A.  Let master assign region B.
++    HRegionInfo hri = newRegions[0].getRegionInfo();
++    HMsg msg = new HMsg(HMsg.Type.MSG_REGION_OPEN, hri,
++      Bytes.toBytes("Local immediate open"));
++    try {
++      this.server.toDo.put(new HRegionServer.ToDoEntry(msg));
++    } catch (InterruptedException e) {
++      throw new IOException("Failed queue of open of " + hri, e);
++    }
+   }
+ 
+   /**
+Index: src/java/org/apache/hadoop/hbase/master/ServerManager.java
+===================================================================
+--- src/java/org/apache/hadoop/hbase/master/ServerManager.java	(revision 821960)
++++ src/java/org/apache/hadoop/hbase/master/ServerManager.java	(working copy)
+@@ -454,7 +454,8 @@
+           break;
+ 
+         case MSG_REPORT_SPLIT:
+-          processSplitRegion(region, incomingMsgs[++i], incomingMsgs[++i]);
++          processSplitRegion(serverInfo, region, incomingMsgs[++i],
++            incomingMsgs[++i]);
+           break;
+ 
+         default:
+@@ -496,18 +497,26 @@
+    * @param splitB
+    * @param returnMsgs
+    */
+-  private void processSplitRegion(HRegionInfo region, HMsg splitA, HMsg splitB) {
++  private void processSplitRegion(final HServerInfo si, final HRegionInfo region,
++      final HMsg splitA, final HMsg splitB) {
+     synchronized (master.regionManager) {
+       // Cancel any actions pending for the affected region.
+       // This prevents the master from sending a SPLIT message if the table
+       // has already split by the region server. 
+-      master.regionManager.endActions(region.getRegionName());
+-      assignSplitDaughter(splitA.getRegionInfo());
++      this.master.regionManager.endActions(region.getRegionName());
++      // Region A is now opened immediately on the splitting server.  The message
++      // that its been successfully opened is probably just behind this split
++      // message.  Set up the master state so that its properly primed for the
++      // coming open message.
++      HRegionInfo a = splitA.getRegionInfo();
++      assignSplitDaughter(a);
++      this.master.regionManager.doRegionAssignment(a.getRegionNameAsString(), si);
++      // Region B will be assigned old-school style by the master.
+       assignSplitDaughter(splitB.getRegionInfo());
+       if (region.isMetaTable()) {
+         // A meta region has split.
+-        master.regionManager.offlineMetaRegion(region.getStartKey());
+-        master.regionManager.incrementNumMetaRegions();
++        this.master.regionManager.offlineMetaRegion(region.getStartKey());
++        this.master.regionManager.incrementNumMetaRegions();
+       }
+     }
+   }
+@@ -578,7 +587,7 @@
+       if (duplicateAssignment) {
+         if (LOG.isDebugEnabled()) {
+           LOG.debug("region server " + serverInfo.getServerAddress().toString()
+-              + " should not have opened region " + Bytes.toString(region.getRegionName()));
++            + " should not have opened region " + Bytes.toString(region.getRegionName()));
+         }
+ 
+         // This Region should not have been opened.
+Index: src/java/org/apache/hadoop/hbase/master/RegionManager.java
+===================================================================
+--- src/java/org/apache/hadoop/hbase/master/RegionManager.java	(revision 821960)
++++ src/java/org/apache/hadoop/hbase/master/RegionManager.java	(working copy)
+@@ -340,8 +340,17 @@
+     LOG.info("Assigning region " + regionName + " to " + sinfo.getServerName());
+     rs.setPendingOpen(sinfo.getServerName());
+     this.regionsInTransition.put(regionName, rs);
++    if (returnMsgs != null) {
++      returnMsgs.add(new HMsg(HMsg.Type.MSG_REGION_OPEN, rs.getRegionInfo()));
++    }
++  }
+ 
+-    returnMsgs.add(new HMsg(HMsg.Type.MSG_REGION_OPEN, rs.getRegionInfo()));
++  /**
++   * @param regionName
++   * @param sinfo
++   */
++  void doRegionAssignment(final String regionName, final HServerInfo sinfo) {
++    doRegionAssignment(this.regionsInTransition.get(regionName), sinfo, null);
+   }
+ 
+   /*

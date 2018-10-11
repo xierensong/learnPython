@@ -1,0 +1,248 @@
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChangedReadersObserver.java hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChangedReadersObserver.java
+index 0bc75e7..f96e3ba 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChangedReadersObserver.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ChangedReadersObserver.java
+@@ -34,5 +34,5 @@ public interface ChangedReadersObserver {
+    * Notify observers.
+    * @throws IOException e
+    */
+-  void updateReaders(List<StoreFile> sfs) throws IOException;
++  void updateReaders(List<StoreFile> sfs, long snapshotId) throws IOException;
+ }
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+index 4032a19..1d5ab40 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+@@ -152,6 +152,7 @@ public class HStore implements Store {
+    *   - completing a compaction
+    */
+   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
++  private volatile long latestSnapshotId = -1;
+   /**
+    * Lock specific to archiving compacted store files.  This avoids races around
+    * the combination of retrieving the list of compacted files and moving them to
+@@ -1107,6 +1108,10 @@ public class HStore implements Store {
+     return hFileContext;
+   }
+ 
++  @Override
++  public long getLatestSnapshotId() {
++    return latestSnapshotId;
++  }
+ 
+   /*
+    * Change storeFiles adding into place the Reader produced by this new flush.
+@@ -1132,7 +1137,8 @@ public class HStore implements Store {
+       this.lock.writeLock().unlock();
+     }
+     // notify to be called here - only in case of flushes
+-    notifyChangedReadersObservers(sfs);
++    notifyChangedReadersObservers(sfs, snapshotId);
++    latestSnapshotId = snapshotId;
+     if (LOG.isTraceEnabled()) {
+       long totalSize = 0;
+       for (StoreFile sf : sfs) {
+@@ -1150,9 +1156,9 @@ public class HStore implements Store {
+    * Notify all observers that set of Readers has changed.
+    * @throws IOException
+    */
+-  private void notifyChangedReadersObservers(List<StoreFile> sfs) throws IOException {
++  private void notifyChangedReadersObservers(List<StoreFile> sfs, long snapshotId) throws IOException {
+     for (ChangedReadersObserver o : this.changedReaderObservers) {
+-      o.updateReaders(sfs);
++      o.updateReaders(sfs, snapshotId);
+     }
+   }
+ 
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+index 9d5d3b6..4f4ed1f 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+@@ -377,6 +377,11 @@ public interface Store extends HeapSize, StoreConfigInformation, PropagatingConf
+   /** @return aggregate size of all HStores used in the last compaction */
+   long getLastCompactSize();
+ 
++  /**
++   * @return The id of the latest snapshot flush
++   */
++  long getLatestSnapshotId();
++
+   /** @return aggregate size of HStore */
+   long getSize();
+ 
+diff --git hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index 28d9ef2..eb4c11a 100644
+--- hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -27,6 +27,7 @@ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.NavigableSet;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.commons.logging.Log;
+@@ -62,6 +63,7 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+     implements KeyValueScanner, InternalScanner, ChangedReadersObserver {
+   private static final Log LOG = LogFactory.getLog(StoreScanner.class);
++  private volatile long latestSnapshotId = -1;
+   // In unit tests, the store could be null
+   protected final Store store;
+   protected ScanQueryMatcher matcher;
+@@ -757,12 +759,13 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+ 
+   // Implementation of ChangedReadersObserver
+   @Override
+-  public void updateReaders(List<StoreFile> sfs) throws IOException {
++  public void updateReaders(List<StoreFile> sfs, long snapshotId) throws IOException {
+     flushed = true;
+     flushLock.lock();
+     try {
+       flushedStoreFiles.addAll(sfs);
+     } finally {
++      this.latestSnapshotId = snapshotId;
+       flushLock.unlock();
+     }
+   }
+@@ -812,34 +815,61 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+     return false;
+   }
+ 
+-  protected void resetScannerStack(Cell lastTopKey) throws IOException {
+-    /* When we have the scan object, should we not pass it to getScanners()
+-     * to get a limited set of scanners? We did so in the constructor and we
+-     * could have done it now by storing the scan object from the constructor
+-     */
+-
+-    final boolean isCompaction = false;
++  private List<KeyValueScanner> getScannersFromFlush(boolean includeMemstoreScanner) throws IOException {
+     boolean usePread = get || scanUsePread;
+-    List<KeyValueScanner> scanners = null;
+     try {
+       flushLock.lock();
+-      scanners = selectScannersFrom(store.getScanners(flushedStoreFiles, cacheBlocks, get, usePread,
+-        isCompaction, matcher, scan.getStartRow(), scan.getStopRow(), this.readPt, true));
++      return selectScannersFrom(store.getScanners(flushedStoreFiles, cacheBlocks, get, usePread,
++        false, matcher, scan.getStartRow(), scan.getStopRow(), this.readPt, includeMemstoreScanner));
++    } finally {
+       // Clear the current set of flushed store files so that they don't get added again
+       flushedStoreFiles.clear();
+-    } finally {
+       flushLock.unlock();
+     }
++  }
++
++  protected void resetScannerStack(Cell lastTopKey) throws IOException {
++    /* When we have the scan object, should we not pass it to getScanners()
++     * to get a limited set of scanners? We did so in the constructor and we
++     * could have done it now by storing the scan object from the constructor
++     */
++    List<KeyValueScanner> scanners = getScannersFromFlush(true);
++
+ 
+     // Seek the new scanners to the last key
+     seekScanners(scanners, lastTopKey, false, parallelSeekEnabled);
+     // remove the older memstore scanner
++    boolean hasDataInMemStore = false;
+     for (int i = 0; i < currentScanners.size(); i++) {
+       if (!currentScanners.get(i).isFileScanner()) {
++        hasDataInMemStore = currentScanners.get(i).peek() != null;
+         currentScanners.remove(i);
+         break;
+       }
+     }
++
++    // If we don't exhaust the MemStoreScanner, we should make sure
++    // that the hfile created by lastest MemStore has been loaded.
++    if (hasDataInMemStore) {
++      boolean hasSleep = false;
++      // If the flush happen again before resetScannerStack call this metohd,
++      // the snapshot id will be different.
++      while (latestSnapshotId != store.getLatestSnapshotId()) {
++        hasSleep = true;
++        try {
++          TimeUnit.MILLISECONDS.sleep(10);
++        } catch (InterruptedException ex) {
++          throw new IOException(ex);
++        }
++      }
++      // The flushed files is changed, so we need to update the scanner again.
++      if (hasSleep) {
++        List<KeyValueScanner> laterScanners = getScannersFromFlush(false);
++        seekScanners(laterScanners, lastTopKey, false, parallelSeekEnabled);
++        scanners.addAll(laterScanners);
++      }
++    }
++
+     // add the newly created scanners on the flushed files and the current active memstore scanner
+     addCurrentScanners(scanners);
+     // Combine all seeked scanners with a heap
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/TestAcidGuarantees.java hbase-server/src/test/java/org/apache/hadoop/hbase/TestAcidGuarantees.java
+index c3e0ec4..46aba8f 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/TestAcidGuarantees.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/TestAcidGuarantees.java
+@@ -334,7 +334,7 @@ public class TestAcidGuarantees implements Tool {
+   public void testGetAtomicity() throws Exception {
+     util.startMiniCluster(1);
+     try {
+-      runTestAtomicity(20000, 5, 5, 0, 3);
++      runTestAtomicity(150000, 5, 5, 0, 3);
+     } finally {
+       util.shutdownMiniCluster();
+     }
+@@ -344,7 +344,7 @@ public class TestAcidGuarantees implements Tool {
+   public void testScanAtomicity() throws Exception {
+     util.startMiniCluster(1);
+     try {
+-      runTestAtomicity(20000, 5, 0, 5, 3);
++      runTestAtomicity(150000, 5, 0, 5, 3);
+     } finally {
+       util.shutdownMiniCluster();
+     }
+@@ -354,7 +354,7 @@ public class TestAcidGuarantees implements Tool {
+   public void testMixedAtomicity() throws Exception {
+     util.startMiniCluster(1);
+     try {
+-      runTestAtomicity(20000, 5, 2, 2, 3);
++      runTestAtomicity(150000, 5, 2, 2, 3);
+     } finally {
+       util.shutdownMiniCluster();
+     }
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreScanner.java hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreScanner.java
+index 30ffe0b..59a0339 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreScanner.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreScanner.java
+@@ -452,9 +452,9 @@ public class TestStoreScanner extends TestCase {
+     // normally cause an NPE because scan.store is null.  So as long as we get through these
+     // two calls we are good and the bug was quashed.
+ 
+-    scan.updateReaders(new ArrayList<StoreFile>());
++    scan.updateReaders(new ArrayList<StoreFile>(), 0);
+ 
+-    scan.updateReaders(new ArrayList<StoreFile>());
++    scan.updateReaders(new ArrayList<StoreFile>(), 1);
+ 
+     scan.peek();
+   }
+diff --git hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWideScanner.java hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWideScanner.java
+index 7e86632..0e831cf 100644
+--- hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWideScanner.java
++++ hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWideScanner.java
+@@ -100,6 +100,7 @@ public class TestWideScanner extends HBaseTestCase {
+       int total = 0;
+       int i = 0;
+       boolean more;
++      int snapshotId = 0;
+       do {
+         more = s.next(results);
+         i++;
+@@ -125,7 +126,7 @@ public class TestWideScanner extends HBaseTestCase {
+           ((HRegion.RegionScannerImpl)s).storeHeap.getHeap().iterator();
+         while (scanners.hasNext()) {
+           StoreScanner ss = (StoreScanner)scanners.next();
+-          ss.updateReaders(new ArrayList<StoreFile>());
++          ss.updateReaders(new ArrayList<StoreFile>(), snapshotId++);
+         }
+       } while (more);
+ 

@@ -1,0 +1,2151 @@
+From beb5cf354d1c49cdcce1389c9de99ef407e02e97 Mon Sep 17 00:00:00 2001
+From: Michael Stack <stack@apache.org>
+Date: Thu, 26 Oct 2017 14:55:53 -0700
+Subject: [PATCH] HBASE-18770 Remove bypass method in ObserverContext and
+ implement the 'bypass' logic case by case
+
+Changes Coprocessor context 'bypass' semantic. Changes default so
+it is NOT supported; only a couple of preXXX methods in
+RegionObserver allow it: e.g.  preGet and prePut but not preFlush, etc.
+
+Changes Coprocessor 'complete' semantic too. It only has an effect
+on those methods that support 'bypass'; i.e. you can only exit
+a Coprocessor chain early via 'complete' on methods that are
+bypassable.
+
+See javadoc for whether a Coprocessor Observer method supports
+'bypass'. If no mention, 'bypass' is NOT supported.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/CoprocessorHost.java
+ Added passing of 'bypassable' (and 'completable') argument to the Operation constructors.
+ Methods that support 'bypass' must set this flag.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+ Refactoring in here is minor. A few methods that used support bypass
+ no longer do so removed the check and the need of an if/else meant a
+ left-shift in some code.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+ Ditto
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionCoprocessorHost.java
+ In here label explicitly those methods that are bypassable.
+ Some changes to make sure we call the corresponding execOperation.
+
+TODO: What to do w/ the Scanner methods.
+---
+ .../org/apache/hadoop/hbase/util/VersionInfo.java  |   2 +
+ .../hadoop/hbase/coprocessor/CoprocessorHost.java  |  82 +++--
+ .../coprocessor/DoesNotSupportBypassException.java |  24 ++
+ .../DoesNotSupportCompleteException.java           |  24 ++
+ .../hadoop/hbase/coprocessor/ObserverContext.java  |  25 +-
+ .../hbase/coprocessor/ObserverContextImpl.java     |  30 +-
+ .../hadoop/hbase/master/MasterCoprocessorHost.java |  12 +-
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |  70 ++--
+ .../apache/hadoop/hbase/regionserver/HStore.java   |   6 +-
+ .../hadoop/hbase/regionserver/RSRpcServices.java   |  25 +-
+ .../hbase/regionserver/RegionCoprocessorHost.java  | 404 +++++++++++++--------
+ .../regionserver/RegionServerCoprocessorHost.java  |   8 +-
+ .../hbase/regionserver/SecureBulkLoadManager.java  |  75 ++--
+ .../hbase/regionserver/wal/WALCoprocessorHost.java |   9 +-
+ .../hbase/coprocessor/TestMasterObserver.java      | 143 +-------
+ .../hadoop/hbase/regionserver/TestHRegion.java     |  18 +-
+ 16 files changed, 501 insertions(+), 456 deletions(-)
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportBypassException.java
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportCompleteException.java
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/VersionInfo.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/VersionInfo.java
+index 07b9c5880a..e48dd92579 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/util/VersionInfo.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/util/VersionInfo.java
+@@ -26,6 +26,8 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.hbase.Version;
+ import org.apache.yetus.audience.InterfaceAudience;
+ 
++import static sun.rmi.transport.TransportConstants.Version;
++
+ /**
+  * This class finds the Version information for HBase.
+  */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/CoprocessorHost.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/CoprocessorHost.java
+index c785b0b594..af771472ed 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/CoprocessorHost.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/CoprocessorHost.java
+@@ -1,5 +1,4 @@
+ /*
+- *
+  * Licensed to the Apache Software Foundation (ASF) under one
+  * or more contributor license agreements.  See the NOTICE file
+  * distributed with this work for additional information
+@@ -36,14 +35,12 @@ import java.util.function.Function;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.yetus.audience.InterfaceAudience;
+-import org.apache.yetus.audience.InterfaceStability;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Abortable;
+ import org.apache.hadoop.hbase.Coprocessor;
+ import org.apache.hadoop.hbase.CoprocessorEnvironment;
+ import org.apache.hadoop.hbase.DoNotRetryIOException;
+-import org.apache.hadoop.hbase.HBaseInterfaceAudience;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.ipc.RpcServer;
+ import org.apache.hadoop.hbase.security.User;
+@@ -548,11 +545,20 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+     ObserverGetter<C, O> observerGetter;
+ 
+     ObserverOperation(ObserverGetter<C, O> observerGetter) {
+-      this(observerGetter, RpcServer.getRequestUser().orElse(null));
++      this(observerGetter, null, false);
+     }
+ 
+     ObserverOperation(ObserverGetter<C, O> observerGetter, User user) {
+-      super(user);
++      this(observerGetter, user, false);
++    }
++
++    ObserverOperation(ObserverGetter<C, O> observerGetter, boolean bypassable) {
++      this(observerGetter, null, bypassable);
++    }
++
++    ObserverOperation(ObserverGetter<C, O> observerGetter, User user, boolean bypassable) {
++      super(user != null? user: RpcServer.getRequestUser().orElse(null),
++          bypassable, bypassable/*'completable': make completable same as bypassable*/);
+       this.observerGetter = observerGetter;
+     }
+ 
+@@ -574,6 +580,11 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+       super(observerGetter, user);
+     }
+ 
++    public ObserverOperationWithoutResult(ObserverGetter<C, O> observerGetter, User user,
++        boolean bypassable) {
++      super(observerGetter, user, bypassable);
++    }
++
+     /**
+      * In case of coprocessors which have many kinds of observers (for eg, {@link RegionCoprocessor}
+      * has BulkLoadObserver, RegionObserver, etc), some implementations may not need all
+@@ -594,15 +605,23 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+ 
+     private R result;
+ 
+-    public ObserverOperationWithResult(ObserverGetter<C, O> observerGetter) {
+-      super(observerGetter);
++    public ObserverOperationWithResult(ObserverGetter<C, O> observerGetter, R result) {
++      this(observerGetter, result, false);
+     }
+ 
+-    public ObserverOperationWithResult(ObserverGetter<C, O> observerGetter, User user) {
+-      super(observerGetter, user);
++    public ObserverOperationWithResult(ObserverGetter<C, O> observerGetter, R result,
++        boolean bypassable) {
++      this(observerGetter, result, null, bypassable);
++    }
++
++    public ObserverOperationWithResult(ObserverGetter<C, O> observerGetter, R result,
++        User user) {
++      this(observerGetter, result, user, false);
+     }
+ 
+-    void setResult(final R result) {
++    private ObserverOperationWithResult(ObserverGetter<C, O> observerGetter, R result, User user,
++        boolean bypassable) {
++      super(observerGetter, user, bypassable);
+       this.result = result;
+     }
+ 
+@@ -621,38 +640,25 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+   //////////////////////////////////////////////////////////////////////////////////////////
+   // Functions to execute observer hooks and handle results (if any)
+   //////////////////////////////////////////////////////////////////////////////////////////
+-  protected <O, R> R execOperationWithResult(final R defaultValue,
+-      final ObserverOperationWithResult<O, R> observerOperation) throws IOException {
+-    if (observerOperation == null) {
+-      return defaultValue;
+-    }
+-    observerOperation.setResult(defaultValue);
+-    execOperation(observerOperation);
+-    return observerOperation.getResult();
+-  }
+ 
+-  // what does bypass mean?
+-  protected <O, R> R execOperationWithResult(final boolean ifBypass, final R defaultValue,
++  /**
++   * Do not call with an observerOperation that is null! Have the caller check.
++   */
++  protected <O, R> R execOperationWithResult(
+       final ObserverOperationWithResult<O, R> observerOperation) throws IOException {
+-    if (observerOperation == null) {
+-      return ifBypass ? null : defaultValue;
+-    } else {
+-      observerOperation.setResult(defaultValue);
+-      boolean bypass = execOperation(true, observerOperation);
+-      R result = observerOperation.getResult();
+-      return bypass == ifBypass ? result : null;
+-    }
++    boolean bypass = execOperation(observerOperation);
++    R result = observerOperation.getResult();
++    return bypass == observerOperation.isBypassable()? result: null;
+   }
+ 
++  /**
++   * @return True if we are to bypass (Can only be <code>true</code> if
++   * {@link ObserverOperation#isBypassable()}).
++   */
+   protected <O> boolean execOperation(final ObserverOperation<O> observerOperation)
+       throws IOException {
+-    return execOperation(true, observerOperation);
+-  }
+-
+-  protected <O> boolean execOperation(final boolean earlyExit,
+-      final ObserverOperation<O> observerOperation) throws IOException {
+-    if (observerOperation == null) return false;
+     boolean bypass = false;
++    if (observerOperation == null) return bypass;
+     List<E> envs = coprocEnvironments.get();
+     for (E env : envs) {
+       observerOperation.prepare(env);
+@@ -666,8 +672,10 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+       } finally {
+         currentThread.setContextClassLoader(cl);
+       }
++      // Internal to shouldBypass, it checks if obeserverOperation#isBypassable().
+       bypass |= observerOperation.shouldBypass();
+-      if (earlyExit && observerOperation.shouldComplete()) {
++      // Internal to shouldComplete, it checks if obeserverOperation#isCompletable().
++      if (observerOperation.shouldComplete()) {
+         break;
+       }
+       observerOperation.postEnvCall();
+@@ -675,7 +683,6 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+     return bypass;
+   }
+ 
+-
+   /**
+    * Coprocessor classes can be configured in any order, based on that priority is set and
+    * chained in a sorted order. Should be used preStop*() hooks i.e. when master/regionserver is
+@@ -719,5 +726,4 @@ public abstract class CoprocessorHost<C extends Coprocessor, E extends Coprocess
+     }
+     return bypass;
+   }
+-
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportBypassException.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportBypassException.java
+new file mode 100644
+index 0000000000..b90a4f42f0
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportBypassException.java
+@@ -0,0 +1,24 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.coprocessor;
++
++import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.yetus.audience.InterfaceAudience;
++
++@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.COPROC)
++public class DoesNotSupportBypassException extends CoprocessorException {}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportCompleteException.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportCompleteException.java
+new file mode 100644
+index 0000000000..866fe65809
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/DoesNotSupportCompleteException.java
+@@ -0,0 +1,24 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.coprocessor;
++
++import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.yetus.audience.InterfaceAudience;
++
++@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.COPROC)
++public class DoesNotSupportCompleteException extends CoprocessorException {}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContext.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContext.java
+index 3cb054b44d..78ba226625 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContext.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContext.java
+@@ -28,7 +28,7 @@ import java.util.Optional;
+ /**
+  * Carries the execution state for a given invocation of an Observer coprocessor
+  * ({@link RegionObserver}, {@link MasterObserver}, or {@link WALObserver})
+- * method.  The same ObserverContext instance is passed sequentially to all loaded
++ * method. The same ObserverContext instance is passed sequentially to all loaded
+  * coprocessors for a given Observer method trigger, with the
+  * <code>CoprocessorEnvironment</code> reference swapped out for each
+  * coprocessor.
+@@ -42,16 +42,26 @@ public interface ObserverContext<E extends CoprocessorEnvironment> {
+ 
+   /**
+    * Call to indicate that the current coprocessor's return value should be
+-   * used in place of the normal HBase obtained value.
++   * used in place of the value that would be obtained via normal processing; i.e. bypass and
++   * return the Coprocessor's result instead. DOES NOT work on all invocations, only on a small
++   * subset of methods, mostly preXXX calls in RegionObserver. Check javadoc on the pertinent
++   * Coprocessor Observer to see if <code>bypass</code> is supported.
++   * This behavior of honoring only a subset of methods is new since hbase-2.0.0.
++   * @exception CoprocessorException Thrown if you call bypass on a method that is not
++   * bypassable.
+    */
+-  void bypass();
++  void bypass() throws CoprocessorException;
+ 
+   /**
+-   * Call to indicate that additional coprocessors further down the execution
+-   * chain do not need to be invoked.  Implies that this coprocessor's response
+-   * is definitive.
++   * Call to indicate that additional coprocessors further down the execution chain should be
++   * skipped and not run. Implies that this coprocessor's response is definitive.
++   * Since hbase-2.0.0, only <code>complete</code> of bypassable methods has an effect. See javadoc
++   * on the Coprocessor Observer method as to whether bypass (and thereby 'complete') is
++   * supported.
++   * This behavior of honoring only a subset of methods is new * since hbase-2.0.0.
++   * @exception CoprocessorException Thrown if you call complete on a non-completable method.
+    */
+-  void complete();
++  void complete() throws CoprocessorException;
+ 
+   /**
+    * Returns the active user for the coprocessor call. If an explicit {@code User} instance was
+@@ -60,5 +70,4 @@ public interface ObserverContext<E extends CoprocessorEnvironment> {
+    * context.
+    */
+   Optional<User> getCaller();
+-
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContextImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContextImpl.java
+index ff829564b6..245adf5430 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContextImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/coprocessor/ObserverContextImpl.java
+@@ -35,11 +35,25 @@ import org.apache.yetus.audience.InterfaceStability;
+ public class ObserverContextImpl<E extends CoprocessorEnvironment> implements ObserverContext<E> {
+   private E env;
+   private boolean bypass;
++  /**
++   * Is this operation bypassable?
++   */
++  private final boolean bypassable;
++  /**
++   * Is this operation completable?
++   */
+   private boolean complete;
++  private final boolean completable;
+   private final User caller;
+ 
+   public ObserverContextImpl(User caller) {
++    this(caller, false, false);
++  }
++
++  public ObserverContextImpl(User caller, boolean bypassable, boolean completable) {
+     this.caller = caller;
++    this.bypassable = bypassable;
++    this.completable = completable;
+   }
+ 
+   public E getEnvironment() {
+@@ -50,11 +64,21 @@ public class ObserverContextImpl<E extends CoprocessorEnvironment> implements Ob
+     this.env = env;
+   }
+ 
+-  public void bypass() {
++  public boolean isBypassable() {return this.bypassable;};
++
++  public void bypass() throws DoesNotSupportBypassException {
++    if (!this.bypassable) {
++      throw new DoesNotSupportBypassException();
++    }
+     bypass = true;
+   }
+ 
+-  public void complete() {
++  public boolean isCompleable() {return this.completable;};
++
++  public void complete() throws DoesNotSupportCompleteException {
++    if (!this.completable) {
++      throw new DoesNotSupportCompleteException();
++    }
+     complete = true;
+   }
+ 
+@@ -63,6 +87,7 @@ public class ObserverContextImpl<E extends CoprocessorEnvironment> implements Ob
+    * coprocessors, {@code false} otherwise.
+    */
+   public boolean shouldBypass() {
++    if (!isBypassable()) return false;
+     if (bypass) {
+       bypass = false;
+       return true;
+@@ -75,6 +100,7 @@ public class ObserverContextImpl<E extends CoprocessorEnvironment> implements Ob
+    * coprocessors, {@code false} otherwise.
+    */
+   public boolean shouldComplete() {
++    if (!isCompleable()) return false;
+     if (complete) {
+       complete = false;
+       return true;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterCoprocessorHost.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterCoprocessorHost.java
+index fa2a0a9dc6..d767b1478a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterCoprocessorHost.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterCoprocessorHost.java
+@@ -908,9 +908,11 @@ public class MasterCoprocessorHost
+     });
+   }
+ 
++  // This hook allows Coprocessor change value of balance switch.
+   public boolean preBalanceSwitch(final boolean b) throws IOException {
+-    return execOperationWithResult(b, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<MasterObserver, Boolean>(masterObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return b;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<MasterObserver, Boolean>(masterObserverGetter, b) {
+           @Override
+           public Boolean call(MasterObserver observer) throws IOException {
+             return observer.preBalanceSwitch(this, getResult());
+@@ -931,7 +933,8 @@ public class MasterCoprocessorHost
+   public void preShutdown() throws IOException {
+     // While stopping the cluster all coprocessors method should be executed first then the
+     // coprocessor should be cleaned up.
+-    execShutdown(coprocEnvironments.isEmpty() ? null : new MasterObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return;
++    execShutdown(new MasterObserverOperation() {
+       @Override
+       public void call(MasterObserver observer) throws IOException {
+         observer.preShutdown(this);
+@@ -947,7 +950,8 @@ public class MasterCoprocessorHost
+   public void preStopMaster() throws IOException {
+     // While stopping master all coprocessors method should be executed first then the coprocessor
+     // environment should be cleaned up.
+-    execShutdown(coprocEnvironments.isEmpty() ? null : new MasterObserverOperation() {
++    if(coprocEnvironments.isEmpty()) return;
++    execShutdown(new MasterObserverOperation() {
+       @Override
+       public void call(MasterObserver observer) throws IOException {
+         observer.preStopMaster(this);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 07518e7999..3b9c165e45 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -3416,43 +3416,39 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver, Regi
+         MiniBatchOperationInProgress<Mutation> miniBatchOp =
+           new MiniBatchOperationInProgress<>(batchOp.getMutationsForCoprocs(),
+           batchOp.retCodeDetails, batchOp.walEditsFromCoprocessors, firstIndex, lastIndexExclusive);
+-        if (coprocessorHost.preBatchMutate(miniBatchOp)) {
+-          doneByCoprocessor = true;
+-          return;
+-        } else {
+-          for (int i = firstIndex; i < lastIndexExclusive; i++) {
+-            if (batchOp.retCodeDetails[i].getOperationStatusCode() != OperationStatusCode.NOT_RUN) {
+-              // lastIndexExclusive was incremented above.
+-              continue;
+-            }
+-            // we pass (i - firstIndex) below since the call expects a relative index
+-            Mutation[] cpMutations = miniBatchOp.getOperationsFromCoprocessors(i - firstIndex);
+-            if (cpMutations == null) {
+-              continue;
+-            }
+-            Mutation mutation = batchOp.getMutation(i);
+-            boolean skipWal = getEffectiveDurability(mutation.getDurability()) == Durability.SKIP_WAL;
+-            // Else Coprocessor added more Mutations corresponding to the Mutation at this index.
+-            for (int j = 0; j < cpMutations.length; j++) {
+-              Mutation cpMutation = cpMutations[j];
+-              checkAndPrepareMutation(cpMutation, replay, now);
+-
+-              // Acquire row locks. If not, the whole batch will fail.
+-              acquiredRowLocks.add(getRowLockInternal(cpMutation.getRow(), true));
+-
+-              // Returned mutations from coprocessor correspond to the Mutation at index i. We can
+-              // directly add the cells from those mutations to the familyMaps of this mutation.
+-              Map<byte[], List<Cell>> cpFamilyMap = cpMutation.getFamilyCellMap();
+-              // will get added to the memStore later
+-              mergeFamilyMaps(batchOp.familyCellMaps[i], cpFamilyMap);
+-
+-              // The durability of returned mutation is replaced by the corresponding mutation.
+-              // If the corresponding mutation contains the SKIP_WAL, we shouldn't count the
+-              // cells of returned mutation.
+-              if (!skipWal) {
+-                for (List<Cell> cells : cpFamilyMap.values()) {
+-                  cellCount += cells.size();
+-                }
++        coprocessorHost.preBatchMutate(miniBatchOp);
++        for (int i = firstIndex; i < lastIndexExclusive; i++) {
++          if (batchOp.retCodeDetails[i].getOperationStatusCode() != OperationStatusCode.NOT_RUN) {
++            // lastIndexExclusive was incremented above.
++            continue;
++          }
++          // we pass (i - firstIndex) below since the call expects a relative index
++          Mutation[] cpMutations = miniBatchOp.getOperationsFromCoprocessors(i - firstIndex);
++          if (cpMutations == null) {
++            continue;
++          }
++          Mutation mutation = batchOp.getMutation(i);
++          boolean skipWal = getEffectiveDurability(mutation.getDurability()) == Durability.SKIP_WAL;
++          // Else Coprocessor added more Mutations corresponding to the Mutation at this index.
++          for (int j = 0; j < cpMutations.length; j++) {
++            Mutation cpMutation = cpMutations[j];
++            checkAndPrepareMutation(cpMutation, replay, now);
++
++            // Acquire row locks. If not, the whole batch will fail.
++            acquiredRowLocks.add(getRowLockInternal(cpMutation.getRow(), true));
++
++            // Returned mutations from coprocessor correspond to the Mutation at index i. We can
++            // directly add the cells from those mutations to the familyMaps of this mutation.
++            Map<byte[], List<Cell>> cpFamilyMap = cpMutation.getFamilyCellMap();
++            // will get added to the memStore later
++            mergeFamilyMaps(batchOp.familyCellMaps[i], cpFamilyMap);
++
++            // The durability of returned mutation is replaced by the corresponding mutation.
++            // If the corresponding mutation contains the SKIP_WAL, we shouldn't count the
++            // cells of returned mutation.
++            if (!skipWal) {
++              for (List<Cell> cells : cpFamilyMap.values()) {
++                cellCount += cells.size();
+               }
+             }
+           }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+index c0cea4e152..94b34b5edd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+@@ -936,7 +936,7 @@ public class HStore implements Store, HeapSize, StoreConfigInformation, Propagat
+ 
+   /**
+    * Snapshot this stores memstore. Call before running
+-   * {@link #flushCache(long, MemStoreSnapshot, MonitoredTask, ThroughputController)}
++   * #flushCache(long, MemStoreSnapshot, MonitoredTask, ThroughputController)
+    *  so it has some work to do.
+    */
+   void snapshot() {
+@@ -1671,9 +1671,7 @@ public class HStore implements Store, HeapSize, StoreConfigInformation, Propagat
+         if (this.getCoprocessorHost() != null) {
+           final List<HStoreFile> candidatesForCoproc = compaction.preSelect(this.filesCompacting);
+           boolean override = false;
+-          //TODO: is it correct way to get CompactionRequest?
+-          override = getCoprocessorHost().preCompactSelection(this, candidatesForCoproc,
+-            tracker, user);
++          getCoprocessorHost().preCompactSelection(this, candidatesForCoproc, tracker, user);
+           if (override) {
+             // Coprocessor is overriding normal file selection.
+             compaction.forceSelect(new CompactionRequestImpl(candidatesForCoproc));
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index bff69ba0b7..d9530ef015 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -680,7 +680,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+         } else {
+           // convert duplicate append to get
+           List<Cell> results = region.get(ProtobufUtil.toGet(mutation, cellScanner), false,
+-            nonceGroup, nonce);
++              nonceGroup, nonce);
+           r = Result.create(results);
+         }
+         success = true;
+@@ -731,7 +731,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+         } else {
+           // convert duplicate increment to get
+           List<Cell> results = region.get(ProtobufUtil.toGet(mutation, cells), false, nonceGroup,
+-            nonce);
++              nonce);
+           r = Result.create(results);
+         }
+         success = true;
+@@ -2250,7 +2250,6 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+       checkOpen();
+       requestCount.increment();
+       HRegion region = getRegion(request.getRegion());
+-      boolean bypass = false;
+       boolean loaded = false;
+       Map<byte[], List<Path>> map = null;
+ 
+@@ -2277,15 +2276,13 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+           familyPaths.add(new Pair<>(familyPath.getFamily().toByteArray(), familyPath.getPath()));
+         }
+         if (region.getCoprocessorHost() != null) {
+-          bypass = region.getCoprocessorHost().preBulkLoadHFile(familyPaths);
++          region.getCoprocessorHost().preBulkLoadHFile(familyPaths);
+         }
+         try {
+-          if (!bypass) {
+-            map = region.bulkLoadHFiles(familyPaths, request.getAssignSeqNum(), null,
+-                request.getCopyFile());
+-            if (map != null) {
+-              loaded = true;
+-            }
++          map = region.bulkLoadHFiles(familyPaths, request.getAssignSeqNum(), null,
++              request.getCopyFile());
++          if (map != null) {
++            loaded = true;
+           }
+         } finally {
+           if (region.getCoprocessorHost() != null) {
+@@ -2731,8 +2728,8 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+           ByteArrayComparable comparator =
+             ProtobufUtil.toComparator(condition.getComparator());
+           if (region.getCoprocessorHost() != null) {
+-            processed = region.getCoprocessorHost().preCheckAndPut(
+-              row, family, qualifier, compareOp, comparator, put);
++            processed = region.getCoprocessorHost().preCheckAndPut(row, family, qualifier,
++                compareOp, comparator, put);
+           }
+           if (processed == null) {
+             boolean result = region.checkAndMutate(row, family,
+@@ -2762,8 +2759,8 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+           ByteArrayComparable comparator =
+             ProtobufUtil.toComparator(condition.getComparator());
+           if (region.getCoprocessorHost() != null) {
+-            processed = region.getCoprocessorHost().preCheckAndDelete(
+-              row, family, qualifier, op, comparator, delete);
++            processed = region.getCoprocessorHost().preCheckAndDelete(row, family, qualifier, op,
++                comparator, delete);
+           }
+           if (processed == null) {
+             boolean result = region.checkAndMutate(row, family,
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionCoprocessorHost.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionCoprocessorHost.java
+index c242fd1850..e03228c5fd 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionCoprocessorHost.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionCoprocessorHost.java
+@@ -474,14 +474,23 @@ public class RegionCoprocessorHost
+   private ObserverGetter<RegionCoprocessor, EndpointObserver> endpointObserverGetter =
+       RegionCoprocessor::getEndpointObserver;
+ 
+-  abstract class RegionObserverOperation extends ObserverOperationWithoutResult<RegionObserver> {
+-    public RegionObserverOperation() {
++  abstract class RegionObserverOperationWithoutResult extends
++      ObserverOperationWithoutResult<RegionObserver> {
++    public RegionObserverOperationWithoutResult() {
+       super(regionObserverGetter);
+     }
+ 
+-    public RegionObserverOperation(User user) {
++    public RegionObserverOperationWithoutResult(User user) {
+       super(regionObserverGetter, user);
+     }
++
++    public RegionObserverOperationWithoutResult(boolean bypassable) {
++      super(regionObserverGetter, null, bypassable);
++    }
++
++    public RegionObserverOperationWithoutResult(User user, boolean bypassable) {
++      super(regionObserverGetter, user, bypassable);
++    }
+   }
+ 
+   abstract class BulkLoadObserverOperation extends
+@@ -506,7 +515,8 @@ public class RegionCoprocessorHost
+    * @throws IOException Signals that an I/O exception has occurred.
+    */
+   public void preOpen() throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preOpen(this);
+@@ -519,8 +529,9 @@ public class RegionCoprocessorHost
+    * Invoked after a region open
+    */
+   public void postOpen() {
++    if (coprocEnvironments.isEmpty()) return;
+     try {
+-      execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++      execOperation(new RegionObserverOperationWithoutResult() {
+         @Override
+         public void call(RegionObserver observer) throws IOException {
+           observer.postOpen(this);
+@@ -535,8 +546,9 @@ public class RegionCoprocessorHost
+    * Invoked after log replay on region
+    */
+   public void postLogReplay() {
++    if (coprocEnvironments.isEmpty()) return;
+     try {
+-      execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++      execOperation(new RegionObserverOperationWithoutResult() {
+         @Override
+         public void call(RegionObserver observer) throws IOException {
+           observer.postLogReplay(this);
+@@ -552,7 +564,7 @@ public class RegionCoprocessorHost
+    * @param abortRequested true if the server is aborting
+    */
+   public void preClose(final boolean abortRequested) throws IOException {
+-    execOperation(false, new RegionObserverOperation() {
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preClose(this, abortRequested);
+@@ -566,7 +578,7 @@ public class RegionCoprocessorHost
+    */
+   public void postClose(final boolean abortRequested) {
+     try {
+-      execOperation(false, new RegionObserverOperation() {
++      execOperation(new RegionObserverOperationWithoutResult() {
+         @Override
+         public void call(RegionObserver observer) throws IOException {
+           observer.postClose(this, abortRequested);
+@@ -589,12 +601,12 @@ public class RegionCoprocessorHost
+    * @param candidates The currently available store files
+    * @param tracker used to track the life cycle of a compaction
+    * @param user the user
+-   * @return If {@code true}, skip the normal selection process and use the current list
+    * @throws IOException
+    */
+-  public boolean preCompactSelection(final HStore store, final List<HStoreFile> candidates,
++  public void preCompactSelection(final HStore store, final List<HStoreFile> candidates,
+       final CompactionLifeCycleTracker tracker, final User user) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation(user) {
++    if(coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult(user) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preCompactSelection(this, store, candidates, tracker);
+@@ -614,7 +626,8 @@ public class RegionCoprocessorHost
+   public void postCompactSelection(final HStore store, final List<HStoreFile> selected,
+       final CompactionLifeCycleTracker tracker, final CompactionRequest request,
+       final User user) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation(user) {
++    if (coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult(user) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postCompactSelection(this, store, selected, tracker, request);
+@@ -632,12 +645,15 @@ public class RegionCoprocessorHost
+    * @param user the user
+    * @throws IOException
+    */
++  // A Coprocessor can return null to cancel Compact. Leaving for now but this is a form of 'bypass'.
+   public InternalScanner preCompact(final HStore store, final InternalScanner scanner,
+       final ScanType scanType, final CompactionLifeCycleTracker tracker,
+       final CompactionRequest request, final User user) throws IOException {
+-    return execOperationWithResult(false, scanner, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, InternalScanner>(
+-            regionObserverGetter, user) {
++    InternalScanner defaultResult = scanner;
++    if (coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, InternalScanner>(regionObserverGetter,
++            defaultResult, user) {
+           @Override
+           public InternalScanner call(RegionObserver observer) throws IOException {
+             return observer.preCompact(this, store, getResult(), scanType, tracker, request);
+@@ -657,7 +673,7 @@ public class RegionCoprocessorHost
+   public void postCompact(final HStore store, final HStoreFile resultFile,
+       final CompactionLifeCycleTracker tracker, final CompactionRequest request, final User user)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation(user) {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult(user) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postCompact(this, store, resultFile, tracker, request);
+@@ -669,10 +685,12 @@ public class RegionCoprocessorHost
+    * Invoked before a memstore flush
+    * @throws IOException
+    */
++  // A Coprocessor can return null to cancel Flush. Leaving for now but this is a form of 'bypass'.
+   public InternalScanner preFlush(HStore store, InternalScanner scanner,
+       FlushLifeCycleTracker tracker) throws IOException {
+-    return execOperationWithResult(false, scanner, coprocEnvironments.isEmpty() ? null
+-        : new ObserverOperationWithResult<RegionObserver, InternalScanner>(regionObserverGetter) {
++    if (coprocEnvironments.isEmpty()) return scanner;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, InternalScanner>(regionObserverGetter, scanner) {
+           @Override
+           public InternalScanner call(RegionObserver observer) throws IOException {
+             return observer.preFlush(this, store, getResult(), tracker);
+@@ -685,7 +703,7 @@ public class RegionCoprocessorHost
+    * @throws IOException
+    */
+   public void preFlush(FlushLifeCycleTracker tracker) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preFlush(this, tracker);
+@@ -698,7 +716,7 @@ public class RegionCoprocessorHost
+    * @throws IOException
+    */
+   public void postFlush(FlushLifeCycleTracker tracker) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postFlush(this, tracker);
+@@ -712,7 +730,7 @@ public class RegionCoprocessorHost
+    */
+   public void postFlush(HStore store, HStoreFile storeFile, FlushLifeCycleTracker tracker)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postFlush(this, store, storeFile, tracker);
+@@ -722,13 +740,16 @@ public class RegionCoprocessorHost
+ 
+   // RegionObserver support
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param get the Get request
+-   * @return true if default processing should be bypassed
++   * @param results What to return if return is true/'bypass'.
++   * @return true if default processing should be bypassed.
+    * @exception IOException Exception
+    */
+-  public boolean preGet(final Get get, final List<Cell> results)
+-      throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++  public boolean preGet(final Get get, final List<Cell> results) throws IOException {
++    if (coprocEnvironments.isEmpty()) return false;
++    boolean bypassable = true;
++    return execOperation(new RegionObserverOperationWithoutResult(bypassable) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preGetOp(this, get, results);
+@@ -738,12 +759,13 @@ public class RegionCoprocessorHost
+ 
+   /**
+    * @param get the Get request
+-   * @param results the result sett
++   * @param results the result set
+    * @exception IOException Exception
+    */
+   public void postGet(final Get get, final List<Cell> results)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postGetOp(this, get, results);
+@@ -752,14 +774,18 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param get the Get request
+-   * @return true or false to return to client if bypassing normal operation,
+-   * or null otherwise
++   * @return true or false to return to client if bypassing normal operation, or null otherwise
+    * @exception IOException Exception
+    */
+   public Boolean preExists(final Get get) throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: false;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preExists(this, get, getResult());
+@@ -769,14 +795,15 @@ public class RegionCoprocessorHost
+ 
+   /**
+    * @param get the Get request
+-   * @param exists the result returned by the region server
++   * @param result the result returned by the region server
+    * @return the result to return to the client
+    * @exception IOException Exception
+    */
+-  public boolean postExists(final Get get, boolean exists)
++  public boolean postExists(final Get get, boolean result)
+       throws IOException {
+-    return execOperationWithResult(exists, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, result) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postExists(this, get, getResult());
+@@ -785,6 +812,7 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param put The Put object
+    * @param edit The WALEdit object.
+    * @param durability The durability used
+@@ -793,7 +821,9 @@ public class RegionCoprocessorHost
+    */
+   public boolean prePut(final Put put, final WALEdit edit, final Durability durability)
+       throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return false;
++    boolean bypassable = true;
++    return execOperation(new RegionObserverOperationWithoutResult(bypassable) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.prePut(this, put, edit, durability);
+@@ -802,21 +832,25 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param mutation - the current mutation
+    * @param kv - the current cell
+    * @param byteNow - current timestamp in bytes
+    * @param get - the get that could be used
+    * Note that the get only does not specify the family and qualifier that should be used
+    * @return true if default processing should be bypassed
+-   * @exception IOException
+-   *              Exception
++   * @deprecated In hbase-2.0.0. Will be removed in hbase-3.0.0. Added explicitly for a single
++   * Coprocessor for its needs only. Will be removed.
+    */
++  @Deprecated
+   public boolean prePrepareTimeStampForDeleteVersion(final Mutation mutation,
+       final Cell kv, final byte[] byteNow, final Get get) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return false;
++    boolean bypassable = true;
++    return execOperation(new RegionObserverOperationWithoutResult(bypassable) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+-        observer.prePrepareTimeStampForDeleteVersion(this, mutation, kv, byteNow, get);
++          observer.prePrepareTimeStampForDeleteVersion(this, mutation, kv, byteNow, get);
+       }
+     });
+   }
+@@ -829,7 +863,8 @@ public class RegionCoprocessorHost
+    */
+   public void postPut(final Put put, final WALEdit edit, final Durability durability)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postPut(this, put, edit, durability);
+@@ -838,6 +873,7 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param delete The Delete object
+    * @param edit The WALEdit object.
+    * @param durability The durability used
+@@ -846,10 +882,12 @@ public class RegionCoprocessorHost
+    */
+   public boolean preDelete(final Delete delete, final WALEdit edit, final Durability durability)
+       throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (this.coprocEnvironments.isEmpty()) return false;
++    boolean bypassable = true;
++    return execOperation(new RegionObserverOperationWithoutResult(bypassable) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+-        observer.preDelete(this, delete, edit, durability);
++         observer.preDelete(this, delete, edit, durability);
+       }
+     });
+   }
+@@ -862,7 +900,8 @@ public class RegionCoprocessorHost
+    */
+   public void postDelete(final Delete delete, final WALEdit edit, final Durability durability)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postDelete(this, delete, edit, durability);
+@@ -870,14 +909,10 @@ public class RegionCoprocessorHost
+     });
+   }
+ 
+-  /**
+-   * @param miniBatchOp
+-   * @return true if default processing should be bypassed
+-   * @throws IOException
+-   */
+-  public boolean preBatchMutate(
++  public void preBatchMutate(
+       final MiniBatchOperationInProgress<Mutation> miniBatchOp) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (this.coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preBatchMutate(this, miniBatchOp);
+@@ -885,13 +920,10 @@ public class RegionCoprocessorHost
+     });
+   }
+ 
+-  /**
+-   * @param miniBatchOp
+-   * @throws IOException
+-   */
+   public void postBatchMutate(
+       final MiniBatchOperationInProgress<Mutation> miniBatchOp) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (this.coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postBatchMutate(this, miniBatchOp);
+@@ -902,7 +934,8 @@ public class RegionCoprocessorHost
+   public void postBatchMutateIndispensably(
+       final MiniBatchOperationInProgress<Mutation> miniBatchOp, final boolean success)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    if (this.coprocEnvironments.isEmpty()) return;
++    execOperation(new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postBatchMutateIndispensably(this, miniBatchOp, success);
+@@ -911,22 +944,26 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param row row to check
+    * @param family column family
+    * @param qualifier column qualifier
+    * @param op the comparison operation
+    * @param comparator the comparator
+    * @param put data to put if check succeeds
+-   * @return true or false to return to client if default processing should
+-   * be bypassed, or null otherwise
+-   * @throws IOException e
++   * @return true or false to return to client if default processing should be bypassed, or null
++   * otherwise
+    */
+   public Boolean preCheckAndPut(final byte [] row, final byte [] family,
+       final byte [] qualifier, final CompareOperator op,
+       final ByteArrayComparable comparator, final Put put)
+       throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult,  bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preCheckAndPut(this, row, family, qualifier,
+@@ -936,21 +973,25 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param row row to check
+    * @param family column family
+    * @param qualifier column qualifier
+    * @param op the comparison operation
+    * @param comparator the comparator
+    * @param put data to put if check succeeds
+-   * @return true or false to return to client if default processing should
+-   * be bypassed, or null otherwise
+-   * @throws IOException e
++   * @return true or false to return to client if default processing should be bypassed, or null
++   * otherwise
+    */
+   public Boolean preCheckAndPutAfterRowLock(
+       final byte[] row, final byte[] family, final byte[] qualifier, final CompareOperator op,
+       final ByteArrayComparable comparator, final Put put) throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preCheckAndPutAfterRowLock(this, row, family, qualifier,
+@@ -972,8 +1013,9 @@ public class RegionCoprocessorHost
+       final byte [] qualifier, final CompareOperator op,
+       final ByteArrayComparable comparator, final Put put,
+       boolean result) throws IOException {
+-    return execOperationWithResult(result, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, result) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postCheckAndPut(this, row, family, qualifier,
+@@ -983,22 +1025,26 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param row row to check
+    * @param family column family
+    * @param qualifier column qualifier
+    * @param op the comparison operation
+    * @param comparator the comparator
+    * @param delete delete to commit if check succeeds
+-   * @return true or false to return to client if default processing should
+-   * be bypassed, or null otherwise
+-   * @throws IOException e
++   * @return true or false to return to client if default processing should be bypassed,
++   * or null otherwise
+    */
+   public Boolean preCheckAndDelete(final byte [] row, final byte [] family,
+       final byte [] qualifier, final CompareOperator op,
+       final ByteArrayComparable comparator, final Delete delete)
+       throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preCheckAndDelete(this, row, family,
+@@ -1008,21 +1054,25 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param row row to check
+    * @param family column family
+    * @param qualifier column qualifier
+    * @param op the comparison operation
+    * @param comparator the comparator
+    * @param delete delete to commit if check succeeds
+-   * @return true or false to return to client if default processing should
+-   * be bypassed, or null otherwise
+-   * @throws IOException e
++   * @return true or false to return to client if default processing should be bypassed,
++   * or null otherwise
+    */
+   public Boolean preCheckAndDeleteAfterRowLock(final byte[] row, final byte[] family,
+       final byte[] qualifier, final CompareOperator op, final ByteArrayComparable comparator,
+       final Delete delete) throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preCheckAndDeleteAfterRowLock(this, row,
+@@ -1044,8 +1094,9 @@ public class RegionCoprocessorHost
+       final byte [] qualifier, final CompareOperator op,
+       final ByteArrayComparable comparator, final Delete delete,
+       boolean result) throws IOException {
+-    return execOperationWithResult(result, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, result) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postCheckAndDelete(this, row, family,
+@@ -1055,14 +1106,18 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param append append object
+-   * @return result to return to client if default operation should be
+-   * bypassed, null otherwise
++   * @return result to return to client if default operation should be bypassed, null otherwise
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result preAppend(final Append append) throws IOException {
+-    return execOperationWithResult(true, null, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    boolean bypassable = true;
++    Result defaultResult = null;
++    if (this.coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++      new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter, defaultResult,
++            bypassable) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.preAppend(this, append);
+@@ -1071,14 +1126,18 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param append append object
+-   * @return result to return to client if default operation should be
+-   * bypassed, null otherwise
++   * @return result to return to client if default operation should be bypassed, null otherwise
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result preAppendAfterRowLock(final Append append) throws IOException {
+-    return execOperationWithResult(true, null, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    boolean bypassable = true;
++    Result defaultResult = null;
++    if (this.coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.preAppendAfterRowLock(this, append);
+@@ -1087,14 +1146,18 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param increment increment object
+-   * @return result to return to client if default operation should be
+-   * bypassed, null otherwise
++   * @return result to return to client if default operation should be bypassed, null otherwise
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result preIncrement(final Increment increment) throws IOException {
+-    return execOperationWithResult(true, null, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    boolean bypassable = true;
++    Result defaultResult = null;
++    if (coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter, defaultResult,
++            bypassable) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.preIncrement(this, increment);
+@@ -1103,14 +1166,18 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param increment increment object
+-   * @return result to return to client if default operation should be
+-   * bypassed, null otherwise
++   * @return result to return to client if default operation should be bypassed, null otherwise
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result preIncrementAfterRowLock(final Increment increment) throws IOException {
+-    return execOperationWithResult(true, null, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    boolean bypassable = true;
++    Result defaultResult = null;
++    if (coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter, defaultResult,
++            bypassable) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.preIncrementAfterRowLock(this, increment);
+@@ -1124,8 +1191,9 @@ public class RegionCoprocessorHost
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result postAppend(final Append append, final Result result) throws IOException {
+-    return execOperationWithResult(result, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter, result) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.postAppend(this, append, result);
+@@ -1139,8 +1207,9 @@ public class RegionCoprocessorHost
+    * @throws IOException if an error occurred on the coprocessor
+    */
+   public Result postIncrement(final Increment increment, Result result) throws IOException {
+-    return execOperationWithResult(result, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Result>(regionObserverGetter, result) {
+           @Override
+           public Result call(RegionObserver observer) throws IOException {
+             return observer.postIncrement(this, increment, getResult());
+@@ -1153,7 +1222,7 @@ public class RegionCoprocessorHost
+    * @exception IOException Exception
+    */
+   public void preScannerOpen(final Scan scan) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preScannerOpen(this, scan);
+@@ -1168,8 +1237,9 @@ public class RegionCoprocessorHost
+    * @exception IOException Exception
+    */
+   public RegionScanner postScannerOpen(final Scan scan, RegionScanner s) throws IOException {
+-    return execOperationWithResult(s, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, RegionScanner>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return s;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, RegionScanner>(regionObserverGetter, s) {
+           @Override
+           public RegionScanner call(RegionObserver observer) throws IOException {
+             return observer.postScannerOpen(this, scan, getResult());
+@@ -1181,14 +1251,17 @@ public class RegionCoprocessorHost
+    * @param s the scanner
+    * @param results the result set returned by the region server
+    * @param limit the maximum number of results to return
+-   * @return 'has next' indication to client if bypassing default behavior, or
+-   * null otherwise
++   * @return 'has next' indication to client if bypassing default behavior, or null otherwise
+    * @exception IOException Exception
+    */
+   public Boolean preScannerNext(final InternalScanner s,
+       final List<Result> results, final int limit) throws IOException {
+-    return execOperationWithResult(true, false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean bypassable = true;
++    boolean defaultResult = false;
++    if (coprocEnvironments.isEmpty()) return bypassable?  null: defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter,
++            defaultResult, bypassable) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.preScannerNext(this, s, results, limit, getResult());
+@@ -1207,8 +1280,9 @@ public class RegionCoprocessorHost
+   public boolean postScannerNext(final InternalScanner s,
+       final List<Result> results, final int limit, boolean hasMore)
+       throws IOException {
+-    return execOperationWithResult(hasMore, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return hasMore;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, hasMore) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postScannerNext(this, s, results, limit, getResult());
+@@ -1227,9 +1301,11 @@ public class RegionCoprocessorHost
+   public boolean postScannerFilterRow(final InternalScanner s, final Cell curRowCell)
+       throws IOException {
+     // short circuit for performance
+-    if (!hasCustomPostScannerFilterRow) return true;
+-    return execOperationWithResult(true, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++    boolean defaultResult = true;
++    if (!hasCustomPostScannerFilterRow) return defaultResult;
++    if (this.coprocEnvironments.isEmpty()) return defaultResult;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, defaultResult) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postScannerFilterRow(this, s, curRowCell, getResult());
+@@ -1238,12 +1314,15 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param s the scanner
+    * @return true if default behavior should be bypassed, false otherwise
+    * @exception IOException Exception
+    */
++  // Should this be bypassable?
+   public boolean preScannerClose(final InternalScanner s) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    return execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult(true) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preScannerClose(this, s);
+@@ -1255,7 +1334,8 @@ public class RegionCoprocessorHost
+    * @exception IOException Exception
+    */
+   public void postScannerClose(final InternalScanner s) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postScannerClose(this, s);
+@@ -1264,12 +1344,14 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
++   * Supports Coprocessor 'bypass'.
+    * @param info the RegionInfo for this region
+    * @param edits the file of recovered edits
+-   * @throws IOException Exception
++   * @return true if default behavior should be bypassed, false otherwise
+    */
+-  public void preReplayWALs(final RegionInfo info, final Path edits) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++  public boolean preReplayWALs(final RegionInfo info, final Path edits) throws IOException {
++    return execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult(true) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preReplayWALs(this, info, edits);
+@@ -1283,7 +1365,8 @@ public class RegionCoprocessorHost
+    * @throws IOException Exception
+    */
+   public void postReplayWALs(final RegionInfo info, final Path edits) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postReplayWALs(this, info, edits);
+@@ -1292,15 +1375,16 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
+-   * @param info
+-   * @param logKey
+-   * @param logEdit
++   * Supports Coprocessor 'bypass'.
+    * @return true if default behavior should be bypassed, false otherwise
+-   * @throws IOException
++   * @deprecated Since hbase-2.0.0. No replacement. To be removed in hbase-3.0.0 and replaced
++   * with something that doesn't expose IntefaceAudience.Private classes.
+    */
+-  public boolean preWALRestore(final RegionInfo info, final WALKey logKey,
+-      final WALEdit logEdit) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++  @Deprecated
++  public boolean preWALRestore(final RegionInfo info, final WALKey logKey, final WALEdit logEdit)
++      throws IOException {
++    return execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult(true) {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preWALRestore(this, info, logKey, logEdit);
+@@ -1309,14 +1393,14 @@ public class RegionCoprocessorHost
+   }
+ 
+   /**
+-   * @param info
+-   * @param logKey
+-   * @param logEdit
+-   * @throws IOException
++   * @deprecated Since hbase-2.0.0. No replacement. To be removed in hbase-3.0.0 and replaced
++   * with something that doesn't expose IntefaceAudience.Private classes.
+    */
++  @Deprecated
+   public void postWALRestore(final RegionInfo info, final WALKey logKey, final WALEdit logEdit)
+       throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postWALRestore(this, info, logKey, logEdit);
+@@ -1326,11 +1410,9 @@ public class RegionCoprocessorHost
+ 
+   /**
+    * @param familyPaths pairs of { CF, file path } submitted for bulk load
+-   * @return true if the default operation should be bypassed
+-   * @throws IOException
+    */
+-  public boolean preBulkLoadHFile(final List<Pair<byte[], String>> familyPaths) throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++  public void preBulkLoadHFile(final List<Pair<byte[], String>> familyPaths) throws IOException {
++    execOperation(coprocEnvironments.isEmpty()? null: new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preBulkLoadHFile(this, familyPaths);
+@@ -1340,7 +1422,8 @@ public class RegionCoprocessorHost
+ 
+   public boolean preCommitStoreFile(final byte[] family, final List<Pair<Path, Path>> pairs)
+       throws IOException {
+-    return execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    return execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.preCommitStoreFile(this, family, pairs);
+@@ -1348,7 +1431,8 @@ public class RegionCoprocessorHost
+     });
+   }
+   public void postCommitStoreFile(final byte[] family, Path srcPath, Path dstPath) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postCommitStoreFile(this, family, srcPath, dstPath);
+@@ -1359,14 +1443,15 @@ public class RegionCoprocessorHost
+   /**
+    * @param familyPaths pairs of { CF, file path } submitted for bulk load
+    * @param map Map of CF to List of file paths for the final loaded files
+-   * @param hasLoaded whether load was successful or not
++   * @param result whether load was successful or not
+    * @return the possibly modified value of hasLoaded
+    * @throws IOException
+    */
+   public boolean postBulkLoadHFile(final List<Pair<byte[], String>> familyPaths,
+-      Map<byte[], List<Path>> map, boolean hasLoaded) throws IOException {
+-    return execOperationWithResult(hasLoaded, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter) {
++      Map<byte[], List<Path>> map, boolean result) throws IOException {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Boolean>(regionObserverGetter, result) {
+           @Override
+           public Boolean call(RegionObserver observer) throws IOException {
+             return observer.postBulkLoadHFile(this, familyPaths, map, getResult());
+@@ -1375,7 +1460,8 @@ public class RegionCoprocessorHost
+   }
+ 
+   public void postStartRegionOperation(final Operation op) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postStartRegionOperation(this, op);
+@@ -1384,7 +1470,8 @@ public class RegionCoprocessorHost
+   }
+ 
+   public void postCloseRegionOperation(final Operation op) throws IOException {
+-    execOperation(coprocEnvironments.isEmpty() ? null : new RegionObserverOperation() {
++    execOperation(coprocEnvironments.isEmpty()? null:
++        new RegionObserverOperationWithoutResult() {
+       @Override
+       public void call(RegionObserver observer) throws IOException {
+         observer.postCloseRegionOperation(this, op);
+@@ -1406,8 +1493,9 @@ public class RegionCoprocessorHost
+   public StoreFileReader preStoreFileReaderOpen(final FileSystem fs, final Path p,
+       final FSDataInputStreamWrapper in, final long size, final CacheConfig cacheConf,
+       final Reference r) throws IOException {
+-    return execOperationWithResult(null, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, StoreFileReader>(regionObserverGetter) {
++    if (coprocEnvironments.isEmpty()) return null;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, StoreFileReader>(regionObserverGetter, null) {
+           @Override
+           public StoreFileReader call(RegionObserver observer) throws IOException {
+             return observer.preStoreFileReaderOpen(this, fs, p, in, size, cacheConf, r,
+@@ -1430,8 +1518,9 @@ public class RegionCoprocessorHost
+   public StoreFileReader postStoreFileReaderOpen(final FileSystem fs, final Path p,
+       final FSDataInputStreamWrapper in, final long size, final CacheConfig cacheConf,
+       final Reference r, final StoreFileReader reader) throws IOException {
+-    return execOperationWithResult(reader, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, StoreFileReader>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return reader;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, StoreFileReader>(regionObserverGetter, reader) {
+           @Override
+           public StoreFileReader call(RegionObserver observer) throws IOException {
+             return observer.postStoreFileReaderOpen(this, fs, p, in, size, cacheConf, r,
+@@ -1442,8 +1531,9 @@ public class RegionCoprocessorHost
+ 
+   public Cell postMutationBeforeWAL(final MutationType opType, final Mutation mutation,
+       final Cell oldCell, Cell newCell) throws IOException {
+-    return execOperationWithResult(newCell, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, Cell>(regionObserverGetter) {
++    if (this.coprocEnvironments.isEmpty()) return newCell;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, Cell>(regionObserverGetter, newCell) {
+           @Override
+           public Cell call(RegionObserver observer) throws IOException {
+             return observer.postMutationBeforeWAL(this, opType, mutation, oldCell, getResult());
+@@ -1453,8 +1543,9 @@ public class RegionCoprocessorHost
+ 
+   public Message preEndpointInvocation(final Service service, final String methodName,
+       Message request) throws IOException {
+-    return execOperationWithResult(request, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<EndpointObserver, Message>(endpointObserverGetter) {
++    if (coprocEnvironments.isEmpty()) return request;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<EndpointObserver, Message>(endpointObserverGetter, request) {
+           @Override
+           public Message call(EndpointObserver observer) throws IOException {
+             return observer.preEndpointInvocation(this, service, methodName, getResult());
+@@ -1473,9 +1564,14 @@ public class RegionCoprocessorHost
+         });
+   }
+ 
+-  public DeleteTracker postInstantiateDeleteTracker(DeleteTracker tracker) throws IOException {
+-    return execOperationWithResult(tracker, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<RegionObserver, DeleteTracker>(regionObserverGetter) {
++  /**
++   * @deprecated Since 2.0 with out any replacement and will be removed in 3.0
++   */
++  @Deprecated
++  public DeleteTracker postInstantiateDeleteTracker(DeleteTracker result) throws IOException {
++    if (this.coprocEnvironments.isEmpty()) return result;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<RegionObserver, DeleteTracker>(regionObserverGetter, result) {
+           @Override
+           public DeleteTracker call(RegionObserver observer) throws IOException {
+             return observer.postInstantiateDeleteTracker(this, getResult());
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerCoprocessorHost.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerCoprocessorHost.java
+index 27a3e201ea..39047b3e55 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerCoprocessorHost.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerCoprocessorHost.java
+@@ -115,7 +115,8 @@ public class RegionServerCoprocessorHost extends
+   public void preStop(String message, User user) throws IOException {
+     // While stopping the region server all coprocessors method should be executed first then the
+     // coprocessor should be cleaned up.
+-    execShutdown(coprocEnvironments.isEmpty() ? null : new RegionServerObserverOperation(user) {
++    if (coprocEnvironments.isEmpty()) return;
++    execShutdown(new RegionServerObserverOperation(user) {
+       @Override
+       public void call(RegionServerObserver observer) throws IOException {
+         observer.preStopRegionServer(this);
+@@ -169,9 +170,10 @@ public class RegionServerCoprocessorHost extends
+ 
+   public ReplicationEndpoint postCreateReplicationEndPoint(final ReplicationEndpoint endpoint)
+       throws IOException {
+-    return execOperationWithResult(endpoint, coprocEnvironments.isEmpty() ? null :
++    if (this.coprocEnvironments.isEmpty()) return endpoint;
++    return execOperationWithResult(
+         new ObserverOperationWithResult<RegionServerObserver, ReplicationEndpoint>(
+-            rsObserverGetter) {
++            rsObserverGetter, endpoint) {
+       @Override
+       public ReplicationEndpoint call(RegionServerObserver observer) throws IOException {
+         return observer.postCreateReplicationEndPoint(this, getResult());
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java
+index 653ec75394..6ce44fe859 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SecureBulkLoadManager.java
+@@ -192,57 +192,54 @@ public class SecureBulkLoadManager {
+       throw new DoNotRetryIOException("User token cannot be null");
+     }
+ 
+-    boolean bypass = false;
+     if (region.getCoprocessorHost() != null) {
+-        bypass = region.getCoprocessorHost().preBulkLoadHFile(familyPaths);
++      region.getCoprocessorHost().preBulkLoadHFile(familyPaths);
+     }
+     boolean loaded = false;
+     Map<byte[], List<Path>> map = null;
+ 
+     try {
+-      if (!bypass) {
+-        // Get the target fs (HBase region server fs) delegation token
+-        // Since we have checked the permission via 'preBulkLoadHFile', now let's give
+-        // the 'request user' necessary token to operate on the target fs.
+-        // After this point the 'doAs' user will hold two tokens, one for the source fs
+-        // ('request user'), another for the target fs (HBase region server principal).
+-        if (userProvider.isHadoopSecurityEnabled()) {
+-          FsDelegationToken targetfsDelegationToken = new FsDelegationToken(userProvider,"renewer");
+-          targetfsDelegationToken.acquireDelegationToken(fs);
+-
+-          Token<?> targetFsToken = targetfsDelegationToken.getUserToken();
+-          if (targetFsToken != null
+-              && (userToken == null || !targetFsToken.getService().equals(userToken.getService()))){
+-            ugi.addToken(targetFsToken);
+-          }
++      // Get the target fs (HBase region server fs) delegation token
++      // Since we have checked the permission via 'preBulkLoadHFile', now let's give
++      // the 'request user' necessary token to operate on the target fs.
++      // After this point the 'doAs' user will hold two tokens, one for the source fs
++      // ('request user'), another for the target fs (HBase region server principal).
++      if (userProvider.isHadoopSecurityEnabled()) {
++        FsDelegationToken targetfsDelegationToken = new FsDelegationToken(userProvider,"renewer");
++        targetfsDelegationToken.acquireDelegationToken(fs);
++
++        Token<?> targetFsToken = targetfsDelegationToken.getUserToken();
++        if (targetFsToken != null
++            && (userToken == null || !targetFsToken.getService().equals(userToken.getService()))){
++          ugi.addToken(targetFsToken);
+         }
++      }
+ 
+-        map = ugi.doAs(new PrivilegedAction<Map<byte[], List<Path>>>() {
+-          @Override
+-          public Map<byte[], List<Path>> run() {
+-            FileSystem fs = null;
+-            try {
+-              fs = FileSystem.get(conf);
+-              for(Pair<byte[], String> el: familyPaths) {
+-                Path stageFamily = new Path(bulkToken, Bytes.toString(el.getFirst()));
+-                if(!fs.exists(stageFamily)) {
+-                  fs.mkdirs(stageFamily);
+-                  fs.setPermission(stageFamily, PERM_ALL_ACCESS);
+-                }
++      map = ugi.doAs(new PrivilegedAction<Map<byte[], List<Path>>>() {
++        @Override
++        public Map<byte[], List<Path>> run() {
++          FileSystem fs = null;
++          try {
++            fs = FileSystem.get(conf);
++            for(Pair<byte[], String> el: familyPaths) {
++              Path stageFamily = new Path(bulkToken, Bytes.toString(el.getFirst()));
++              if(!fs.exists(stageFamily)) {
++                fs.mkdirs(stageFamily);
++                fs.setPermission(stageFamily, PERM_ALL_ACCESS);
+               }
+-              //We call bulkLoadHFiles as requesting user
+-              //To enable access prior to staging
+-              return region.bulkLoadHFiles(familyPaths, true,
+-                  new SecureBulkLoadListener(fs, bulkToken, conf), request.getCopyFile());
+-            } catch (Exception e) {
+-              LOG.error("Failed to complete bulk load", e);
+             }
+-            return null;
++            //We call bulkLoadHFiles as requesting user
++            //To enable access prior to staging
++            return region.bulkLoadHFiles(familyPaths, true,
++                new SecureBulkLoadListener(fs, bulkToken, conf), request.getCopyFile());
++          } catch (Exception e) {
++            LOG.error("Failed to complete bulk load", e);
+           }
+-        });
+-        if (map != null) {
+-          loaded = true;
++          return null;
+         }
++      });
++      if (map != null) {
++        loaded = true;
+       }
+     } finally {
+       if (region.getCoprocessorHost() != null) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALCoprocessorHost.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALCoprocessorHost.java
+index 34f93fa9e2..72f3f4221f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALCoprocessorHost.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALCoprocessorHost.java
+@@ -141,16 +141,15 @@ public class WALCoprocessorHost
+ 
+ 
+   /**
+-   * @param info
+-   * @param logKey
+-   * @param logEdit
+    * @return true if default behavior should be bypassed, false otherwise
+    * @throws IOException
+    */
+   public boolean preWALWrite(final RegionInfo info, final WALKey logKey, final WALEdit logEdit)
+       throws IOException {
+-    return execOperationWithResult(false, coprocEnvironments.isEmpty() ? null :
+-        new ObserverOperationWithResult<WALObserver, Boolean>(walObserverGetter) {
++    // Not bypassable.
++    if (this.coprocEnvironments.isEmpty()) return false;
++    return execOperationWithResult(
++        new ObserverOperationWithResult<WALObserver, Boolean>(walObserverGetter, false) {
+       @Override
+       public Boolean call(WALObserver oserver) throws IOException {
+         return oserver.preWALWrite(this, info, logKey, logEdit);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
+index e9a56bd956..6f96ce149b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestMasterObserver.java
+@@ -301,9 +301,6 @@ public class TestMasterObserver {
+     @Override
+     public void preCreateTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableDescriptor desc, RegionInfo[] regions) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preCreateTableCalled = true;
+     }
+ 
+@@ -324,9 +321,6 @@ public class TestMasterObserver {
+     @Override
+     public void preDeleteTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableName tableName) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preDeleteTableCalled = true;
+     }
+ 
+@@ -347,9 +341,6 @@ public class TestMasterObserver {
+     @Override
+     public void preTruncateTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableName tableName) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preTruncateTableCalled = true;
+     }
+ 
+@@ -381,9 +372,6 @@ public class TestMasterObserver {
+     @Override
+     public void preModifyTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableName tableName, TableDescriptor htd) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preModifyTableCalled = true;
+     }
+ 
+@@ -404,9 +392,6 @@ public class TestMasterObserver {
+     @Override
+     public void preCreateNamespace(ObserverContext<MasterCoprocessorEnvironment> env,
+         NamespaceDescriptor ns) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preCreateNamespaceCalled = true;
+     }
+ 
+@@ -427,9 +412,6 @@ public class TestMasterObserver {
+     @Override
+     public void preDeleteNamespace(ObserverContext<MasterCoprocessorEnvironment> env,
+         String name) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preDeleteNamespaceCalled = true;
+     }
+ 
+@@ -450,9 +432,6 @@ public class TestMasterObserver {
+     @Override
+     public void preModifyNamespace(ObserverContext<MasterCoprocessorEnvironment> env,
+         NamespaceDescriptor ns) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preModifyNamespaceCalled = true;
+     }
+ 
+@@ -490,9 +469,6 @@ public class TestMasterObserver {
+     @Override
+     public void preListNamespaceDescriptors(ObserverContext<MasterCoprocessorEnvironment> env,
+         List<NamespaceDescriptor> descriptors) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preListNamespaceDescriptorsCalled = true;
+     }
+ 
+@@ -513,9 +489,6 @@ public class TestMasterObserver {
+     @Override
+     public void preEnableTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableName tableName) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preEnableTableCalled = true;
+     }
+ 
+@@ -536,9 +509,6 @@ public class TestMasterObserver {
+     @Override
+     public void preDisableTable(ObserverContext<MasterCoprocessorEnvironment> env,
+         TableName tableName) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preDisableTableCalled = true;
+     }
+ 
+@@ -619,9 +589,6 @@ public class TestMasterObserver {
+     public void preMove(ObserverContext<MasterCoprocessorEnvironment> env,
+         RegionInfo region, ServerName srcServer, ServerName destServer)
+     throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preMoveCalled = true;
+     }
+ 
+@@ -643,9 +610,6 @@ public class TestMasterObserver {
+     @Override
+     public void preAssign(ObserverContext<MasterCoprocessorEnvironment> env,
+         final RegionInfo regionInfo) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preAssignCalled = true;
+     }
+ 
+@@ -666,9 +630,6 @@ public class TestMasterObserver {
+     @Override
+     public void preUnassign(ObserverContext<MasterCoprocessorEnvironment> env,
+         final RegionInfo regionInfo, final boolean force) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preUnassignCalled = true;
+     }
+ 
+@@ -709,9 +670,6 @@ public class TestMasterObserver {
+     @Override
+     public void preBalance(ObserverContext<MasterCoprocessorEnvironment> env)
+         throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preBalanceCalled = true;
+     }
+ 
+@@ -732,9 +690,6 @@ public class TestMasterObserver {
+     @Override
+     public boolean preBalanceSwitch(ObserverContext<MasterCoprocessorEnvironment> env, boolean b)
+         throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preBalanceSwitchCalled = true;
+       return b;
+     }
+@@ -898,9 +853,6 @@ public class TestMasterObserver {
+         final ObserverContext<MasterCoprocessorEnvironment> env,
+         final TableDescriptor desc,
+         final RegionInfo[] regions) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preCreateTableActionCalled = true;
+     }
+ 
+@@ -928,9 +880,6 @@ public class TestMasterObserver {
+     public void preDeleteTableAction(
+         final ObserverContext<MasterCoprocessorEnvironment> env, final TableName tableName)
+         throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preDeleteTableActionCalled = true;
+     }
+ 
+@@ -954,9 +903,6 @@ public class TestMasterObserver {
+     public void preTruncateTableAction(
+         final ObserverContext<MasterCoprocessorEnvironment> env, final TableName tableName)
+         throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preTruncateTableActionCalled = true;
+     }
+ 
+@@ -980,9 +926,6 @@ public class TestMasterObserver {
+         final ObserverContext<MasterCoprocessorEnvironment> env,
+         final TableName tableName,
+         final TableDescriptor htd) throws IOException {
+-      if (bypass) {
+-        env.bypass();
+-      }
+       preModifyTableActionCalled = true;
+     }
+ 
+@@ -1005,9 +948,6 @@ public class TestMasterObserver {
+     public void preEnableTableAction(
+         final ObserverContext<MasterCoprocessorEnvironment> ctx, final TableName tableName)
+         throws IOException {
+-      if (bypass) {
+-        ctx.bypass();
+-      }
+       preEnableTableActionCalled = true;
+     }
+ 
+@@ -1030,9 +970,6 @@ public class TestMasterObserver {
+     public void preDisableTableAction(
+         final ObserverContext<MasterCoprocessorEnvironment> ctx, final TableName tableName)
+         throws IOException {
+-      if (bypass) {
+-        ctx.bypass();
+-      }
+       preDisableTableActionCalled = true;
+     }
+ 
+@@ -1370,7 +1307,6 @@ public class TestMasterObserver {
+       admin.createTable(htd, Arrays.copyOfRange(HBaseTestingUtility.KEYS,
+         1, HBaseTestingUtility.KEYS.length));
+ 
+-      // preCreateTable can't bypass default action.
+       assertTrue("Test table should be created", cp.wasCreateTableCalled());
+       tableCreationLatch.await();
+       assertTrue("Table pre create handler called.", cp
+@@ -1389,7 +1325,6 @@ public class TestMasterObserver {
+       tableCreationLatch = new CountDownLatch(1);
+       admin.disableTable(tableName);
+       assertTrue(admin.isTableDisabled(tableName));
+-      // preDisableTable can't bypass default action.
+       assertTrue("Coprocessor should have been called on table disable",
+         cp.wasDisableTableCalled());
+       assertTrue("Disable table handler should be called.",
+@@ -1399,7 +1334,6 @@ public class TestMasterObserver {
+       assertFalse(cp.wasEnableTableCalled());
+       admin.enableTable(tableName);
+       assertTrue(admin.isTableEnabled(tableName));
+-      // preEnableTable can't bypass default action.
+       assertTrue("Coprocessor should have been called on table enable",
+         cp.wasEnableTableCalled());
+       assertTrue("Enable table handler should be called.",
+@@ -1411,7 +1345,6 @@ public class TestMasterObserver {
+       // modify table
+       htd.setMaxFileSize(512 * 1024 * 1024);
+       modifyTableSync(admin, tableName, htd);
+-      // preModifyTable can't bypass default action.
+       assertTrue("Test table should have been modified",
+         cp.wasModifyTableCalled());
+ 
+@@ -1424,7 +1357,6 @@ public class TestMasterObserver {
+       deleteTable(admin, tableName);
+       assertFalse("Test table should have been deleted",
+         admin.tableExists(tableName));
+-      // preDeleteTable can't bypass default action.
+       assertTrue("Coprocessor should have been called on table delete",
+         cp.wasDeleteTableCalled());
+       assertTrue("Delete table handler should be called.",
+@@ -1555,10 +1487,6 @@ public class TestMasterObserver {
+     MasterCoprocessorHost host = master.getMasterCoprocessorHost();
+     CPMasterObserver cp = host.findCoprocessor(CPMasterObserver.class);
+ 
+-    cp.enableBypass(false);
+-    cp.resetStates();
+-
+-
+     // create a table
+     Admin admin = UTIL.getAdmin();
+     admin.createNamespace(NamespaceDescriptor.create(testNamespace).build());
+@@ -1567,75 +1495,8 @@ public class TestMasterObserver {
+     assertNotNull(admin.getNamespaceDescriptor(testNamespace));
+     assertTrue("Test namespace descriptor should have been called",
+         cp.wasGetNamespaceDescriptorCalled());
+-
+-    // turn off bypass, run the tests again
+-    cp.enableBypass(true);
+-    cp.resetStates();
+-
+-    boolean expected = false;
+-    try {
+-      admin.modifyNamespace(NamespaceDescriptor.create(testNamespace).build());
+-    } catch (BypassCoprocessorException ce) {
+-      expected = true;
+-    }
+-    assertTrue(expected);
+-    assertTrue("Test namespace should not have been modified",
+-        cp.preModifyNamespaceCalledOnly());
+-
+-    assertNotNull(admin.getNamespaceDescriptor(testNamespace));
+-    assertTrue("Test namespace descriptor should have been called",
+-        cp.wasGetNamespaceDescriptorCalled());
+-
+-    expected = false;
+-    try {
+-      admin.deleteNamespace(testNamespace);
+-    } catch (BypassCoprocessorException ce) {
+-      expected = true;
+-    }
+-    assertTrue(expected);
+-    assertTrue("Test namespace should not have been deleted", cp.preDeleteNamespaceCalledOnly());
+-
+-    assertNotNull(admin.getNamespaceDescriptor(testNamespace));
+-    assertTrue("Test namespace descriptor should have been called",
+-        cp.wasGetNamespaceDescriptorCalled());
+-
+-    cp.enableBypass(false);
+-    cp.resetStates();
+-
+-    // delete table
+-    admin.modifyNamespace(NamespaceDescriptor.create(testNamespace).build());
+-    assertTrue("Test namespace should have been modified", cp.wasModifyNamespaceCalled());
+-
+-    admin.deleteNamespace(testNamespace);
+-    assertTrue("Test namespace should have been deleted", cp.wasDeleteNamespaceCalled());
+-
+-    cp.enableBypass(true);
+-    cp.resetStates();
+-
+-    expected = false;
+-    try {
+-      admin.createNamespace(NamespaceDescriptor.create(testNamespace).build());
+-    } catch (BypassCoprocessorException ce) {
+-      expected = true;
+-    }
+-    assertTrue(expected);
+-    assertTrue("Test namespace should not be created", cp.preCreateNamespaceCalledOnly());
+-
+-    // turn on bypass, run the test
+-    cp.enableBypass(true);
+-    cp.resetStates();
+-
+-    admin.listNamespaceDescriptors();
+-    assertTrue("post listNamespace should not have been called",
+-               cp.preListNamespaceDescriptorsCalledOnly());
+-
+-    // turn off bypass, run the tests again
+-    cp.enableBypass(false);
+-    cp.resetStates();
+-
+-    admin.listNamespaceDescriptors();
+-    assertTrue("post listNamespace should have been called",
+-               cp.wasListNamespaceDescriptorsCalled());
++    // This test used to do a bunch w/ bypass but bypass of these table and namespace stuff has
++    // been removed so the testing code was removed.
+   }
+ 
+   private void modifyTableSync(Admin admin, TableName tableName, HTableDescriptor htd)
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+index 4499cd569d..ce8a224d8c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+@@ -169,6 +169,7 @@ import org.junit.rules.TestName;
+ import org.junit.rules.TestRule;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.ArgumentMatcher;
++import org.mockito.Matchers;
+ import org.mockito.Mockito;
+ import org.mockito.invocation.InvocationOnMock;
+ import org.mockito.stubbing.Answer;
+@@ -359,7 +360,7 @@ public class TestHRegion {
+ 
+   /**
+    * Create a WAL outside of the usual helper in
+-   * {@link HBaseTestingUtility#createWal(Configuration, Path, HRegionInfo)} because that method
++   * {@link HBaseTestingUtility#createWal(Configuration, Path, RegionInfo)} because that method
+    * doesn't play nicely with FaultyFileSystem. Call this method before overriding
+    * {@code fs.file.impl}.
+    * @param callingMethod a unique component for the path, probably the name of the test method.
+@@ -2384,6 +2385,9 @@ public class TestHRegion {
+     FileSystem fs = FileSystem.get(CONF);
+     Path rootDir = new Path(dir + "testDataInMemoryWithoutWAL");
+     FSHLog hLog = new FSHLog(fs, rootDir, "testDataInMemoryWithoutWAL", CONF);
++    // This chunk creation is done throughout the code base. Do we want to move it into core?
++    // It is missing from this test. W/o it we NPE.
++    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false, 0, 0, 0, null);
+     HRegion region = initHRegion(tableName, null, null, false, Durability.SYNC_WAL, hLog,
+         COLUMN_FAMILY_BYTES);
+ 
+@@ -2431,17 +2435,17 @@ public class TestHRegion {
+     // save normalCPHost and replaced by mockedCPHost
+     RegionCoprocessorHost normalCPHost = region.getCoprocessorHost();
+     RegionCoprocessorHost mockedCPHost = Mockito.mock(RegionCoprocessorHost.class);
+-    Answer<Boolean> answer = new Answer<Boolean>() {
++    // Because the preBatchMutate returns void, we can't do usual Mockito when...then form. Must
++    // do below format (from Mockito doc).
++    Mockito.doAnswer(new Answer() {
+       @Override
+-      public Boolean answer(InvocationOnMock invocation) throws Throwable {
++      public Object answer(InvocationOnMock invocation) throws Throwable {
+         MiniBatchOperationInProgress<Mutation> mb = invocation.getArgumentAt(0,
+                 MiniBatchOperationInProgress.class);
+         mb.addOperationsFromCP(0, new Mutation[]{addPut});
+-        return false;
++        return null;
+       }
+-    };
+-    when(mockedCPHost.preBatchMutate(Mockito.isA(MiniBatchOperationInProgress.class)))
+-      .then(answer);
++    }).when(mockedCPHost).preBatchMutate(Mockito.isA(MiniBatchOperationInProgress.class));
+     region.setCoprocessorHost(mockedCPHost);
+     region.put(originalPut);
+     region.setCoprocessorHost(normalCPHost);
+-- 
+2.11.0 (Apple Git-81)

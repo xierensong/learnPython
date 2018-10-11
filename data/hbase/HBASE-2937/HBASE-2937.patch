@@ -1,0 +1,1007 @@
+commit 83ce6108f89e9fae4a7a9642f3f005dc5c329696
+Author: Karthick <karthick@ubuntu.(none)>
+Date:   Sun Jan 2 13:22:15 2011 -0800
+
+    HBASE-2937 Facilitate Timeouts In HBase Client
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/ClientCallable.java b/src/main/java/org/apache/hadoop/hbase/client/ClientCallable.java
+new file mode 100644
+index 0000000..529b4aa
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/client/ClientCallable.java
+@@ -0,0 +1,78 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.client;
++
++import java.util.concurrent.Callable;
++
++import org.apache.hadoop.hbase.ipc.HBaseRPC;
++import org.apache.hadoop.hbase.ipc.HRegionInterface;
++
++/**
++ * The <code>ClientCallable</code> builds on the {@link ServerCallable}, and
++ * implements a timeout and retry logic at the call-level, which is the block of
++ * code around the invocation on the {@link HRegionInterface}, but does not
++ * include the block of code that instantiates the proxy to the server (
++ * {@link ServerCallable#instantiateServer(boolean)}.
++ * 
++ * <p>
++ * Because this class needs to implement the {@link Callable#call} method, its
++ * sub-classes must define their tasks in the {@link #clientCall()} method
++ * instead.
++ */
++public abstract class ClientCallable<T> extends ServerCallable<T> {
++  private final TimeoutPolicy timeoutPolicy;
++
++  public ClientCallable(HConnection connection, byte[] tableName, byte[] row,
++      TimeoutPolicy timeoutPolicy) {
++    super(connection, tableName, row);
++    if (timeoutPolicy == null) {
++      timeoutPolicy = TimeoutPolicy.NONE;
++    }
++    this.timeoutPolicy = timeoutPolicy;
++  }
++
++  @Override
++  public T call() throws Exception {
++    if (timeoutPolicy.getCallTimeout() > 0) {
++      HBaseRPC.setTimeoutForProxy(server, timeoutPolicy.getCallTimeout());
++    }
++    try {
++      int retries = 0;
++      do {
++        try {
++          return clientCall();
++        } catch (Exception e) {
++          if (HTable.isTimeoutException(e)
++              && timeoutPolicy.getRetryPolicy().shouldRetry(e, retries++)) {
++            continue;
++          }
++          throw e;
++        }
++      } while (true);
++    } finally {
++      if (timeoutPolicy.getCallTimeout() > 0L) {
++        HBaseRPC.setTimeoutForProxy(server, 0L);
++      }
++    }
++  }
++
++  protected abstract T clientCall() throws Exception;
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java b/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+index 80b00a7..ae1091c 100644
+--- a/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
++++ b/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+@@ -29,7 +29,10 @@ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.CopyOnWriteArraySet;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.commons.logging.Log;
+@@ -57,6 +60,7 @@ import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.hbase.zookeeper.RootRegionTracker;
+ import org.apache.hadoop.hbase.zookeeper.ZKTable;
+ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
++import org.apache.hadoop.io.retry.RetryPolicy;
+ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.zookeeper.KeeperException;
+ 
+@@ -210,6 +214,24 @@ public class HConnectionManager {
+     return connection.isRegionCached(tableName, row);
+   }
+ 
++  private final static ThreadLocal<Long> OPERATION_TIMEOUT = new ThreadLocal<Long>() {
++    @Override
++    protected Long initialValue() {
++      return new Long(0);
++    }
++  };
++  
++  public static void setOperationTimeout(long operationTimeout) {
++    OPERATION_TIMEOUT.set(operationTimeout);
++  }
++
++  private final static ThreadLocal<ExecutorService> OPERATION_TIMEOUT_SERVICE = new ThreadLocal<ExecutorService>() {
++    @Override
++    protected ExecutorService initialValue() {
++      return Executors.newSingleThreadExecutor();
++    }
++  };
++
+   /* Encapsulates connection to zookeeper and regionservers.*/
+   static class HConnectionImplementation implements HConnection {
+     static final Log LOG = LogFactory.getLog(HConnectionImplementation.class);
+@@ -278,7 +300,6 @@ public class HConnectionManager {
+       this.rpcTimeout = conf.getInt(
+           HConstants.HBASE_RPC_TIMEOUT_KEY,
+           HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
+-
+       this.prefetchRegionLimit = conf.getInt("hbase.client.prefetch.limit",
+           10);
+ 
+@@ -785,7 +806,7 @@ public class HConnectionManager {
+             "meta: thread is interrupted.");
+         }
+       }
+-    }
++	}
+ 
+     /*
+      * Search the cache for a location that fits our table and row key.
+@@ -984,42 +1005,78 @@ public class HConnectionManager {
+       return zooKeeper;
+     }
+ 
+-    public <T> T getRegionServerWithRetries(ServerCallable<T> callable)
+-    throws IOException, RuntimeException {
+-      List<Throwable> exceptions = new ArrayList<Throwable>();
+-      for(int tries = 0; tries < numRetries; tries++) {
+-        try {
+-          callable.instantiateServer(tries != 0);
+-          return callable.call();
+-        } catch (Throwable t) {
+-          t = translateException(t);
+-          exceptions.add(t);
+-          if (tries == numRetries - 1) {
+-            throw new RetriesExhaustedException(callable.getServerName(),
+-                callable.getRegionName(), callable.getRow(), tries, exceptions);
++    public <T> T getRegionServerWithRetries(final ServerCallable<T> callable)
++        throws IOException, RuntimeException {
++      return getRegionServerWithTimeout(callable, true);
++    }
++
++    public <T> T getRegionServerWithoutRetries(ServerCallable<T> callable)
++        throws IOException, RuntimeException {
++      return getRegionServerWithTimeout(callable, false);
++    }
++
++    private <T> T getRegionServerWithTimeout(final ServerCallable<T> callable,
++        final boolean retry) throws IOException, RuntimeException {
++      LOG.info("Getting region server with operation timeout set to " + OPERATION_TIMEOUT.get());
++
++      if (OPERATION_TIMEOUT.get() <= 0) {
++        return getRegionServer(callable, retry);
++      } else {
++        Future<T> future = OPERATION_TIMEOUT_SERVICE.get().submit(new Callable<T>() {
++          @Override
++          public T call() throws Exception {
++            return getRegionServer(callable, retry);
+           }
+-        }
++        });
+         try {
+-          Thread.sleep(getPauseTime(tries));
+-        } catch (InterruptedException e) {
+-          Thread.currentThread().interrupt();
+-          throw new IOException("Giving up trying to get region server: thread is interrupted.");
++          return future.get(OPERATION_TIMEOUT.get(), TimeUnit.MILLISECONDS);
++        } catch (Exception e) {
++          LOG.info("Getting region server timed out at " + OPERATION_TIMEOUT.get());
++          future.cancel(false);
++          throw new IOException(
++              "Giving up trying to get region server: thread has timed out", e);
+         }
+       }
+-      return null;
+     }
+-
+-    public <T> T getRegionServerWithoutRetries(ServerCallable<T> callable)
+-        throws IOException, RuntimeException {
+-      try {
+-        callable.instantiateServer(false);
+-        return callable.call();
+-      } catch (Throwable t) {
+-        Throwable t2 = translateException(t);
+-        if (t2 instanceof IOException) {
+-          throw (IOException)t2;
+-        } else {
+-          throw new RuntimeException(t2);
++    
++    public <T> T getRegionServer(ServerCallable<T> callable, boolean retry)
++    throws IOException, RuntimeException {
++      if (retry) {
++        List<Throwable> exceptions = new ArrayList<Throwable>();
++        for(int tries = 0; tries < numRetries; tries++) {
++          try {
++            callable.instantiateServer(tries != 0);
++            return callable.call();
++          } catch (Throwable t) {
++            if (t instanceof RetriesExhaustedException
++                || t instanceof NonRetryableException)
++              throw ((RetriesExhaustedException) t);
++            t = translateException(t);
++            exceptions.add(t);
++            if (tries == numRetries - 1) {
++              throw new RetriesExhaustedException(callable.getServerName(),
++                  callable.getRegionName(), callable.getRow(), tries, exceptions);
++            }
++          }
++          try {
++            Thread.sleep(getPauseTime(tries));
++          } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IOException("Giving up trying to get region server: thread is interrupted.");
++          }
++        }
++        return null;
++      } else {
++        try {
++          callable.instantiateServer(false);
++          return callable.call();
++        } catch (Throwable t) {
++          Throwable t2 = translateException(t);
++          if (t2 instanceof IOException) {
++            throw (IOException)t2;
++          } else {
++            throw new RuntimeException(t2);
++          }
+         }
+       }
+     }
+@@ -1421,6 +1478,6 @@ public class HConnectionManager {
+       if (t != null) LOG.fatal(msg, t);
+       else LOG.fatal(msg);
+       this.closed = true;
+-    }
++    }    
+   }
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/HTable.java b/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+index b9be112..4f46e43 100644
+--- a/src/main/java/org/apache/hadoop/hbase/client/HTable.java
++++ b/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+@@ -35,6 +35,24 @@ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.ThreadPoolExecutor;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.commons.logging.Log;
+@@ -59,6 +77,8 @@ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.Pair;
+ import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.hbase.zookeeper.ZKUtil;
++import org.apache.hadoop.io.retry.RetryPolicies;
++import org.apache.hadoop.io.retry.RetryPolicy;
+ import org.apache.zookeeper.KeeperException;
+ 
+ /**
+@@ -102,6 +122,7 @@ public class HTable implements HTableInterface {
+   private int maxKeyValueSize;
+   private ExecutorService pool;  // For Multi
+   private long maxScannerResultSize;
++  private TimeoutPolicy timeoutPolicy;
+ 
+   /**
+    * Creates an object to access a HBase table.
+@@ -194,12 +215,47 @@ public class HTable implements HTableInterface {
+         60, TimeUnit.SECONDS,
+         new LinkedBlockingQueue<Runnable>(),
+         new DaemonThreadFactory());
++
++    long operationTimeout = conf.getLong("hbase.client.operation.timeout", 0);
++    long callTimeout = conf.getInt("hbase.htable.call.timeout", 0);
++    RetryPolicy callRetryPolicy = null;
++    try {
++      String retryPolicyClassName = conf.get("hbase.htable.call.retry.policy");
++      if (retryPolicyClassName != null) {
++        @SuppressWarnings({ "unchecked" })
++        Class<RetryPolicy> retryPolicyClass = (Class<RetryPolicy>) Class
++            .forName(retryPolicyClassName);
++        callRetryPolicy = retryPolicyClass.newInstance();
++      }
++    } catch (Exception e) {
++    } finally {
++      if (callRetryPolicy == null) {
++        callRetryPolicy = RetryPolicies.TRY_ONCE_THEN_FAIL;
++      }
++    }
++    setTimeoutPolicy(new TimeoutPolicy(operationTimeout, callTimeout,
++        TimeUnit.MILLISECONDS, callRetryPolicy));
+   }
+ 
+   public Configuration getConfiguration() {
+     return configuration;
+   }
+ 
++  public TimeoutPolicy getTimeoutPolicy() {
++    return timeoutPolicy;
++  }
++
++  public void setTimeoutPolicy(TimeoutPolicy timeoutPolicy) {
++    this.timeoutPolicy = timeoutPolicy;
++    if (timeoutPolicy.getOperationTimeout() > 0L) {
++      HConnectionManager.setOperationTimeout(timeoutPolicy.getOperationTimeout());
++    }
++  }
++  
++  public static boolean isTimeoutException(Exception e) {
++    return e != null && e.getCause() instanceof TimeoutException;
++  }
++
+   /**
+    * @return the number of region servers that are currently running
+    * @throws IOException if a remote or network exception occurs
+@@ -468,6 +524,7 @@ public class HTable implements HTableInterface {
+    * </pre>
+    * @param out {@link DataOutput} to serialize this object into.
+    * @throws IOException if a remote or network exception occurs
++   *             if a remote or network exception occurs
+    */
+   public void serializeRegionInfo(DataOutput out) throws IOException {
+     Map<HRegionInfo, HServerAddress> allRegions = this.getRegionsInfo();
+@@ -516,8 +573,8 @@ public class HTable implements HTableInterface {
+    public Result getRowOrBefore(final byte[] row, final byte[] family)
+    throws IOException {
+      return connection.getRegionServerWithRetries(
+-         new ServerCallable<Result>(connection, tableName, row) {
+-       public Result call() throws IOException {
++         new ClientCallable<Result>(connection, tableName, row, timeoutPolicy) {
++       public Result clientCall() throws IOException {
+          return server.getClosestRowBefore(location.getRegionInfo().getRegionName(),
+            row, family);
+        }
+@@ -548,8 +605,8 @@ public class HTable implements HTableInterface {
+ 
+   public Result get(final Get get) throws IOException {
+     return connection.getRegionServerWithRetries(
+-        new ServerCallable<Result>(connection, tableName, get.getRow()) {
+-          public Result call() throws IOException {
++        new ClientCallable<Result>(connection, tableName, get.getRow(), timeoutPolicy) {
++          public Result clientCall() throws IOException {
+             return server.get(location.getRegionInfo().getRegionName(), get);
+           }
+         }
+@@ -619,8 +676,8 @@ public class HTable implements HTableInterface {
+   public void delete(final Delete delete)
+   throws IOException {
+     connection.getRegionServerWithRetries(
+-        new ServerCallable<Boolean>(connection, tableName, delete.getRow()) {
+-          public Boolean call() throws IOException {
++        new ClientCallable<Boolean>(connection, tableName, delete.getRow(), timeoutPolicy) {
++          public Boolean clientCall() throws IOException {
+             server.delete(location.getRegionInfo().getRegionName(), delete);
+             return null; // FindBugs NP_BOOLEAN_RETURN_NULL
+           }
+@@ -687,8 +744,8 @@ public class HTable implements HTableInterface {
+           "Invalid arguments to increment, no columns specified");
+     }
+     return connection.getRegionServerWithRetries(
+-        new ServerCallable<Result>(connection, tableName, increment.getRow()) {
+-          public Result call() throws IOException {
++        new ClientCallable<Result>(connection, tableName, increment.getRow(), timeoutPolicy) {
++          public Result clientCall() throws IOException {
+             return server.increment(
+                 location.getRegionInfo().getRegionName(), increment);
+           }
+@@ -717,9 +774,9 @@ public class HTable implements HTableInterface {
+       throw new IOException(
+           "Invalid arguments to incrementColumnValue", npe);
+     }
+-    return connection.getRegionServerWithRetries(
+-        new ServerCallable<Long>(connection, tableName, row) {
+-          public Long call() throws IOException {
++    return (long) connection.getRegionServerWithRetries(
++        new ClientCallable<Long>(connection, tableName, row, timeoutPolicy) {
++          public Long clientCall() throws IOException {
+             return server.incrementColumnValue(
+                 location.getRegionInfo().getRegionName(), row, family,
+                 qualifier, amount, writeToWAL);
+@@ -747,8 +804,8 @@ public class HTable implements HTableInterface {
+       final Put put)
+   throws IOException {
+     return connection.getRegionServerWithRetries(
+-        new ServerCallable<Boolean>(connection, tableName, row) {
+-          public Boolean call() throws IOException {
++        new ClientCallable<Boolean>(connection, tableName, row, timeoutPolicy) {
++          public Boolean clientCall() throws IOException {
+             return server.checkAndPut(location.getRegionInfo().getRegionName(),
+                 row, family, qualifier, value, put) ? Boolean.TRUE : Boolean.FALSE;
+           }
+@@ -775,8 +832,8 @@ public class HTable implements HTableInterface {
+       final Delete delete)
+   throws IOException {
+     return connection.getRegionServerWithRetries(
+-        new ServerCallable<Boolean>(connection, tableName, row) {
+-          public Boolean call() throws IOException {
++        new ClientCallable<Boolean>(connection, tableName, row, timeoutPolicy) {
++          public Boolean clientCall() throws IOException {
+             return server.checkAndDelete(
+                 location.getRegionInfo().getRegionName(),
+                 row, family, qualifier, value, delete)
+@@ -800,8 +857,8 @@ public class HTable implements HTableInterface {
+   @Override
+   public boolean exists(final Get get) throws IOException {
+     return connection.getRegionServerWithRetries(
+-        new ServerCallable<Boolean>(connection, tableName, get.getRow()) {
+-          public Boolean call() throws IOException {
++        new ClientCallable<Boolean>(connection, tableName, get.getRow(), timeoutPolicy) {
++          public Boolean clientCall() throws IOException {
+             return server.
+                 exists(location.getRegionInfo().getRegionName(), get);
+           }
+@@ -855,8 +912,8 @@ public class HTable implements HTableInterface {
+   public RowLock lockRow(final byte [] row)
+   throws IOException {
+     return connection.getRegionServerWithRetries(
+-      new ServerCallable<RowLock>(connection, tableName, row) {
+-        public RowLock call() throws IOException {
++      new ClientCallable<RowLock>(connection, tableName, row, timeoutPolicy) {
++        public RowLock clientCall() throws IOException {
+           long lockId =
+               server.lockRow(location.getRegionInfo().getRegionName(), row);
+           return new RowLock(row,lockId);
+@@ -869,8 +926,8 @@ public class HTable implements HTableInterface {
+   public void unlockRow(final RowLock rl)
+   throws IOException {
+     connection.getRegionServerWithRetries(
+-      new ServerCallable<Boolean>(connection, tableName, rl.getRow()) {
+-        public Boolean call() throws IOException {
++      new ClientCallable<Boolean>(connection, tableName, rl.getRow(), timeoutPolicy) {
++        public Boolean clientCall() throws IOException {
+           server.unlockRow(location.getRegionInfo().getRegionName(),
+               rl.getLockId());
+           return null; // FindBugs NP_BOOLEAN_RETURN_NULL
+@@ -939,7 +996,7 @@ public class HTable implements HTableInterface {
+   public ArrayList<Put> getWriteBuffer() {
+     return writeBuffer;
+   }
+-
++  
+   /**
+    * Implements the scanner interface for the HBase client.
+    * If there are multiple regions in a table, this scanner will iterate
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/NonRetryableException.java b/src/main/java/org/apache/hadoop/hbase/client/NonRetryableException.java
+new file mode 100644
+index 0000000..7e4a216
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/client/NonRetryableException.java
+@@ -0,0 +1,73 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.client;
++
++import java.io.IOException;
++import java.util.List;
++
++import org.apache.hadoop.hbase.util.Bytes;
++
++/**
++ * Exception thrown by HTable methods when an attempt to do something (like
++ * commit changes) fails for good, in the sense that no retry logic of any sort
++ * should or must happen.
++ */
++public class NonRetryableException extends IOException {
++  private static final long serialVersionUID = 1725806987439886018L;
++
++  public NonRetryableException(final String msg) {
++    super(msg);
++  }
++
++  public NonRetryableException(final String msg, final Exception e) {
++    super(msg, e);
++  }
++
++  /**
++   * Create a new NonRetryableException from the list of prior failures.
++   * 
++   * @param serverName
++   *          name of HRegionServer
++   * @param regionName
++   *          name of region
++   * @param row
++   *          The row we were pursuing when we ran out of retries
++   * @param numTries
++   *          The number of tries we made
++   * @param exceptions
++   *          List of exceptions that failed before giving up
++   */
++  public NonRetryableException(String serverName, final byte[] regionName,
++      final byte[] row, List<Throwable> exceptions) {
++    super(getMessage(serverName, regionName, row, exceptions));
++  }
++
++  private static String getMessage(String serverName, final byte[] regionName,
++      final byte[] row, List<Throwable> exceptions) {
++    StringBuilder buffer = new StringBuilder("Trying to contact region server ");
++    buffer.append(serverName);
++    buffer.append(" for region ");
++    buffer.append(regionName == null ? "" : Bytes.toStringBinary(regionName));
++    buffer.append(", row '");
++    buffer.append(row == null ? "" : Bytes.toStringBinary(row));
++    buffer.append("', but aborted for good.\nExceptions:\n");
++    for (Throwable t : exceptions) {
++      buffer.append(t.toString());
++      buffer.append("\n");
++    }
++    return buffer.toString();
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/TimeoutPolicy.java b/src/main/java/org/apache/hadoop/hbase/client/TimeoutPolicy.java
+new file mode 100644
+index 0000000..6daab58
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/client/TimeoutPolicy.java
+@@ -0,0 +1,97 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.client;
++
++import java.util.concurrent.TimeUnit;
++
++import org.apache.hadoop.io.retry.RetryPolicies;
++import org.apache.hadoop.io.retry.RetryPolicy;
++
++/**
++ * The <code>TimeoutPolicy</code> class specifies various timeouts that may be
++ * applied on the HBase client-side. The timeout defined at the operation level
++ * determines how long an operation on the HTable instance will block.
++ * Similarly, the timeout defined at the call-level determines how long the
++ * HBaseClient instance will wait to get the response. Both of these timeouts
++ * are calculated in terms of the unit of time specified herein. In addition, it
++ * specifies a call-level retry policy, which will applied if and only if a
++ * call-level timeout occurs.
++ * 
++ * <p>
++ * If either timeout is set to be zero, then no timeout logic will be applied at
++ * that level. By default, the time unit is taken to be milliseconds, and the
++ * retry policy {@link RetryPolicies#TRY_ONCE_THEN_FAIL}. By design, it is
++ * immutable, which renders it multi-thread safe.
++ * 
++ * <p>
++ * When a new HTable instance is constructed, it initializes the timeout policy
++ * based on {@link Configuration} passed to it. In particular, the
++ * operation-level timeout is set to the value of
++ * <code>hbase.client.operation.timeout</code>, if specified, or zero otherwise.
++ * Similarly, the call-level timeout is set to the value of
++ * <code>hbase.client.call.timeout</code>, or zero otherwise. Lastly, the retry
++ * policy may be specified through the
++ * <code>hbase.htable.call.retry.policy</code> setting, as the corresponding
++ * class name.
++ * 
++ * @see HTable
++ * @see RetryPolicies
++ */
++public final class TimeoutPolicy {
++  public static final TimeoutPolicy NONE = new TimeoutPolicy(0L, 0L,
++      TimeUnit.MILLISECONDS, null);
++
++  private final long callTimeout;
++  private final long operationTimeout;
++  private final TimeUnit timeUnit;
++  private final RetryPolicy retryPolicy;
++
++  public TimeoutPolicy(long operationTimeout, long callTimeout,
++      TimeUnit timeUnit) {
++    this(operationTimeout, callTimeout, timeUnit, null);
++  }
++
++  public TimeoutPolicy(long operationTimeout, long callTimeout,
++      TimeUnit timeUnit, RetryPolicy retryPolicy) {
++    assert timeUnit != null;
++    this.operationTimeout = operationTimeout;
++    this.callTimeout = callTimeout;
++    this.timeUnit = timeUnit;
++    this.retryPolicy = retryPolicy != null ? retryPolicy
++        : RetryPolicies.TRY_ONCE_THEN_FAIL;
++  }
++
++  public long getOperationTimeout() {
++    return operationTimeout;
++  }
++
++  public long getCallTimeout() {
++    return callTimeout;
++  }
++
++  public TimeUnit getTimeUnit() {
++    return timeUnit;
++  }
++
++  public RetryPolicy getRetryPolicy() {
++    return retryPolicy;
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
+index c8ff4a3..56431a6 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
+@@ -23,6 +23,7 @@ package org.apache.hadoop.hbase.ipc;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.client.NonRetryableException;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.io.DataOutputBuffer;
+ import org.apache.hadoop.io.IOUtils;
+@@ -50,6 +51,7 @@ import java.net.UnknownHostException;
+ import java.util.Hashtable;
+ import java.util.Iterator;
+ import java.util.Map.Entry;
++import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+@@ -730,7 +732,7 @@ public class HBaseClient {
+   public Writable call(Writable param, InetSocketAddress addr,
+                        UserGroupInformation ticket, int rpcTimeout)
+                        throws IOException, InterruptedException {
+-    return call(param, addr, null, ticket, rpcTimeout);
++    return call(param, addr, null, ticket, rpcTimeout, 0);
+   }
+ 
+   /** Make a call, passing <code>param</code>, to the IPC server running at
+@@ -740,7 +742,8 @@ public class HBaseClient {
+    * threw an exception. */
+   public Writable call(Writable param, InetSocketAddress addr,
+                        Class<? extends VersionedProtocol> protocol,
+-                       UserGroupInformation ticket, int rpcTimeout)
++                       UserGroupInformation ticket, int rpcTimeout, 
++                       long callTimeout)
+       throws InterruptedException, IOException {
+     Call call = new Call(param);
+     Connection connection = getConnection(addr, protocol, ticket, rpcTimeout, call);
+@@ -748,13 +751,27 @@ public class HBaseClient {
+     boolean interrupted = false;
+     //noinspection SynchronizationOnLocalVariableOrMethodParameter
+     synchronized (call) {
++      long waitStartTime = System.currentTimeMillis();
+       while (!call.done) {
+         try {
+-          call.wait();                           // wait for the result
++          if (callTimeout > 0) {
++            call.wait(callTimeout);
++          } else {
++            call.wait();                           // wait for the result
++          }
+         } catch (InterruptedException ignored) {
+           // save the fact that we were interrupted
+           interrupted = true;
+         }
++        if (callTimeout > 0) {
++        long waitEndTime = System.currentTimeMillis();
++        if (waitEndTime - waitStartTime > callTimeout) {
++          interrupted = false;
++          call.error = new NonRetryableException("Call to " + addr + " timed out in "
++              + callTimeout + " ms", new TimeoutException());
++          break;
++        }
++        }
+       }
+ 
+       if (interrupted) {
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
+index dbb57d9..5e24229 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPC.java
+@@ -244,6 +244,23 @@ public class HBaseRPC {
+     }
+   }
+ 
++  public static void setTimeoutForProxy(VersionedProtocol proxy,
++      long callTimeout) {
++    try {
++      if (proxy != null) {
++        getProxyEngine(proxy).setCallTimeout(callTimeout);
++      }
++    } catch (IllegalArgumentException iae) {
++      LOG.warn("Problem setting timeout on " + proxy
++        + " as it doesn't appear to be a proxy");
++      // SWALLOW
++    } catch (ClassCastException cce) {
++      LOG.warn("Problem setting timeout of " + proxy
++        + " as it's handler is not of the expected type");
++      // SWALLOW
++    }
++  }
++
+   /**
+    * Construct a client-side proxy object that implements the named protocol,
+    * talking to a server at the named address.
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/RpcEngine.java b/src/main/java/org/apache/hadoop/hbase/ipc/RpcEngine.java
+index 71357d4..79cf595 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/RpcEngine.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/RpcEngine.java
+@@ -53,4 +53,6 @@ interface RpcEngine {
+                        boolean verbose, Configuration conf, int highPriorityLevel)
+       throws IOException;
+ 
++  void setCallTimeout(long callTimeout);
++
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/WritableRpcEngine.java b/src/main/java/org/apache/hadoop/hbase/ipc/WritableRpcEngine.java
+index 2273e55..d9ca054 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/WritableRpcEngine.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/WritableRpcEngine.java
+@@ -109,6 +109,13 @@ class WritableRpcEngine implements RpcEngine {
+   }
+ 
+   protected final static ClientCache CLIENTS = new ClientCache();
++  
++  private final static ThreadLocal<Long> CALL_TIMEOUT = new ThreadLocal<Long>() {
++    @Override
++    protected Long initialValue() {
++      return new Long(0);
++    }
++  };
+ 
+   private static class Invoker implements InvocationHandler {
+     private Class<? extends VersionedProtocol> protocol;
+@@ -138,7 +145,8 @@ class WritableRpcEngine implements RpcEngine {
+ 
+       HbaseObjectWritable value = (HbaseObjectWritable)
+         client.call(new Invocation(method, args), address,
+-                    protocol, ticket, rpcTimeout);
++                    protocol, ticket, rpcTimeout,
++                    CALL_TIMEOUT.get());
+       if (logDebug) {
+         long callTime = System.currentTimeMillis() - startTime;
+         LOG.debug("Call: " + method.getName() + " " + callTime);
+@@ -346,4 +354,9 @@ class WritableRpcEngine implements RpcEngine {
+       v = v.substring(0, 55)+"...";
+     LOG.info(v);
+   }
++
++  @Override
++  public void setCallTimeout(long callTimeout) {
++    CALL_TIMEOUT.set(callTimeout);
++  }
+ }
+diff --git a/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java b/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+index 199b7ae..5f49c4d 100644
+--- a/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
++++ b/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+@@ -37,6 +37,8 @@ import java.util.Iterator;
+ import java.util.Map;
+ import java.util.NavigableMap;
+ import java.util.UUID;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -62,6 +64,7 @@ import org.apache.hadoop.hbase.filter.SingleColumnValueFilter;
+ import org.apache.hadoop.hbase.filter.WhileMatchFilter;
+ import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.io.retry.RetryPolicies;
+ import org.junit.After;
+ import org.junit.AfterClass;
+ import org.junit.Before;
+@@ -3970,5 +3973,159 @@ public class TestFromClientSide {
+       assertIncrementKey(kvs[i], ROWS[0], FAMILY, QUALIFIERS[i], 2*(i+1));
+     }
+   }
++  
++  /*
++   * HBASE-2937 Test timeout policy.
++   */
++  @Test
++  public void testTimeouts() throws Exception {
++    byte[] TABLE = Bytes.toBytes("testTimeouts");
++    HTable hTable = TEST_UTIL.createTable(TABLE, FAMILY, 10);
++
++    // Write a column with values at timestamp 1, using no timeouts.
++    hTable.setTimeoutPolicy(TimeoutPolicy.NONE);
++    byte[] row = Bytes.toBytes("row1");
++    byte[] qualifier = Bytes.toBytes("myCol");
++    Put put = new Put(row);
++    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("AAA"));
++    hTable.put(put);
++
++    Get get = new Get(row);
++    get.addColumn(FAMILY, qualifier);
++    get.setMaxVersions();
++
++    Result result = hTable.get(get);
++    NavigableMap<Long, byte[]> navigableMap = result.getMap().get(FAMILY)
++        .get(qualifier);
++    assertEquals(
++        "The put succeeded as expected when the timeouts are set to be high",
++        "AAA", Bytes.toString(navigableMap.get(1L)));
++
++    // Write a column with values at timestamp 1, giving more than sufficient
++    // time for the
++    // operations and calls to complete
++    hTable.setTimeoutPolicy(new TimeoutPolicy(10000L, 10000L,
++        TimeUnit.MILLISECONDS, RetryPolicies.TRY_ONCE_THEN_FAIL));
++    row = Bytes.toBytes("row1");
++    qualifier = Bytes.toBytes("myCol");
++    put = new Put(row);
++    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("BBB"));
++    hTable.put(put);
++
++    get = new Get(row);
++    get.addColumn(FAMILY, qualifier);
++    get.setMaxVersions();
++
++    result = hTable.get(get);
++    navigableMap = result.getMap().get(FAMILY).get(qualifier);
++    assertEquals(
++        "The put succeeded as expected when the timeouts are set to be high",
++        "BBB", Bytes.toString(navigableMap.get(1L)));
++
++    // Update the value at timestamp 1, with no timeout at operation-level but
++    // with a
++    // low call-level timeout. The call timeout will most likely not
++    // affect the outcome of the put, since the call request has already been
++    // sent, unless it needs to be retried. As far as gets are concerned,
++    // chances are that the low call-level timeout will force it to terminate
++    // before
++    // it gets a chance to receive the response.
++    hTable.setTimeoutPolicy(new TimeoutPolicy(0L, 2L, TimeUnit.MILLISECONDS,
++        RetryPolicies.TRY_ONCE_THEN_FAIL));
++    long totalTime = 0L;
++    long startTime, endTime;
++
++    put = new Put(row);
++    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("CCC"));
++    startTime = System.currentTimeMillis();
++    try {
++      hTable.put(put);
++    } finally {
++      endTime = System.currentTimeMillis();
++      totalTime = endTime - startTime;
++    }
++
++    get = new Get(row);
++    get.addColumn(FAMILY, qualifier);
++    get.setMaxVersions();
++
++    startTime = System.currentTimeMillis();
++    result = null;
++    try {
++      result = hTable.get(get);
++      endTime = System.currentTimeMillis();
++      navigableMap = result.getMap().get(FAMILY).get(qualifier);
++      assertEquals(
++          "The get succeeded even though the call-level timeout was 2 ms!",
++          "CCC", Bytes.toString(navigableMap.get(1L)));
++    } catch (IOException e) {
++      endTime = System.currentTimeMillis();
++      if (HTable.isTimeoutException(e)) {
++        assertEquals("The get did not succeed because it timed out in 2 ms!",
++            null, result);
++      } else {
++        throw e;
++      }
++    } finally {
++      totalTime += endTime - startTime;
++    }
++    LOG.info("With the call-level timeout set to 2ms, the put and get together took "
++        + totalTime + " ms");
++
++    // Update the value at timestamp 1, giving very little time for either the
++    // operation
++    // or the call to complete. The operation timeout will most likely not
++    // affect the outcome of the put, since the proxy to the region server is
++    // already initialized.As far as gets are concerned,
++    // chances are that the low call-level timeout will force it to terminate
++    // before
++    // it gets a chance to send the request or if it is lucky enough to do so,
++    // to receive the response.
++    hTable.setTimeoutPolicy(new TimeoutPolicy(5L, 2L, TimeUnit.MILLISECONDS,
++        RetryPolicies.TRY_ONCE_THEN_FAIL));
++    boolean putTimedOut = false;
++
++    put = new Put(row);
++    put.add(FAMILY, qualifier, 1L, Bytes.toBytes("DDD"));
++    startTime = System.currentTimeMillis();
++    try {
++      hTable.put(put);
++      endTime = System.currentTimeMillis();
++    } catch (IOException e) {
++      endTime = System.currentTimeMillis();
++      putTimedOut = HTable.isTimeoutException(e);
++    } finally {
++      totalTime = (endTime - startTime);
++    }
++
++    get = new Get(row);
++    get.addColumn(FAMILY, qualifier);
++    get.setMaxVersions();
++
++    startTime = System.currentTimeMillis();
++    result = null;
++    try {
++      result = hTable.get(get);
++      navigableMap = result.getMap().get(FAMILY).get(qualifier);
++      endTime = System.currentTimeMillis();
++      if (!putTimedOut) {
++        assertEquals(
++            "Both the get and put succeeded despite the low timeout settings.",
++            "DDD", Bytes.toString(navigableMap.get(1L)));
++      }
++    } catch (IOException e) {
++      endTime = System.currentTimeMillis();
++      if (HTable.isTimeoutException(e)) {
++        assertEquals("The get did not succeed as it timed out in 2 ms.", null,
++            result);
++      } else {
++        throw e;
++      }
++    } finally {
++      totalTime += endTime - startTime;
++    }
++    LOG.info("When both the operation and call timeouts were set, the put and get took "
++        + totalTime + " ms.");
++  }
+ }
+ 

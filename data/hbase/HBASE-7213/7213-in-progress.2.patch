@@ -1,0 +1,810 @@
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 58c7d4c..bf30db0 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -324,6 +324,9 @@ public final class HConstants {
+ 
+   /** The META table's name. */
+   public static final byte [] META_TABLE_NAME = toBytes(".META.");
++  
++  /** The META region's HLog filename extension */
++  public static final String META_HLOG_FILE_EXTN = ".META";
+ 
+   /** delimiter used between portions of a region name */
+   public static final int META_ROW_DELIMITER = ',';
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+index 398b66e..7904efb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterFileSystem.java
+@@ -257,9 +257,26 @@ public class MasterFileSystem {
+     serverNames.add(serverName);
+     splitLog(serverNames);
+   }
+-  
+-  public void splitLog(final List<ServerName> serverNames) throws IOException {
++
++  public void splitMetaLog(final ServerName serverName) throws IOException {
+     long splitTime = 0, splitLogSize = 0;
++    List<ServerName> serverNames = new ArrayList<ServerName>();
++    serverNames.add(serverName);
++    List<Path> logDirs = getLogDirs(serverNames);
++    if (logDirs.isEmpty()) {
++      LOG.info("No logs to split");
++      return;
++    }
++    splitLogManager.handleDeadWorkers(serverNames);
++    splitTime = EnvironmentEdgeManager.currentTimeMillis();
++    splitLogSize = splitLogManager.splitMetaLogDistributed(logDirs);
++    splitTime = EnvironmentEdgeManager.currentTimeMillis() - splitTime;
++    if (this.metricsMaster != null) {
++      this.metricsMaster.addSplit(splitTime, splitLogSize);
++    }
++  }
++
++  private List<Path> getLogDirs(final List<ServerName> serverNames) throws IOException {
+     List<Path> logDirs = new ArrayList<Path>();
+     for (ServerName serverName: serverNames) {
+       Path logDir = new Path(this.rootdir, HLogUtil.getHLogDirectoryName(serverName.toString()));
+@@ -277,6 +294,11 @@ public class MasterFileSystem {
+       }
+       logDirs.add(splitDir);
+     }
++    return logDirs;
++  }
++  public void splitLog(final List<ServerName> serverNames) throws IOException {
++    long splitTime = 0, splitLogSize = 0;
++    List<Path> logDirs = getLogDirs(serverNames);
+ 
+     if (logDirs.isEmpty()) {
+       LOG.info("No logs to split");
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java
+index 5679f49..64e36d3 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java
+@@ -40,7 +40,9 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.hbase.Chore;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.SplitLogCounters;
+ import org.apache.hadoop.hbase.DeserializationException;
+ import org.apache.hadoop.hbase.ServerName;
+@@ -194,7 +196,7 @@ public class SplitLogManager extends ZooKeeperListener {
+     }
+   }
+ 
+-  private FileStatus[] getFileList(List<Path> logDirs) throws IOException {
++  private FileStatus[] getFileList(List<Path> logDirs, boolean forMeta) throws IOException {
+     List<FileStatus> fileStatus = new ArrayList<FileStatus>();
+     for (Path hLogDir : logDirs) {
+       this.fs = hLogDir.getFileSystem(conf);
+@@ -202,8 +204,15 @@ public class SplitLogManager extends ZooKeeperListener {
+         LOG.warn(hLogDir + " doesn't exist. Nothing to do!");
+         continue;
+       }
+-      // TODO filter filenames?
+-      FileStatus[] logfiles = FSUtils.listStatus(fs, hLogDir, null);
++      PathFilter filter = null;
++      if (forMeta) {
++        filter = new PathFilter() {
++          public boolean accept(Path p) {
++            return p.getName().endsWith(HConstants.META_HLOG_FILE_EXTN);
++          }
++        };
++      }
++      FileStatus[] logfiles = FSUtils.listStatus(fs, hLogDir, filter);
+       if (logfiles == null || logfiles.length == 0) {
+         LOG.info(hLogDir + " is empty dir, no logs to split");
+       } else {
+@@ -214,7 +223,17 @@ public class SplitLogManager extends ZooKeeperListener {
+     FileStatus[] a = new FileStatus[fileStatus.size()];
+     return fileStatus.toArray(a);
+   }
+-
++  /**
++   * @param logDirs
++   *            one region sever hlog dir path in .logs
++   * @throws IOException
++   *             if there was an error while splitting any log file
++   * @return cumulative size of the logfiles split
++   * @throws IOException 
++   */
++  public long splitMetatLogDistributed(final List<Path> logDirs) throws IOException {
++    return splitLogDistributed(logDirs, true);
++  }
+   /**
+    * @param logDir
+    *            one region sever hlog dir path in .logs
+@@ -239,9 +258,37 @@ public class SplitLogManager extends ZooKeeperListener {
+    * @return cumulative size of the logfiles split
+    */
+   public long splitLogDistributed(final List<Path> logDirs) throws IOException {
++    return splitLogDistributed(logDirs, false);
++  }
++  /**
++   * The caller will block until all the META log files of the given region server
++   * have been processed - successfully split or an error is encountered - by an
++   * available worker region server. This method must only be called after the
++   * region servers have been brought online.
++   *
++   * @param logDirs List of log dirs to split
++   * @throws IOException If there was an error while splitting any log file
++   * @return cumulative size of the logfiles split
++   */
++  public long splitMetaLogDistributed(final List<Path> logDirs) throws IOException {
++    return splitLogDistributed(logDirs, true);
++  }
++  /**
++   * The caller will block until all the log files of the given region server
++   * have been processed - successfully split or an error is encountered - by an
++   * available worker region server. This method must only be called after the
++   * region servers have been brought online.
++   *
++   * @param logDirs List of log dirs to split
++   * @param forMeta is the split for the meta files
++   * @throws IOException If there was an error while splitting any log file
++   * @return cumulative size of the logfiles split
++   */
++  public long splitLogDistributed(final List<Path> logDirs, boolean forMeta) 
++      throws IOException {
+     MonitoredTask status = TaskMonitor.get().createStatus(
+           "Doing distributed log split in " + logDirs);
+-    FileStatus[] logfiles = getFileList(logDirs);
++    FileStatus[] logfiles = getFileList(logDirs, forMeta);
+     status.setStatus("Checking directory contents...");
+     LOG.debug("Scheduling batch of logs to split");
+     SplitLogCounters.tot_mgr_log_split_batch_start.incrementAndGet();
+@@ -400,6 +447,9 @@ public class SplitLogManager extends ZooKeeperListener {
+           if (status == SUCCESS) {
+             SplitLogCounters.tot_mgr_log_split_success.incrementAndGet();
+             LOG.info("Done splitting " + path);
++            if (path.endsWith(HConstants.META_HLOG_FILE_EXTN)) {
++              LOG.info("Done splitting .META.");
++            }
+           } else {
+             SplitLogCounters.tot_mgr_log_split_err.incrementAndGet();
+             LOG.warn("Error splitting " + path);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+index 53c0182..8cec08c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+@@ -55,8 +55,8 @@ import org.apache.zookeeper.KeeperException;
+ @InterfaceAudience.Private
+ public class ServerShutdownHandler extends EventHandler {
+   private static final Log LOG = LogFactory.getLog(ServerShutdownHandler.class);
+-  private final ServerName serverName;
+-  private final MasterServices services;
++  protected final ServerName serverName;
++  protected final MasterServices services;
+   private final DeadServer deadServers;
+   private final boolean shouldSplitHlog; // whether to split HLog or not
+ 
+@@ -174,6 +174,38 @@ public class ServerShutdownHandler extends EventHandler {
+   public void process() throws IOException {
+     final ServerName serverName = this.serverName;
+     try {
++      if (isCarryingMeta() || isCarryingRoot()) {
++        try {
++          LOG.info("Splitting META logs for " + serverName);
++          if (this.shouldSplitHlog) {
++            this.services.getMasterFileSystem().splitMetaLog(serverName);
++          }
++        } catch (IOException ioe) {
++          this.services.getExecutorService().submit(this);
++          this.deadServers.add(serverName);
++          throw new IOException("failed log splitting for " +
++              serverName + ", will retry", ioe);
++        }
++
++        // Assign root and meta if we were carrying them.
++        if (isCarryingRoot()) { // -ROOT-
++          LOG.info("Server " + serverName +
++              " was carrying ROOT. Trying to assign.");
++          this.services.getAssignmentManager().
++          regionOffline(HRegionInfo.ROOT_REGIONINFO);
++          verifyAndAssignRootWithRetries();
++        }
++
++        // Carrying meta?
++        if (isCarryingMeta()) {
++          LOG.info("Server " + serverName +
++              " was carrying META. Trying to assign.");
++          this.services.getAssignmentManager().
++          regionOffline(HRegionInfo.FIRST_META_REGIONINFO);
++          this.services.getAssignmentManager().assignMeta();
++        }
++      }
++
+       try {
+         if (this.shouldSplitHlog) {
+           LOG.info("Splitting logs for " + serverName);
+@@ -182,30 +214,12 @@ public class ServerShutdownHandler extends EventHandler {
+           LOG.info("Skipping log splitting for " + serverName);
+         }
+       } catch (IOException ioe) {
+-        this.services.getExecutorService().submit(this);
++        //typecast to SSH so that we don't do the above meta log split again
++        this.services.getExecutorService().submit((ServerShutdownHandler)this);
+         this.deadServers.add(serverName);
+         throw new IOException("failed log splitting for " +
+           serverName + ", will retry", ioe);
+       }
+-
+-      // Assign root and meta if we were carrying them.
+-      if (isCarryingRoot()) { // -ROOT-
+-        LOG.info("Server " + serverName +
+-            " was carrying ROOT. Trying to assign.");
+-        this.services.getAssignmentManager().
+-          regionOffline(HRegionInfo.ROOT_REGIONINFO);
+-        verifyAndAssignRootWithRetries();
+-      }
+-
+-      // Carrying meta?
+-      if (isCarryingMeta()) {
+-        LOG.info("Server " + serverName +
+-          " was carrying META. Trying to assign.");
+-        this.services.getAssignmentManager().
+-          regionOffline(HRegionInfo.FIRST_META_REGIONINFO);
+-        this.services.getAssignmentManager().assignMeta();
+-      }
+-
+       // We don't want worker thread in the MetaServerShutdownHandler
+       // executor pool to block by waiting availability of -ROOT-
+       // and .META. server. Otherwise, it could run into the following issue:
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index dae5fdb..e104954 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -337,6 +337,7 @@ public class  HRegionServer implements ClientProtocol,
+   RpcServer rpcServer;
+ 
+   private final InetSocketAddress isa;
++  private UncaughtExceptionHandler handler;
+ 
+   // Info server. Default access so can be used by unit tests. REGIONSERVER
+   // is name of the webapp and the attribute name used stuffing this instance
+@@ -366,7 +367,12 @@ public class  HRegionServer implements ClientProtocol,
+   // HLog and HLog roller. log is protected rather than private to avoid
+   // eclipse warning when accessed by inner classes
+   protected volatile HLog hlog;
++  // Optionally, the meta updates are written to a different hlog. If this
++  // regionserver holds meta, then this field will be non-null.
++  protected volatile HLog hlogForMeta;
++  
+   LogRoller hlogRoller;
++  LogRoller metaHlogRoller;
+ 
+   // flag set after we're done setting up server threads (used for testing)
+   protected volatile boolean isOnline;
+@@ -518,6 +524,11 @@ public class  HRegionServer implements ClientProtocol,
+       "hbase.regionserver.kerberos.principal", this.isa.getHostName());
+     regionServerAccounting = new RegionServerAccounting();
+     cacheConfig = new CacheConfig(conf);
++    handler = new UncaughtExceptionHandler() {
++      public void uncaughtException(Thread t, Throwable e) {
++        abort("Uncaught exception in service thread " + t.getName(), e);
++      }
++    };
+   }
+ 
+   /**
+@@ -924,6 +935,7 @@ public class  HRegionServer implements ClientProtocol,
+     if (this.cacheFlusher != null) this.cacheFlusher.interruptIfNecessary();
+     if (this.compactSplitThread != null) this.compactSplitThread.interruptIfNecessary();
+     if (this.hlogRoller != null) this.hlogRoller.interruptIfNecessary();
++    if (this.metaHlogRoller != null) this.metaHlogRoller.interruptIfNecessary();
+     if (this.compactionChecker != null)
+       this.compactionChecker.interrupt();
+ 
+@@ -1401,9 +1413,41 @@ public class  HRegionServer implements ClientProtocol,
+   }
+ 
+   /**
++   * Setup WAL log and replication if enabled.
++   * Replication setup is done in here because it wants to be hooked up to WAL.
++   * @return A WAL instance.
++   * @throws IOException
++   */
++  @Override
++  public HLog setupMetaWAL() throws IOException {
++    if (this.hlogForMeta == null) {
++      final String logName
++      = HLogUtil.getHLogDirectoryName(this.serverNameFromMasterPOV.toString());
++
++      Path logdir = new Path(rootDir, logName);
++      if (LOG.isDebugEnabled()) LOG.debug("logdir=" + logdir);
++
++      return (this.hlogForMeta = instantiateMetaHLog(rootDir, logName));
++    }
++    return this.hlogForMeta;
++  }
++
++  /**
++   * Called by {@link #setupMetaWAL()} creating WAL instance.
++   * @param rootdir
++   * @param logName
++   * @return WAL instance.
++   * @throws IOException
++   */
++  protected HLog instantiateMetaHLog(Path rootdir, String logName) throws IOException {
++    return HLogFactory.createMetaHLog(this.fs.getBackingFs(), rootdir, logName, this.conf,
++        getMETAWALActionListeners(), this.serverNameFromMasterPOV.toString());
++  }
++
++  /**
+    * Called by {@link #setupWALAndReplication()} creating WAL instance.
+-   * @param logdir
+-   * @param oldLogDir
++   * @param rootdir
++   * @param logName
+    * @return WAL instance.
+    * @throws IOException
+    */
+@@ -1430,6 +1474,22 @@ public class  HRegionServer implements ClientProtocol,
+     }
+     return listeners;
+   }
++  /**
++   * Called by {@link #instantiateMetaHLog(Path, Path)} setting up WAL instance.
++   * Add any {@link WALActionsListener}s you want inserted before WAL startup.
++   * @return List of WALActionsListener that will be passed in to
++   * {@link FSHLog} on construction.
++   */
++  protected List<WALActionsListener> getMETAWALActionListeners() {
++    List<WALActionsListener> listeners = new ArrayList<WALActionsListener>();
++    // Log roller.
++    this.metaHlogRoller = new MetaLogRoller(this, this);
++    String n = Thread.currentThread().getName();
++    Threads.setDaemonThreadRunning(this.metaHlogRoller.getThread(), 
++        n + ".META.logRoller", handler);
++    listeners.add(this.metaHlogRoller);
++    return listeners;
++  }
+ 
+   protected LogRoller getLogRoller() {
+     return hlogRoller;
+@@ -1460,12 +1520,6 @@ public class  HRegionServer implements ClientProtocol,
+    */
+   private void startServiceThreads() throws IOException {
+     String n = Thread.currentThread().getName();
+-    UncaughtExceptionHandler handler = new UncaughtExceptionHandler() {
+-      public void uncaughtException(Thread t, Throwable e) {
+-        abort("Uncaught exception in service thread " + t.getName(), e);
+-      }
+-    };
+-
+     // Start executor services
+     this.service = new ExecutorService(getServerName().toString());
+     this.service.startExecutorService(ExecutorType.RS_OPEN_REGION,
+@@ -1562,9 +1616,14 @@ public class  HRegionServer implements ClientProtocol,
+     if (!(leases.isAlive()
+         && cacheFlusher.isAlive() && hlogRoller.isAlive()
+         && this.compactionChecker.isAlive())) {
++      LOG.info("ISALIVE: " + leases.isAlive() + " " +cacheFlusher.isAlive() + " "+ this.compactionChecker.isAlive() + " " + hlogRoller.isAlive() + " " + metaHlogRoller.isAlive()); //REMOVETHIS
+       stop("One or more threads are no longer alive -- stop");
+       return false;
+     }
++    if (metaHlogRoller != null && !metaHlogRoller.isAlive()) {
++      stop("Meta HLog roller thread is no longer alive -- stop");
++      return false;
++    }
+     return true;
+   }
+ 
+@@ -1716,6 +1775,9 @@ public class  HRegionServer implements ClientProtocol,
+     if (this.hlogRoller != null) {
+       Threads.shutdown(this.hlogRoller.getThread());
+     }
++    if (this.metaHlogRoller != null) {
++      Threads.shutdown(this.metaHlogRoller.getThread());
++    }
+     if (this.compactSplitThread != null) {
+       this.compactSplitThread.join();
+     }
+@@ -3971,4 +4033,9 @@ public class  HRegionServer implements ClientProtocol,
+       this.s = s;
+     }
+   }
++
++  @Override
++  public HLog getMetaWAL() {
++    return this.hlogForMeta;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
+index 20df714..51d2eb3 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/LogRoller.java
+@@ -24,6 +24,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.*;
+ import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
+ import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
+ import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+ import org.apache.hadoop.hbase.regionserver.wal.WALActionsListener;
+@@ -47,7 +48,7 @@ class LogRoller extends HasThread implements WALActionsListener {
+   private final ReentrantLock rollLock = new ReentrantLock();
+   private final AtomicBoolean rollLog = new AtomicBoolean(false);
+   private final Server server;
+-  private final RegionServerServices services;
++  protected final RegionServerServices services;
+   private volatile long lastrolltime = System.currentTimeMillis();
+   // Period to roll log.
+   private final long rollperiod;
+@@ -159,6 +160,10 @@ class LogRoller extends HasThread implements WALActionsListener {
+     }
+   }
+ 
++  protected HLog getWAL() {
++    return this.services.getWAL();
++  }
++
+   @Override
+   public void preLogRoll(Path oldPath, Path newPath) throws IOException {
+     // Not interested
+@@ -196,3 +201,13 @@ class LogRoller extends HasThread implements WALActionsListener {
+     // not interested
+   }
+ }
++
++class MetaLogRoller extends LogRoller {
++  public MetaLogRoller(Server server, RegionServerServices services) {
++    super(server, services);
++  }
++  @Override
++  protected HLog getWAL() {
++    return services.getMetaWAL();
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java
+new file mode 100644
+index 0000000..bb5348d
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java
+@@ -0,0 +1,15 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
++
++/**
++ * This class has methods that others invoke to do meta specific stuff. For
++ * example, .meta. file could be created with a higher replication, etc. 
++ *
++ */
++interface MetaServices {
++  public HLog getMetaWAL();
++  public HLog setupMetaWAL() throws IOException;
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+index 8583113..abcce3b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+@@ -32,7 +32,7 @@ import org.apache.zookeeper.KeeperException;
+  * Services provided by {@link HRegionServer}
+  */
+ @InterfaceAudience.Private
+-public interface RegionServerServices extends OnlineRegions {
++public interface RegionServerServices extends OnlineRegions, MetaServices {
+   /**
+    * @return True if this regionserver is stopping.
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
+index 0c1929c..9b8d828 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
+@@ -18,11 +18,15 @@
+  */
+ package org.apache.hadoop.hbase.regionserver.handler;
+ 
++
++import java.io.IOException;
++
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
+ 
+ /**
+  * Handles opening of a meta region on a region server.
+@@ -42,4 +46,13 @@ public class OpenMetaHandler extends OpenRegionHandler {
+     super(server, rsServices, regionInfo, htd, EventType.M_RS_OPEN_META,
+         versionOfOfflineNode);
+   }
++  @Override
++  public void process() throws IOException {
++    rsServices.setupMetaWAL();
++    super.process();
++  }
++  @Override
++  protected HLog getWAL() {
++    return rsServices.getMetaWAL();
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+index 074ef8f..b60d7fc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+@@ -31,6 +31,7 @@ import org.apache.hadoop.hbase.executor.EventHandler;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
+ import org.apache.hadoop.hbase.util.CancelableProgressable;
+ import org.apache.hadoop.hbase.zookeeper.ZKAssign;
+ import org.apache.zookeeper.KeeperException;
+@@ -44,7 +45,7 @@ import org.apache.zookeeper.KeeperException;
+ public class OpenRegionHandler extends EventHandler {
+   private static final Log LOG = LogFactory.getLog(OpenRegionHandler.class);
+ 
+-  private final RegionServerServices rsServices;
++  protected final RegionServerServices rsServices;
+ 
+   private final HRegionInfo regionInfo;
+   private final HTableDescriptor htd;
+@@ -343,7 +344,7 @@ public class OpenRegionHandler extends EventHandler {
+       // Instantiate the region.  This also periodically tickles our zk OPENING
+       // state so master doesn't timeout this region in transition.
+       region = HRegion.openHRegion(this.regionInfo, this.htd,
+-          this.rsServices.getWAL(), this.server.getConfiguration(),
++          getWAL(), this.server.getConfiguration(),
+           this.rsServices,
+         new CancelableProgressable() {
+           public boolean progress() {
+@@ -372,6 +373,10 @@ public class OpenRegionHandler extends EventHandler {
+     return region;
+   }
+ 
++  protected HLog getWAL() {
++    return this.rsServices.getWAL();
++  }
++
+   private void cleanupFailedOpen(final HRegion region) throws IOException {
+     if (region != null) region.close();
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index 103ec59..7010498 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -154,6 +154,8 @@ class FSHLog implements HLog, Syncable {
+ 
+   private final AtomicLong logSeqNum = new AtomicLong(0);
+ 
++  private boolean forMeta = false;
++
+   // The timestamp (in ms) when the log file was created.
+   private volatile long filenum = -1;
+ 
+@@ -219,7 +221,7 @@ class FSHLog implements HLog, Syncable {
+                 final Configuration conf)
+   throws IOException {
+     this(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
+-        conf, null, true, null);
++        conf, null, true, null, false);
+   }
+   
+   /**
+@@ -236,7 +238,7 @@ class FSHLog implements HLog, Syncable {
+                 final String oldLogName, final Configuration conf)
+   throws IOException {
+     this(fs, root, logName, oldLogName, 
+-        conf, null, true, null);
++        conf, null, true, null, false);
+   }
+ 
+   /**
+@@ -249,7 +251,6 @@ class FSHLog implements HLog, Syncable {
+    * @param fs filesystem handle
+    * @param root path for stored and archived hlogs
+    * @param logName dir where hlogs are stored
+-   * @param oldLogName dir where hlogs are archived
+    * @param conf configuration to use
+    * @param listeners Listeners on WAL events. Listeners passed here will
+    * be registered before we do anything else; e.g. the
+@@ -263,7 +264,7 @@ class FSHLog implements HLog, Syncable {
+       final Configuration conf, final List<WALActionsListener> listeners,
+       final String prefix) throws IOException {
+     this(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
+-        conf, listeners, true, prefix);
++        conf, listeners, true, prefix, false);
+   }
+ 
+   /**
+@@ -275,7 +276,6 @@ class FSHLog implements HLog, Syncable {
+    *
+    * @param fs filesystem handle
+    * @param root path to where logs and oldlogs
+-   * @param oldLogDir path to where hlogs are archived
+    * @param conf configuration to use
+    * @param listeners Listeners on WAL events. Listeners passed here will
+    * be registered before we do anything else; e.g. the
+@@ -284,18 +284,20 @@ class FSHLog implements HLog, Syncable {
+    * @param prefix should always be hostname and port in distributed env and
+    *        it will be URL encoded before being used.
+    *        If prefix is null, "hlog" will be used
++   * @param forMeta if this hlog is meant for meta updates
+    * @throws IOException
+    */
+-  private FSHLog(final FileSystem fs, final Path root, final String logName,
++  public FSHLog(final FileSystem fs, final Path root, final String logName,
+       final String oldLogName, final Configuration conf, 
+       final List<WALActionsListener> listeners,
+-      final boolean failIfLogDirExists, final String prefix)
++      final boolean failIfLogDirExists, final String prefix, boolean forMeta)
+   throws IOException {
+     super();
+     this.fs = fs;
+     this.rootDir = root;
+     this.dir = new Path(this.rootDir, logName);
+     this.oldLogDir = new Path(this.rootDir, oldLogName);
++    this.forMeta = forMeta;
+     this.conf = conf;
+    
+     if (listeners != null) {
+@@ -334,11 +336,12 @@ class FSHLog implements HLog, Syncable {
+     // If prefix is null||empty then just name it hlog
+     this.prefix = prefix == null || prefix.isEmpty() ?
+         "hlog" : URLEncoder.encode(prefix, "UTF8");
+-   
+-    if (failIfLogDirExists && this.fs.exists(dir)) {
++
++    boolean dirExists = false;
++    if (failIfLogDirExists && (dirExists = this.fs.exists(dir))) {
+       throw new IOException("Target HLog directory already exists: " + dir);
+     }
+-    if (!fs.mkdirs(dir)) {
++    if (!dirExists && !fs.mkdirs(dir)) {
+       throw new IOException("Unable to mkdir " + dir);
+     }
+ 
+@@ -484,6 +487,7 @@ class FSHLog implements HLog, Syncable {
+       long currentFilenum = this.filenum;
+       Path oldPath = null;
+       if (currentFilenum > 0) {
++        //computeFilename  will take care of meta hlog filename
+         oldPath = computeFilename(currentFilenum);
+       }
+       this.filenum = System.currentTimeMillis();
+@@ -562,6 +566,9 @@ class FSHLog implements HLog, Syncable {
+    */
+   protected Writer createWriterInstance(final FileSystem fs, final Path path,
+       final Configuration conf) throws IOException {
++    if (forMeta) {
++      //set a higher replication for the hlog files (HBASE-6773)
++    }
+     return HLogFactory.createWriter(fs, path, conf);
+   }
+ 
+@@ -730,7 +737,11 @@ class FSHLog implements HLog, Syncable {
+     if (filenum < 0) {
+       throw new RuntimeException("hlog file number can't be < 0");
+     }
+-    return new Path(dir, prefix + "." + filenum);
++    String child = prefix + "." + filenum;
++    if (forMeta) {
++      child += ".META";
++    }
++    return new Path(dir, child);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
+index ea83c87..44d3d0a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
+@@ -26,9 +26,9 @@ import java.util.List;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Writer;
+ 
+@@ -50,6 +50,13 @@ public class HLogFactory {
+         final String prefix) throws IOException {
+       return new FSHLog(fs, root, logName, conf, listeners, prefix);
+     }
++
++    public static HLog createMetaHLog(final FileSystem fs, final Path root, final String logName,
++        final Configuration conf, final List<WALActionsListener> listeners,
++        final String prefix) throws IOException {
++      return new FSHLog(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
++            conf, listeners, false, prefix, true);
++    }
+     
+     /*
+      * WAL Reader
+@@ -110,6 +117,7 @@ public class HLogFactory {
+         }
+         HLog.Writer writer = (HLog.Writer) logWriterClass.newInstance();
+         writer.init(fs, path, conf);
++        LOG.info("CREATED writer " + path); //REMOVETHIS
+         return writer;
+       } catch (Exception e) {
+         throw new IOException("cannot get log writer", e);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+index 8a2e0ef..0e5e890 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+@@ -49,6 +49,7 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
+@@ -302,6 +303,11 @@ public class HLogSplitter {
+             + ": " + logPath + ", length=" + logLength);
+         Reader in = null;
+         try {
++          //actually, for meta-only hlogs, we don't need to go thru the process
++          //of parsing and segregating by regions since all the logs are for
++          //meta only. However, there is a sequence number that can be obtained
++          //only by parsing.. so we parse for all files currently
++          //TODO: optimize this part somehow
+           in = getReader(fs, log, conf, skipErrors);
+           if (in != null) {
+             parseHLog(in, logPath, entryBuffers, fs, conf, skipErrors);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogUtil.java
+index 7888aba..06d8a6d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogUtil.java
+@@ -76,7 +76,7 @@ public class HLogUtil {
+   /**
+    * Pattern used to validate a HLog file name
+    */
+-  private static final Pattern pattern = Pattern.compile(".*\\.\\d*");
++  private static final Pattern pattern = Pattern.compile(".*\\.\\d*(.META)*");
+ 
+   /**
+    * @param filename
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+index 7def888..3868bec 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+@@ -522,4 +522,16 @@ class MockRegionServer implements AdminProtocol, ClientProtocol, RegionServerSer
+     // TODO Auto-generated method stub
+     return null;
+   }
++
++  @Override
++  public HLog getMetaWAL() {
++    // TODO Auto-generated method stub
++    return null;
++  }
++
++  @Override
++  public HLog setupMetaWAL() throws IOException {
++    // TODO Auto-generated method stub
++    return null;
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockRegionServerServices.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockRegionServerServices.java
+index 5eb8547..42b87f5 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockRegionServerServices.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockRegionServerServices.java
+@@ -162,4 +162,14 @@ public class MockRegionServerServices implements RegionServerServices {
+   public Leases getLeases() {
+     return null;
+   }
++
++  @Override
++  public HLog getMetaWAL() {
++    return null;
++  }
++
++  @Override
++  public HLog setupMetaWAL() throws IOException {
++    return null;
++  }
+ }

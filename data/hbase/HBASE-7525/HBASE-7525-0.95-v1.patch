@@ -1,0 +1,995 @@
+From 7ffe4e5a1c1714e45f4429424f1cfa86a1b0ceb1 Mon Sep 17 00:00:00 2001
+From: Scott Miao <scott_miao@trend.com.tw>
+Date: Mon, 8 Apr 2013 20:26:24 +0800
+Subject: [PATCH 1/2] HBASE-7525 A canary monitoring program specifically for regionserver
+
+---
+ .../java/org/apache/hadoop/hbase/tool/Canary.java  |  554 +++++++++++++++++---
+ 1 files changed, 476 insertions(+), 78 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
+index a3c88c6..f2f5b3c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
+@@ -19,30 +19,41 @@
+ 
+ package org.apache.hadoop.hbase.tool;
+ 
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-
+-import org.apache.hadoop.hbase.exceptions.TableNotFoundException;
+-import org.apache.hadoop.util.Tool;
+-import org.apache.hadoop.util.ToolRunner;
+-
+ import org.apache.hadoop.conf.Configuration;
+-
++import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+-import org.apache.hadoop.hbase.HColumnDescriptor;
+-import org.apache.hadoop.hbase.HBaseConfiguration;
+-
++import org.apache.hadoop.hbase.ServerName;
++import org.apache.hadoop.hbase.exceptions.TableNotFoundException;
+ import org.apache.hadoop.hbase.client.Get;
+-import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
++import org.apache.hadoop.hbase.client.HTable;
++import org.apache.hadoop.util.Tool;
++import org.apache.hadoop.util.ToolRunner;
+ 
+ /**
+  * HBase Canary Tool, that that can be used to do
+  * "canary monitoring" of a running HBase cluster.
+- *
+- * Foreach region tries to get one row per column family
++ * 
++ * Here are two modes
++ * 1. region mode - Foreach region tries to get one row per column family
+  * and outputs some information about failure or latency.
++ * 
++ * 2. regionserver mode - Foreach regionserver tries to get one row from one table 
++ * selected randomly and outputs some information about failure or latency.
+  */
+ public final class Canary implements Tool {
+   // Sink interface used by the canary to outputs information
+@@ -51,6 +62,12 @@ public final class Canary implements Tool {
+     public void publishReadFailure(HRegionInfo region, HColumnDescriptor column);
+     public void publishReadTiming(HRegionInfo region, HColumnDescriptor column, long msTime);
+   }
++  // new extended sink for output regionserver mode info
++  // do not change the Sink interface directly due to maintaining the API
++  public interface ExtendedSink extends Sink {
++    public void publishReadFailure(String table, String server);
++    public void publishReadTiming(String table, String server, long msTime);
++  }
+ 
+   // Simple implementation of canary sink that allows to plot on
+   // file or standard output timings or failures.
+@@ -72,18 +89,41 @@ public final class Canary implements Tool {
+                region.getRegionNameAsString(), column.getNameAsString(), msTime));
+     }
+   }
++  // a ExtendedSink implementation
++  public static class RegionServerStdOutSink extends StdOutSink implements ExtendedSink {
++
++    @Override
++    public void publishReadFailure(String table, String server) {
++      LOG.error(String.format("Read from table:%s on region server:%s",
++          table, server));
++    }
++
++    @Override
++    public void publishReadTiming(String table, String server, long msTime) {
++      LOG.info(String.format("Read from table:%s on region server:%s in %dms",
++          table, server, msTime));
++    }
++    
++  }
++  
+ 
+   private static final long DEFAULT_INTERVAL = 6000;
++  
++  private static final long DEFAULT_TIMEOUT = 600000; // 10 mins
+ 
+   private static final Log LOG = LogFactory.getLog(Canary.class);
+ 
+   private Configuration conf = null;
+-  private HBaseAdmin admin = null;
+   private long interval = 0;
+   private Sink sink = null;
++  
++  private boolean useRegExp;
++  private long timeout = DEFAULT_TIMEOUT;
++  private boolean failOnError = true;
++  private boolean regionServerMode = false;
+ 
+   public Canary() {
+-    this(new StdOutSink());
++    this(new RegionServerStdOutSink());
+   }
+ 
+   public Canary(Sink sink) {
+@@ -102,14 +142,14 @@ public final class Canary implements Tool {
+ 
+   @Override
+   public int run(String[] args) throws Exception {
+-    int tables_index = -1;
++    int index = -1;
+ 
+     // Process command line args
+     for (int i = 0; i < args.length; i++) {
+       String cmd = args[i];
+ 
+       if (cmd.startsWith("-")) {
+-        if (tables_index >= 0) {
++        if (index >= 0) {
+           // command line args must be in the form: [opts] [table 1 [table 2 ...]]
+           System.err.println("Invalid command line options");
+           printUsageAndExit();
+@@ -136,112 +176,470 @@ public final class Canary implements Tool {
+             System.err.println("-interval needs a numeric value argument.");
+             printUsageAndExit();
+           }
++        } else if(cmd.equals("-regionserver")) {
++          this.regionServerMode = true;
++        } else if (cmd.equals("-e")) {
++          this.useRegExp = true;
++        } else if (cmd.equals("-t")) {
++          i++;
++
++          if (i == args.length) {
++            System.err.println("-t needs a numeric value argument.");
++            printUsageAndExit();
++          }
++
++          try {
++            this.timeout = Long.parseLong(args[i]);
++          } catch (NumberFormatException e) {
++            System.err.println("-t needs a numeric value argument.");
++            printUsageAndExit();
++          }
++
++        } else if (cmd.equals("-f")) {
++          i++;
++
++          if (i == args.length) {
++            System.err
++                .println("-f needs a boolean value argument (true|false).");
++            printUsageAndExit();
++          }
++
++          this.failOnError = Boolean.parseBoolean(args[i]);
+         } else {
+           // no options match
+           System.err.println(cmd + " options is invalid.");
+           printUsageAndExit();
+         }
+-      } else if (tables_index < 0) {
++      } else if (index < 0) {
+         // keep track of first table name specified by the user
+-        tables_index = i;
++        index = i;
+       }
+     }
+-
+-    // initialize HBase conf and admin
+-    if (conf == null) conf = HBaseConfiguration.create();
+-    admin = new HBaseAdmin(conf);
+-
+-    // lets the canary monitor the cluster
++    
++    // start to prepare the stuffs
++    Monitor monitor = null;
++    Thread monitorThread = null;
++    long startTime = 0;
++    long currentTimeLength = 0;
++    long runCount = 0;
++    
+     do {
+-      if (admin.isAborted()) {
+-        LOG.error("HBaseAdmin aborted");
+-        return(1);
++      // do monitor !!
++      monitor = this.newMonitor(index, args);
++      monitorThread = new Thread(monitor);
++      startTime = System.currentTimeMillis();
++      monitorThread.start();
++      runCount = 0;
++      while (!monitor.isDone()) {
++        // wait for 1 sec
++        Thread.sleep(1000);
++        // exit if any error occurs
++        if (this.failOnError && monitor.isError()) {
++          monitorThread.interrupt();
++          System.exit(1);
++        }
++        currentTimeLength = System.currentTimeMillis() - startTime;
++        if (currentTimeLength > this.timeout) {
++          LOG.error("The monitor is running too long (" + currentTimeLength
++              + ") after timeout limit:" + this.timeout
++              + " will be killed itself !!");
++          monitorThread.interrupt();
++          monitor.setError(true);
++          break;
++        }
++        LOG.debug("runCount=" + runCount++);
+       }
+ 
+-      if (tables_index >= 0) {
+-        for (int i = tables_index; i < args.length; i++) {
+-          sniff(args[i]);
+-        }
+-      } else {
+-        sniff();
++      if (this.failOnError && monitor.isError()) {
++        monitorThread.interrupt();
++        System.exit(1);
+       }
+ 
+       Thread.sleep(interval);
+     } while (interval > 0);
+ 
+-    return(0);
++    return(monitor.isError()? 1: 0);
+   }
+ 
+   private void printUsageAndExit() {
+-    System.err.printf("Usage: bin/hbase %s [opts] [table 1 [table 2...]]%n", getClass().getName());
++    System.err.printf(
++        "Usage: bin/hbase %s [opts] [table/regionserver 1 [table/regionserver 2...]]%n", 
++        getClass().getName());
+     System.err.println(" where [opts] are:");
+     System.err.println("   -help          Show this help and exit.");
++    System.err.println("   -regionserver  replace the table argument to regionserver,");
++    System.err.println("      which means to enable regionserver mode");
+     System.err.println("   -daemon        Continuous check at defined intervals.");
+     System.err.println("   -interval <N>  Interval between checks (sec)");
++    System.err.println("   -e             Use region/regionserver as regular expression");
++    System.err.println("      which means the region/regionserver is regular expression pattern");
++    System.err.println("   -f <B>         stop whole program if first error occurs, default is true");
++    System.err.println("   -t <N>         timeout for a check, default is 600000 (milisecs)");
+     System.exit(1);
+   }
+-
+-  /*
+-   * canary entry point to monitor all the tables.
++  
++  /**
++   * a Factory method for {@link Monitor}.
++   * Can be overrided by user.
++   * @param index
++   * @param args
++   * @return a Monitor instance
+    */
+-  private void sniff() throws Exception {
+-    for (HTableDescriptor table : admin.listTables()) {
+-      sniff(table);
++  public Monitor newMonitor(int index, String[] args) {
++    Monitor monitor = null;
++    if(this.regionServerMode) {
++      monitor = new RegionServerMonitor(this.conf, index, args, 
++          this.useRegExp, (ExtendedSink)this.sink);
++    } else {
++      monitor = new RegionMonitor(this.conf, index, args, this.useRegExp, this.sink);
+     }
++    return monitor;
+   }
++  
++  // a Monotor super-class can be extended by users
++  public static abstract class Monitor implements Runnable {
++
++    protected Configuration config;
++    protected HBaseAdmin admin;
++    protected int index;
++    protected String[] args;
++    protected boolean useRegExp;
++
++    protected boolean done = false;
++    protected boolean error = false;
++    protected Sink sink;
++
++    public boolean isDone() {
++      return done;
++    }
+ 
+-  /*
+-   * canary entry point to monitor specified table.
+-   */
+-  private void sniff(String tableName) throws Exception {
+-    if (admin.isTableAvailable(tableName)) {
+-      sniff(admin.getTableDescriptor(tableName.getBytes()));
+-    } else {
+-      LOG.warn(String.format("Table %s is not available", tableName));
++    public boolean isError() {
++      return error;
++    }
++
++    public void setError(boolean error) {
++      this.error = error;
++    }
++
++    protected Monitor(Configuration config, int index,
++        String[] args, boolean useRegExp, Sink sink) {
++      if (null == config)
++        throw new IllegalArgumentException("config shall not be null");
++
++      this.config = config;
++      this.index = index;
++      this.args = args;
++      this.useRegExp = useRegExp;
++      this.sink = sink;
++    }
++
++    public abstract void run();
++
++    protected boolean initialAdmin() {
++      if (null == this.admin) {
++        try {
++          this.admin = new HBaseAdmin(config);
++        } catch (Exception e) {
++          LOG.error("Initial HBaseAdmin failed...", e);
++          this.error = true;
++        }
++      }
++      if (admin.isAborted()) {
++        LOG.error("HBaseAdmin aborted");
++        this.error = true;
++      }
++      return !this.error;
+     }
+   }
++  
++  // a monitor for region mode
++  private static class RegionMonitor extends Monitor {
++    
++    public RegionMonitor(Configuration config, int index, String[] args,
++        boolean useRegExp, Sink sink) {
++      super(config, index, args, useRegExp, sink);
++    }
+ 
+-  /*
+-   * Loops over regions that owns this table,
+-   * and output some information abouts the state.
+-   */
+-  private void sniff(HTableDescriptor tableDesc) throws Exception {
+-    HTable table = null;
++    @Override
++    public void run() {
++      if(this.initialAdmin()) {
++        try {
++          if (index >= 0) {
++            String[] tables = generateMonitorTables(args, index);
++            for (int i = 0; i < tables.length; i++) {
++              sniff(tables[i]);
++            }
++          } else {
++            sniff();
++          }
++        } catch (Exception e) {
++          LOG.error("Run regionMonitor failed", e);
++          this.error = true;
++        }
++      }
++      this.done = true;
++    }
++    
++    private String[] generateMonitorTables(String[] args, int index) throws IOException {
++      String[] returnTables = null;
++      
++      int length = args.length - index;
++      returnTables = new String[length];
++      System.arraycopy(args, index, returnTables, 0, length);
++      
++      if(this.useRegExp) {
++        Pattern pattern = null;
++        HTableDescriptor[] tds = null;
++        Set<String> tmpTables = new TreeSet<String>();
++        try {
++          for(int a = 0; a < returnTables.length; a++) {
++            pattern = Pattern.compile(returnTables[a]);
++            tds = this.admin.listTables(pattern);
++            if(null != tds) {
++              for(HTableDescriptor td : tds) {
++                tmpTables.add(td.getNameAsString());
++              }
++            }
++          }
++        } catch(IOException e) {
++          LOG.error("Communicate with admin failed", e);
++          throw e;
++        }
++        
++        if(tmpTables.size() > 0) {
++          returnTables = tmpTables.toArray(new String[]{});
++        } else {
++          String msg = "No any HTable found, tablePattern:"
++              + Arrays.toString(returnTables);
++          LOG.error(msg);
++          this.error = true;
++          new TableNotFoundException(msg);
++        }
++      }
++      
++      return returnTables;
++    }
++    
++    /*
++     * canary entry point to monitor all the tables.
++     */
++    private void sniff() throws Exception {
++      for (HTableDescriptor table : admin.listTables()) {
++        sniff(table);
++      }
++    }
+ 
+-    try {
+-      table = new HTable(admin.getConfiguration(), tableDesc.getName());
+-    } catch (TableNotFoundException e) {
+-      return;
++    /*
++     * canary entry point to monitor specified table.
++     */
++    private void sniff(String tableName) throws Exception {
++      if (admin.isTableAvailable(tableName)) {
++        sniff(admin.getTableDescriptor(tableName.getBytes()));
++      } else {
++        LOG.warn(String.format("Table %s is not available", tableName));
++      }
+     }
+ 
+-    for (HRegionInfo region : admin.getTableRegions(tableDesc.getName())) {
++    /*
++     * Loops over regions that owns this table,
++     * and output some information abouts the state.
++     */
++    private void sniff(HTableDescriptor tableDesc) throws Exception {
++      HTable table = null;
++
+       try {
+-        sniffRegion(region, table);
+-      } catch (Exception e) {
+-        sink.publishReadFailure(region);
++        table = new HTable(admin.getConfiguration(), tableDesc.getName());
++      } catch (TableNotFoundException e) {
++        return;
++      }
++
++      for (HRegionInfo region : admin.getTableRegions(tableDesc.getName())) {
++        try {
++          sniffRegion(region, table);
++        } catch (Exception e) {
++          sink.publishReadFailure(region);
++        }
++      }
++    }
++
++    /*
++     * For each column family of the region tries to get one row
++     * and outputs the latency, or the failure.
++     */
++    private void sniffRegion(HRegionInfo region, HTable table) throws Exception {
++      HTableDescriptor tableDesc = table.getTableDescriptor();
++      for (HColumnDescriptor column : tableDesc.getColumnFamilies()) {
++        Get get = new Get(region.getStartKey());
++        get.addFamily(column.getName());
++
++        try {
++          long startTime = System.currentTimeMillis();
++          table.get(get);
++          long time = System.currentTimeMillis() - startTime;
++
++          sink.publishReadTiming(region, column, time);
++        } catch (Exception e) {
++          sink.publishReadFailure(region, column);
++        }
+       }
+     }
+   }
++  //a monitor for regionserver mode
++  private static class RegionServerMonitor extends Monitor {
+ 
+-  /*
+-   * For each column family of the region tries to get one row
+-   * and outputs the latency, or the failure.
+-   */
+-  private void sniffRegion(HRegionInfo region, HTable table) throws Exception {
+-    HTableDescriptor tableDesc = table.getTableDescriptor();
+-    for (HColumnDescriptor column : tableDesc.getColumnFamilies()) {
+-      Get get = new Get(region.getStartKey());
+-      get.addFamily(column.getName());
++    public RegionServerMonitor(Configuration config, int index,
++        String[] args, boolean useRegExp, ExtendedSink sink) {
++      super(config, index, args, useRegExp, sink);
++    }
++    
++    private ExtendedSink getSink() {
++      return (ExtendedSink) this.sink;
++    }
++
++    @Override
++    public void run() {
++      if (this.initialAdmin()) {
++        Map<String, List<HRegionInfo>> rsAndRMap = null;
++        rsAndRMap = this.prepareFilteredRegionServerAndRegionsMap(this.args,
++            this.index);
++        this.monitorRegionServers(rsAndRMap);
++      }
++      this.done = true;
++    }
++
++    private void monitorRegionServers(Map<String, List<HRegionInfo>> rsAndRMap) {
++      String serverName = null;
++      String tableName = null;
++      HRegionInfo region = null;
++      HTable table = null;
++      Get get = null;
++      long startTime = 0;
++      long time = 0;
++      // monitor one region on every region server
++      for (Map.Entry<String, List<HRegionInfo>> entry : rsAndRMap.entrySet()) {
++        serverName = entry.getKey();
++        // always get the first region
++        region = entry.getValue().get(0);
++        try {
++          tableName = region.getTableNameAsString();
++          table = new HTable(this.admin.getConfiguration(), tableName);
++          get = new Get(region.getStartKey());
++          startTime = System.currentTimeMillis();
++          table.get(get);
++          time = System.currentTimeMillis() - startTime;
++          
++          this.getSink().publishReadTiming(tableName, serverName, time);
++        } catch (IOException e) {
++          this.getSink().publishReadFailure(tableName, serverName);
++          LOG.error(e);
++          this.error = true;
++        } finally {
++          if (null != table) {
++            try {
++              table.close();
++            } catch (IOException e) {/* DO NOTHING */
++            }
++          }
++        }
++      }
++    }
+ 
++    private Map<String, List<HRegionInfo>> prepareFilteredRegionServerAndRegionsMap(
++        String[] args, int tableIndex) {
++      Map<String, List<HRegionInfo>> regionServerAndRegionsMap = this
++          .prepareFullRegionServerAndRegionsMap();
++      regionServerAndRegionsMap = this
++          .doPrepareFilteredRegionServerAndRegionsMap(args, tableIndex,
++              regionServerAndRegionsMap);
++      return regionServerAndRegionsMap;
++    }
++
++    private Map<String, List<HRegionInfo>> prepareFullRegionServerAndRegionsMap() {
++      Map<String, List<HRegionInfo>> rsAndRMap = new HashMap<String, List<HRegionInfo>>();
++      HTable table = null;
+       try {
+-        long startTime = System.currentTimeMillis();
+-        table.get(get);
+-        long time = System.currentTimeMillis() - startTime;
++        HTableDescriptor[] tableDescs = this.admin.listTables();
++        List<HRegionInfo> regions = null;
++        for (HTableDescriptor tableDesc : tableDescs) {
++          table = new HTable(this.admin.getConfiguration(), tableDesc.getName());
++
++          for (Map.Entry<HRegionInfo, ServerName> entry : table
++              .getRegionLocations().entrySet()) {
++            ServerName rs = entry.getValue();
++            String rsName = rs.getHostname();
++            HRegionInfo r = entry.getKey();
++
++            if (rsAndRMap.containsKey(rsName)) {
++              regions = rsAndRMap.get(rsName);
++            } else {
++              regions = new ArrayList<HRegionInfo>();
++              rsAndRMap.put(rsName, regions);
++            }
++            regions.add(r);
++          }
++          table.close();
++        }
++
++      } catch (IOException e) {
++        String msg = "Get HTables info failed";
++        LOG.error(msg, e);
++        this.error = true;
++      } finally {
++        if (null != table) {
++          try {
++            table.close();
++          } catch (IOException e) {
++            LOG.warn("Close table failed", e);
++          }
++        }
++      }
++
++      return rsAndRMap;
++    }
+ 
+-        sink.publishReadTiming(region, column, time);
+-      } catch (Exception e) {
+-        sink.publishReadFailure(region, column);
++    private Map<String, List<HRegionInfo>> doPrepareFilteredRegionServerAndRegionsMap(
++        String[] args, int tableIndex,
++        Map<String, List<HRegionInfo>> fullRsAndRMap) {
++
++      Map<String, List<HRegionInfo>> filteredRsAndRMap = null;
++
++      if (tableIndex >= 0) {
++        String rsName = null;
++        filteredRsAndRMap = new HashMap<String, List<HRegionInfo>>();
++        Pattern pattern = null;
++        Matcher matcher = null;
++        boolean regExpFound = false;
++        for (int a = tableIndex; a < args.length; a++) {
++          rsName = args[a];
++          if (this.useRegExp) {
++            regExpFound = false;
++            pattern = Pattern.compile(rsName);
++            for (String tmpRsName : fullRsAndRMap.keySet()) {
++              matcher = pattern.matcher(tmpRsName);
++              if (matcher.matches()) {
++                filteredRsAndRMap.put(tmpRsName, fullRsAndRMap.get(tmpRsName));
++                regExpFound = true;
++              }
++            }
++            if (!regExpFound) {
++              LOG.error("No any RegionServerInfo found, regionServerPattern:"
++                  + rsName);
++              this.error = true;
++            }
++          } else {
++            if (fullRsAndRMap.containsKey(rsName)) {
++              filteredRsAndRMap.put(rsName, fullRsAndRMap.get(rsName));
++            } else {
++              LOG.error("No any RegionServerInfo found, regionServerName:"
++                  + rsName);
++              this.error = true;
++            }
++          }
++        }
++      } else {
++        filteredRsAndRMap = fullRsAndRMap;
+       }
++      return filteredRsAndRMap;
+     }
+   }
+ 
+-- 
+1.7.1
+
+
+From 28025c99ea3fd36a49bf0b321bca939ec6c652bb Mon Sep 17 00:00:00 2001
+From: Scott Miao <scott_miao@trend.com.tw>
+Date: Wed, 1 May 2013 19:25:10 +0800
+Subject: [PATCH 2/2] HBASE-7525 A canary monitoring program specifically for regionserver
+
+refacotr some codes and wordings
+---
+ .../java/org/apache/hadoop/hbase/tool/Canary.java  |  121 ++++++++++----------
+ 1 files changed, 62 insertions(+), 59 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
+index f2f5b3c..5bd5047 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/tool/Canary.java
+@@ -234,7 +234,7 @@ public final class Canary implements Tool {
+         // wait for 1 sec
+         Thread.sleep(1000);
+         // exit if any error occurs
+-        if (this.failOnError && monitor.isError()) {
++        if (this.failOnError && monitor.hasError()) {
+           monitorThread.interrupt();
+           System.exit(1);
+         }
+@@ -250,7 +250,7 @@ public final class Canary implements Tool {
+         LOG.debug("runCount=" + runCount++);
+       }
+ 
+-      if (this.failOnError && monitor.isError()) {
++      if (this.failOnError && monitor.hasError()) {
+         monitorThread.interrupt();
+         System.exit(1);
+       }
+@@ -258,7 +258,7 @@ public final class Canary implements Tool {
+       Thread.sleep(interval);
+     } while (interval > 0);
+ 
+-    return(monitor.isError()? 1: 0);
++    return(monitor.hasError()? 1: 0);
+   }
+ 
+   private void printUsageAndExit() {
+@@ -273,7 +273,8 @@ public final class Canary implements Tool {
+     System.err.println("   -interval <N>  Interval between checks (sec)");
+     System.err.println("   -e             Use region/regionserver as regular expression");
+     System.err.println("      which means the region/regionserver is regular expression pattern");
+-    System.err.println("   -f <B>         stop whole program if first error occurs, default is true");
++    System.err.println("   -f <B>         stop whole program if first error occurs," + 
++        " default is true");
+     System.err.println("   -t <N>         timeout for a check, default is 600000 (milisecs)");
+     System.exit(1);
+   }
+@@ -281,28 +282,35 @@ public final class Canary implements Tool {
+   /**
+    * a Factory method for {@link Monitor}.
+    * Can be overrided by user.
+-   * @param index
+-   * @param args
++   * @param index a start index for monitor target 
++   * @param args args passed from user
+    * @return a Monitor instance
+    */
+   public Monitor newMonitor(int index, String[] args) {
+     Monitor monitor = null;
++    String[] monitorTargets = null;
++    
++    if(index >= 0) {
++      int length = args.length - index;
++      monitorTargets = new String[length];
++      System.arraycopy(args, index, monitorTargets, 0, length);
++    }
++    
+     if(this.regionServerMode) {
+-      monitor = new RegionServerMonitor(this.conf, index, args, 
++      monitor = new RegionServerMonitor(this.conf, monitorTargets, 
+           this.useRegExp, (ExtendedSink)this.sink);
+     } else {
+-      monitor = new RegionMonitor(this.conf, index, args, this.useRegExp, this.sink);
++      monitor = new RegionMonitor(this.conf, monitorTargets, this.useRegExp, this.sink);
+     }
+     return monitor;
+   }
+   
+-  // a Monotor super-class can be extended by users
++  // a Monitor super-class can be extended by users
+   public static abstract class Monitor implements Runnable {
+ 
+     protected Configuration config;
+     protected HBaseAdmin admin;
+-    protected int index;
+-    protected String[] args;
++    protected String[] targets;
+     protected boolean useRegExp;
+ 
+     protected boolean done = false;
+@@ -313,7 +321,7 @@ public final class Canary implements Tool {
+       return done;
+     }
+ 
+-    public boolean isError() {
++    public boolean hasError() {
+       return error;
+     }
+ 
+@@ -321,21 +329,20 @@ public final class Canary implements Tool {
+       this.error = error;
+     }
+ 
+-    protected Monitor(Configuration config, int index,
+-        String[] args, boolean useRegExp, Sink sink) {
++    protected Monitor(Configuration config, String[] monitorTargets, 
++        boolean useRegExp, Sink sink) {
+       if (null == config)
+         throw new IllegalArgumentException("config shall not be null");
+ 
+       this.config = config;
+-      this.index = index;
+-      this.args = args;
++      this.targets = monitorTargets;
+       this.useRegExp = useRegExp;
+       this.sink = sink;
+     }
+ 
+     public abstract void run();
+ 
+-    protected boolean initialAdmin() {
++    protected boolean initAdmin() {
+       if (null == this.admin) {
+         try {
+           this.admin = new HBaseAdmin(config);
+@@ -355,19 +362,19 @@ public final class Canary implements Tool {
+   // a monitor for region mode
+   private static class RegionMonitor extends Monitor {
+     
+-    public RegionMonitor(Configuration config, int index, String[] args,
++    public RegionMonitor(Configuration config, String[] monitorTargets,
+         boolean useRegExp, Sink sink) {
+-      super(config, index, args, useRegExp, sink);
++      super(config, monitorTargets, useRegExp, sink);
+     }
+ 
+     @Override
+     public void run() {
+-      if(this.initialAdmin()) {
++      if(this.initAdmin()) {
+         try {
+-          if (index >= 0) {
+-            String[] tables = generateMonitorTables(args, index);
+-            for (int i = 0; i < tables.length; i++) {
+-              sniff(tables[i]);
++          if (this.targets != null && this.targets.length > 0) {
++            String[] tables = generateMonitorTables(this.targets);
++            for (String table : tables) {
++              sniff(table);
+             }
+           } else {
+             sniff();
+@@ -380,22 +387,18 @@ public final class Canary implements Tool {
+       this.done = true;
+     }
+     
+-    private String[] generateMonitorTables(String[] args, int index) throws IOException {
++    private String[] generateMonitorTables(String[] monitorTargets) throws IOException {
+       String[] returnTables = null;
+       
+-      int length = args.length - index;
+-      returnTables = new String[length];
+-      System.arraycopy(args, index, returnTables, 0, length);
+-      
+       if(this.useRegExp) {
+         Pattern pattern = null;
+         HTableDescriptor[] tds = null;
+         Set<String> tmpTables = new TreeSet<String>();
+         try {
+-          for(int a = 0; a < returnTables.length; a++) {
+-            pattern = Pattern.compile(returnTables[a]);
++          for(int a = 0; a < monitorTargets.length; a++) {
++            pattern = Pattern.compile(monitorTargets[a]);
+             tds = this.admin.listTables(pattern);
+-            if(null != tds) {
++            if(tds != null) {
+               for(HTableDescriptor td : tds) {
+                 tmpTables.add(td.getNameAsString());
+               }
+@@ -410,11 +413,13 @@ public final class Canary implements Tool {
+           returnTables = tmpTables.toArray(new String[]{});
+         } else {
+           String msg = "No any HTable found, tablePattern:"
+-              + Arrays.toString(returnTables);
++              + Arrays.toString(monitorTargets);
+           LOG.error(msg);
+           this.error = true;
+           new TableNotFoundException(msg);
+         }
++      } else {
++        returnTables = monitorTargets;
+       }
+       
+       return returnTables;
+@@ -468,15 +473,19 @@ public final class Canary implements Tool {
+      */
+     private void sniffRegion(HRegionInfo region, HTable table) throws Exception {
+       HTableDescriptor tableDesc = table.getTableDescriptor();
++      byte[] startKey = null;
++      long startTime = 0L;
++      long time = 0L;
++      Get get = null;
+       for (HColumnDescriptor column : tableDesc.getColumnFamilies()) {
+-        Get get = new Get(region.getStartKey());
++        startKey = region.getStartKey();
++        get = new Get(startKey);
+         get.addFamily(column.getName());
+ 
+         try {
+-          long startTime = System.currentTimeMillis();
++          startTime = System.currentTimeMillis();
+           table.get(get);
+-          long time = System.currentTimeMillis() - startTime;
+-
++          time = System.currentTimeMillis() - startTime;
+           sink.publishReadTiming(region, column, time);
+         } catch (Exception e) {
+           sink.publishReadFailure(region, column);
+@@ -487,9 +496,9 @@ public final class Canary implements Tool {
+   //a monitor for regionserver mode
+   private static class RegionServerMonitor extends Monitor {
+ 
+-    public RegionServerMonitor(Configuration config, int index,
+-        String[] args, boolean useRegExp, ExtendedSink sink) {
+-      super(config, index, args, useRegExp, sink);
++    public RegionServerMonitor(Configuration config, String[] monitorTargets, 
++        boolean useRegExp, ExtendedSink sink) {
++      super(config, monitorTargets, useRegExp, sink);
+     }
+     
+     private ExtendedSink getSink() {
+@@ -498,10 +507,9 @@ public final class Canary implements Tool {
+ 
+     @Override
+     public void run() {
+-      if (this.initialAdmin()) {
++      if (this.initAdmin()) {
+         Map<String, List<HRegionInfo>> rsAndRMap = null;
+-        rsAndRMap = this.prepareFilteredRegionServerAndRegionsMap(this.args,
+-            this.index);
++        rsAndRMap = this.filterRegionServerByName();
+         this.monitorRegionServers(rsAndRMap);
+       }
+       this.done = true;
+@@ -534,7 +542,7 @@ public final class Canary implements Tool {
+           LOG.error(e);
+           this.error = true;
+         } finally {
+-          if (null != table) {
++          if (table != null) {
+             try {
+               table.close();
+             } catch (IOException e) {/* DO NOTHING */
+@@ -544,17 +552,15 @@ public final class Canary implements Tool {
+       }
+     }
+ 
+-    private Map<String, List<HRegionInfo>> prepareFilteredRegionServerAndRegionsMap(
+-        String[] args, int tableIndex) {
+-      Map<String, List<HRegionInfo>> regionServerAndRegionsMap = this
+-          .prepareFullRegionServerAndRegionsMap();
+-      regionServerAndRegionsMap = this
+-          .doPrepareFilteredRegionServerAndRegionsMap(args, tableIndex,
+-              regionServerAndRegionsMap);
++    private Map<String, List<HRegionInfo>> filterRegionServerByName() {
++      Map<String, List<HRegionInfo>> regionServerAndRegionsMap = this.
++          getAllRegionServerByName();
++      regionServerAndRegionsMap = this.doFilterRegionServerByName(
++          regionServerAndRegionsMap);
+       return regionServerAndRegionsMap;
+     }
+ 
+-    private Map<String, List<HRegionInfo>> prepareFullRegionServerAndRegionsMap() {
++    private Map<String, List<HRegionInfo>> getAllRegionServerByName() {
+       Map<String, List<HRegionInfo>> rsAndRMap = new HashMap<String, List<HRegionInfo>>();
+       HTable table = null;
+       try {
+@@ -585,7 +591,7 @@ public final class Canary implements Tool {
+         LOG.error(msg, e);
+         this.error = true;
+       } finally {
+-        if (null != table) {
++        if (table != null) {
+           try {
+             table.close();
+           } catch (IOException e) {
+@@ -597,20 +603,17 @@ public final class Canary implements Tool {
+       return rsAndRMap;
+     }
+ 
+-    private Map<String, List<HRegionInfo>> doPrepareFilteredRegionServerAndRegionsMap(
+-        String[] args, int tableIndex,
++    private Map<String, List<HRegionInfo>> doFilterRegionServerByName(
+         Map<String, List<HRegionInfo>> fullRsAndRMap) {
+ 
+       Map<String, List<HRegionInfo>> filteredRsAndRMap = null;
+ 
+-      if (tableIndex >= 0) {
+-        String rsName = null;
++      if (this.targets != null && this.targets.length > 0) {
+         filteredRsAndRMap = new HashMap<String, List<HRegionInfo>>();
+         Pattern pattern = null;
+         Matcher matcher = null;
+         boolean regExpFound = false;
+-        for (int a = tableIndex; a < args.length; a++) {
+-          rsName = args[a];
++        for (String rsName : this.targets) {
+           if (this.useRegExp) {
+             regExpFound = false;
+             pattern = Pattern.compile(rsName);
+-- 
+1.7.1
+

@@ -1,0 +1,554 @@
+From 3e018268bd4696d86ad053a92cccca5c0d60edb5 Mon Sep 17 00:00:00 2001
+From: jingyuntian <tianjy1990@gmail.com>
+Date: Fri, 15 Dec 2017 15:23:48 +0800
+Subject: [PATCH] HBASE-19358 Improve the stability of splitting log when do
+ fail over
+
+---
+ .../org/apache/hadoop/hbase/wal/WALSplitter.java   | 282 ++++++++++++++++-----
+ .../wal/TestWALReplayCreateWriterLimited.java      |  37 +++
+ .../hbase/wal/TestWALSplitCreateWriterLimited.java |  44 ++++
+ 3 files changed, 304 insertions(+), 59 deletions(-)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplayCreateWriterLimited.java
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplitCreateWriterLimited.java
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALSplitter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALSplitter.java
+index ce1713a..513a3dc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALSplitter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALSplitter.java
+@@ -18,11 +18,6 @@
+  */
+ package org.apache.hadoop.hbase.wal;
+ 
+-import org.apache.hadoop.hbase.coordination.SplitLogWorkerCoordination;
+-import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
+-import org.apache.hadoop.hbase.shaded.com.google.common.base.Preconditions;
+-import org.apache.hadoop.hbase.shaded.com.google.common.collect.Lists;
+-
+ import java.io.EOFException;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+@@ -30,6 +25,7 @@ import java.io.InterruptedIOException;
+ import java.text.ParseException;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+@@ -70,6 +66,7 @@ import org.apache.hadoop.hbase.client.Delete;
+ import org.apache.hadoop.hbase.client.Durability;
+ import org.apache.hadoop.hbase.client.Mutation;
+ import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.coordination.SplitLogWorkerCoordination;
+ import org.apache.hadoop.hbase.io.HeapSize;
+ import org.apache.hadoop.hbase.master.SplitLogManager;
+ import org.apache.hadoop.hbase.monitoring.MonitoredTask;
+@@ -78,6 +75,9 @@ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.LastSequenceId;
+ import org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL;
+ import org.apache.hadoop.hbase.regionserver.wal.WALCellCodec;
++import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;
++import org.apache.hadoop.hbase.shaded.com.google.common.base.Preconditions;
++import org.apache.hadoop.hbase.shaded.com.google.common.collect.Lists;
+ import org.apache.hadoop.hbase.shaded.com.google.protobuf.TextFormat;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.WALEntry;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.MutationProto.MutationType;
+@@ -137,6 +137,12 @@ public class WALSplitter {
+   // the file being split currently
+   private FileStatus fileBeingSplit;
+ 
++  // if we limit the number of writers opened for sinking recovered edits
++  private boolean splitCreateWriterLimited;
++
++  public final static String SPLIT_CREATE_WRITER_LIMITED = "hbase.split.create.writer.limited";
++
++
+   @VisibleForTesting
+   WALSplitter(final WALFactory factory, Configuration conf, Path rootDir,
+       FileSystem fs, LastSequenceId idChecker,
+@@ -153,11 +159,17 @@ public class WALSplitter {
+     this.walFactory = factory;
+     PipelineController controller = new PipelineController();
+ 
++    this.splitCreateWriterLimited = conf.getBoolean(SPLIT_CREATE_WRITER_LIMITED, false);
++
+     entryBuffers = new EntryBuffers(controller,
+-        this.conf.getInt("hbase.regionserver.hlog.splitlog.buffersize", 128 * 1024 * 1024));
++        this.conf.getInt("hbase.regionserver.hlog.splitlog.buffersize", 128 * 1024 * 1024), splitCreateWriterLimited);
+ 
+     int numWriterThreads = this.conf.getInt("hbase.regionserver.hlog.splitlog.writer.threads", 3);
+-    outputSink = new LogRecoveredEditsOutputSink(controller, entryBuffers, numWriterThreads);
++    if(splitCreateWriterLimited){
++      outputSink = new LogCreateWriterLimitedOutputSink(controller, entryBuffers, numWriterThreads);
++    }else {
++      outputSink = new LogRecoveredEditsOutputSink(controller, entryBuffers, numWriterThreads);
++    }
+   }
+ 
+   /**
+@@ -839,10 +851,16 @@ public class WALSplitter {
+ 
+     long totalBuffered = 0;
+     long maxHeapUsage;
++    boolean splitCreateWriterLimited;
+ 
+     public EntryBuffers(PipelineController controller, long maxHeapUsage) {
++      this(controller, maxHeapUsage, false);
++    }
++
++    public EntryBuffers(PipelineController controller, long maxHeapUsage, boolean splitCreateWriterLimited){
+       this.controller = controller;
+       this.maxHeapUsage = maxHeapUsage;
++      this.splitCreateWriterLimited = splitCreateWriterLimited;
+     }
+ 
+     /**
+@@ -883,6 +901,13 @@ public class WALSplitter {
+      * @return RegionEntryBuffer a buffer of edits to be written.
+      */
+     synchronized RegionEntryBuffer getChunkToWrite() {
++      // The core part of limiting opening writers is it doesn't return chunk only if the heap size is over maxHeapUsage.
++      // Thus it doesn't need to create a writer for each region during splitting.
++      // It will flush all the logs in the buffer after splitting through a threadpool, which means the number of writers it created
++      // is under control (hbase.regionserver.hlog.splitlog.writer.threads for each HLogSplitter).
++      if (totalBuffered < maxHeapUsage && splitCreateWriterLimited) {
++        return null;
++      }
+       long biggestSize = 0;
+       byte[] biggestBufferKey = null;
+ 
+@@ -900,6 +925,7 @@ public class WALSplitter {
+       RegionEntryBuffer buffer = buffers.remove(biggestBufferKey);
+       currentlyWriting.add(biggestBufferKey);
+       return buffer;
++
+     }
+ 
+     void doneWriting(RegionEntryBuffer buffer) {
+@@ -1062,7 +1088,7 @@ public class WALSplitter {
+     protected EntryBuffers entryBuffers;
+ 
+     protected Map<byte[], SinkWriter> writers = Collections
+-        .synchronizedMap(new TreeMap<byte[], SinkWriter>(Bytes.BYTES_COMPARATOR));;
++        .synchronizedMap(new TreeMap<byte[], SinkWriter>(Bytes.BYTES_COMPARATOR));
+ 
+     protected final Map<byte[], Long> regionMaximumEditLogSeqNum = Collections
+         .synchronizedMap(new TreeMap<byte[], Long>(Bytes.BYTES_COMPARATOR));
+@@ -1300,48 +1326,7 @@ public class WALSplitter {
+           @Override
+           public Void call() throws Exception {
+             WriterAndPath wap = (WriterAndPath) writersEntry.getValue();
+-            if (LOG.isTraceEnabled()) LOG.trace("Closing " + wap.p);
+-            try {
+-              wap.w.close();
+-            } catch (IOException ioe) {
+-              LOG.error("Couldn't close log at " + wap.p, ioe);
+-              thrown.add(ioe);
+-              return null;
+-            }
+-            if (LOG.isDebugEnabled()) {
+-              LOG.debug("Closed wap " + wap.p + " (wrote " + wap.editsWritten
+-                + " edits, skipped " + wap.editsSkipped + " edits in "
+-                + (wap.nanosSpent / 1000 / 1000) + "ms");
+-            }
+-            if (wap.editsWritten == 0) {
+-              // just remove the empty recovered.edits file
+-              if (fs.exists(wap.p) && !fs.delete(wap.p, false)) {
+-                LOG.warn("Failed deleting empty " + wap.p);
+-                throw new IOException("Failed deleting empty  " + wap.p);
+-              }
+-              return null;
+-            }
+-
+-            Path dst = getCompletedRecoveredEditsFilePath(wap.p,
+-              regionMaximumEditLogSeqNum.get(writersEntry.getKey()));
+-            try {
+-              if (!dst.equals(wap.p) && fs.exists(dst)) {
+-                deleteOneWithFewerEntries(wap, dst);
+-              }
+-              // Skip the unit tests which create a splitter that reads and
+-              // writes the data without touching disk.
+-              // TestHLogSplit#testThreading is an example.
+-              if (fs.exists(wap.p)) {
+-                if (!fs.rename(wap.p, dst)) {
+-                  throw new IOException("Failed renaming " + wap.p + " to " + dst);
+-                }
+-                LOG.info("Rename " + wap.p + " to " + dst);
+-              }
+-            } catch (IOException ioe) {
+-              LOG.error("Couldn't rename " + wap.p + " to " + dst, ioe);
+-              thrown.add(ioe);
+-              return null;
+-            }
++            Path dst = closeWriter(writersEntry.getKey(), wap, thrown);
+             paths.add(dst);
+             return null;
+           }
+@@ -1378,6 +1363,52 @@ public class WALSplitter {
+       return paths;
+     }
+ 
++    protected Path closeWriter(byte[] encodedRegionName, WriterAndPath wap, List<IOException> thrown) throws IOException{
++      if (LOG.isTraceEnabled()) LOG.trace("Closing " + wap.p);
++      try {
++        wap.w.close();
++      } catch (IOException ioe) {
++        LOG.error("Couldn't close log at " + wap.p, ioe);
++        thrown.add(ioe);
++        return null;
++      }
++      if (LOG.isDebugEnabled()) {
++        LOG.debug("Closed wap " + wap.p + " (wrote " + wap.editsWritten
++            + " edits, skipped " + wap.editsSkipped + " edits in "
++            + (wap.nanosSpent / 1000 / 1000) + "ms");
++      }
++      if (wap.editsWritten == 0) {
++        // just remove the empty recovered.edits file
++        if (fs.exists(wap.p) && !fs.delete(wap.p, false)) {
++          LOG.warn("Failed deleting empty " + wap.p);
++          throw new IOException("Failed deleting empty  " + wap.p);
++        }
++        return null;
++      }
++
++      Path dst = getCompletedRecoveredEditsFilePath(wap.p,
++          regionMaximumEditLogSeqNum.get(encodedRegionName));
++      try {
++        if (!dst.equals(wap.p) && fs.exists(dst)) {
++          deleteOneWithFewerEntries(wap, dst);
++        }
++        // Skip the unit tests which create a splitter that reads and
++        // writes the data without touching disk.
++        // TestHLogSplit#testThreading is an example.
++        if (fs.exists(wap.p)) {
++          if (!fs.rename(wap.p, dst)) {
++            throw new IOException("Failed renaming " + wap.p + " to " + dst);
++          }
++          LOG.info("Rename " + wap.p + " to " + dst);
++        }
++      } catch (IOException ioe) {
++        LOG.error("Couldn't rename " + wap.p + " to " + dst, ioe);
++        thrown.add(ioe);
++        return null;
++      }
++      return dst;
++    }
++
+     private List<IOException> closeLogWriters(List<IOException> thrown) throws IOException {
+       if (writersClosed) {
+         return thrown;
+@@ -1427,7 +1458,7 @@ public class WALSplitter {
+      * long as multiple threads are always acting on different regions.
+      * @return null if this region shouldn't output any logs
+      */
+-    private WriterAndPath getWriterAndPath(Entry entry) throws IOException {
++    protected WriterAndPath getWriterAndPath(Entry entry, boolean reusable) throws IOException {
+       byte region[] = entry.getKey().getEncodedRegionName();
+       WriterAndPath ret = (WriterAndPath) writers.get(region);
+       if (ret != null) {
+@@ -1443,14 +1474,16 @@ public class WALSplitter {
+         blacklistedRegions.add(region);
+         return null;
+       }
+-      writers.put(region, ret);
++      if(reusable) {
++        writers.put(region, ret);
++      }
+       return ret;
+     }
+ 
+     /**
+      * @return a path with a write for that path. caller should close.
+      */
+-    private WriterAndPath createWAP(byte[] region, Entry entry, Path rootdir) throws IOException {
++    protected WriterAndPath createWAP(byte[] region, Entry entry, Path rootdir) throws IOException {
+       Path regionedits = getRegionSplitEditsPath(fs, entry, rootdir, fileBeingSplit.getPath().getName());
+       if (regionedits == null) {
+         return null;
+@@ -1468,7 +1501,7 @@ public class WALSplitter {
+       return new WriterAndPath(regionedits, w, entry.getKey().getSequenceId());
+     }
+ 
+-    private void filterCellByStore(Entry logEntry) {
++    protected void filterCellByStore(Entry logEntry) {
+       Map<byte[], Long> maxSeqIdInStores =
+           regionMaxSeqIdInStores.get(Bytes.toString(logEntry.getKey().getEncodedRegionName()));
+       if (maxSeqIdInStores == null || maxSeqIdInStores.isEmpty()) {
+@@ -1499,10 +1532,14 @@ public class WALSplitter {
+ 
+     @Override
+     public void append(RegionEntryBuffer buffer) throws IOException {
++      appendBuffer(buffer, true);
++    }
++
++    protected WriterAndPath appendBuffer(RegionEntryBuffer buffer, boolean reusable) throws IOException{
+       List<Entry> entries = buffer.entryBuffer;
+       if (entries.isEmpty()) {
+         LOG.warn("got an empty buffer, skipping");
+-        return;
++        return null;
+       }
+ 
+       WriterAndPath wap = null;
+@@ -1513,14 +1550,14 @@ public class WALSplitter {
+ 
+         for (Entry logEntry : entries) {
+           if (wap == null) {
+-            wap = getWriterAndPath(logEntry);
++            wap = getWriterAndPath(logEntry, reusable);
+             if (wap == null) {
+               if (LOG.isTraceEnabled()) {
+                 // This log spews the full edit. Can be massive in the log. Enable only debugging
+                 // WAL lost edit issues.
+                 LOG.trace("getWriterAndPath decided we don't need to write edits for " + logEntry);
+               }
+-              return;
++              return null;
+             }
+           }
+           filterCellByStore(logEntry);
+@@ -1536,11 +1573,12 @@ public class WALSplitter {
+         wap.incrementEdits(editsCount);
+         wap.incrementNanoTime(System.nanoTime() - startTime);
+       } catch (IOException e) {
+-          e = e instanceof RemoteException ?
+-                  ((RemoteException)e).unwrapRemoteException() : e;
++        e = e instanceof RemoteException ?
++            ((RemoteException)e).unwrapRemoteException() : e;
+         LOG.fatal(" Got while writing log entry to log", e);
+         throw e;
+       }
++      return wap;
+     }
+ 
+     @Override
+@@ -1575,6 +1613,132 @@ public class WALSplitter {
+   }
+ 
+   /**
++   *
++   */
++  class LogCreateWriterLimitedOutputSink extends LogRecoveredEditsOutputSink {
++
++    ConcurrentHashMap<String, Long> regionRecoverStatMap = new ConcurrentHashMap<>();
++
++    public LogCreateWriterLimitedOutputSink(PipelineController controller, EntryBuffers entryBuffers,
++        int numWriters) {
++      super(controller, entryBuffers, numWriters);
++    }
++
++    @Override
++    public List<Path> finishWritingAndClose() throws IOException {
++      boolean isSuccessful;
++      List<Path> result;
++      try {
++        isSuccessful = finishWriting(false);
++      } finally {
++        result = writeAndClose();
++      }
++      if (isSuccessful) {
++        splits = result;
++      }
++      return splits;
++    }
++
++    private List<Path> writeAndClose() throws IOException{
++      com.google.common.base.Preconditions.checkState(!closeAndCleanCompleted);
++
++      final List<Path> paths = new ArrayList<Path>();
++      final List<IOException> thrown = Lists.newArrayList();
++      ThreadPoolExecutor writeAndCloseThreadPool = Threads.getBoundedCachedThreadPool(numThreads, 30L,
++          TimeUnit.SECONDS, new ThreadFactory() {
++            private int count = 1;
++
++            public Thread newThread(Runnable r) {
++              Thread t = new Thread(r, "split-log-writeAndCloseStream-" + count++);
++              return t;
++            }
++          });
++      CompletionService<Void> closeCompletionService =
++          new ExecutorCompletionService<Void>(writeAndCloseThreadPool);
++
++      for (final Map.Entry<byte[], RegionEntryBuffer> buffer : entryBuffers.buffers.entrySet()) {
++        LOG.info("Submitting writeThenClose of " + buffer.getValue().encodedRegionName);
++        closeCompletionService.submit(new Callable<Void>() {
++          public Void call() throws Exception {
++            Path dst = ((LogCreateWriterLimitedOutputSink)outputSink).writeThenClose(buffer.getValue());
++            paths.add(dst);
++            return null;
++          }
++        });
++      }
++
++      boolean progress_failed = false;
++      try {
++        for (int i = 0, n = entryBuffers.buffers.size(); i < n; i++) {
++          Future<Void> future = closeCompletionService.take();
++          future.get();
++          if (!progress_failed && reporter != null && !reporter.progress()) {
++            progress_failed = true;
++          }
++        }
++      } catch (InterruptedException e) {
++        IOException iie = new InterruptedIOException();
++        iie.initCause(e);
++        throw iie;
++      } catch (ExecutionException e) {
++        throw new IOException(e.getCause());
++      } finally {
++        writeAndCloseThreadPool.shutdownNow();
++      }
++
++      if (!thrown.isEmpty()) {
++        throw MultipleIOException.createIOException(thrown);
++      }
++
++      if (progress_failed) {
++        return null;
++      }
++      return paths;
++    }
++
++    @Override
++    public Map<byte[], Long> getOutputCounts() {
++      Map<byte[], Long> regionRecoverStatMapResult = new HashMap<>();
++      for(Map.Entry<String, Long> entry: regionRecoverStatMap.entrySet()){
++        regionRecoverStatMapResult.put(Bytes.toBytes(entry.getKey()), entry.getValue());
++      }
++      return regionRecoverStatMapResult;
++    }
++
++    @Override
++    public int getNumberOfRecoveredRegions() {
++      return regionRecoverStatMap.size();
++    }
++
++    @Override
++    public void append(RegionEntryBuffer buffer) throws IOException {
++      writeThenClose(buffer);
++    }
++
++    private Path writeThenClose(RegionEntryBuffer buffer) throws IOException {
++      WriterAndPath wap = appendBuffer(buffer, false);
++      if(wap != null) {
++        String encodedRegionName = Bytes.toString(buffer.encodedRegionName);
++        Long value = regionRecoverStatMap.putIfAbsent(encodedRegionName, wap.editsWritten);
++        if (value != null) {
++          Long newValue = regionRecoverStatMap.get(encodedRegionName) + wap.editsWritten;
++          regionRecoverStatMap.put(encodedRegionName, newValue);
++        }
++      }
++
++      Path dst = null;
++      List<IOException> thrown = new ArrayList<>();
++      if(wap != null){
++        dst = closeWriter(buffer.encodedRegionName, wap, thrown);
++      }
++      if (!thrown.isEmpty()) {
++        throw MultipleIOException.createIOException(thrown);
++      }
++      return dst;
++    }
++  }
++
++  /**
+    * Class wraps the actual writer which writes data out and related statistics
+    */
+   public abstract static class SinkWriter {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplayCreateWriterLimited.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplayCreateWriterLimited.java
+new file mode 100644
+index 0000000..05e020f
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALReplayCreateWriterLimited.java
+@@ -0,0 +1,37 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import org.apache.hadoop.hbase.testclassification.MediumTests;
++import org.apache.hadoop.hbase.wal.WALSplitter;
++import org.junit.BeforeClass;
++import org.junit.experimental.categories.Category;
++
++/**
++ * Created by tianjingyun on 17-12-12.
++ */
++@Category(MediumTests.class)
++public class TestWALReplayCreateWriterLimited extends TestWALReplay {
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    TestWALReplay.setUpBeforeClass();
++    TEST_UTIL.getConfiguration().setBoolean(WALSplitter.SPLIT_CREATE_WRITER_LIMITED, true);
++  }
++}
++
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplitCreateWriterLimited.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplitCreateWriterLimited.java
+new file mode 100644
+index 0000000..228f2e2
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/TestWALSplitCreateWriterLimited.java
+@@ -0,0 +1,44 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.wal;
++
++import org.apache.hadoop.hbase.testclassification.LargeTests;
++import org.junit.BeforeClass;
++import org.junit.Ignore;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category(LargeTests.class)
++public class TestWALSplitCreateWriterLimited extends TestWALSplit{
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    TestWALSplit.setUpBeforeClass();
++    TEST_UTIL.getConfiguration().setBoolean(WALSplitter.SPLIT_CREATE_WRITER_LIMITED, true);
++  }
++
++  /**
++   * The logic of this test has conflict with the limit writers split logic, skip this test
++   */
++  @Test(timeout=300000)
++  @Ignore
++  public void testThreadingSlowWriterSmallBuffer() throws Exception {
++    super.testThreadingSlowWriterSmallBuffer();
++  }
++}
++
+-- 
+2.7.4
+

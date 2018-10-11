@@ -1,0 +1,312 @@
+From 9f3215aa3358387aadd613f507b251992898add9 Mon Sep 17 00:00:00 2001
+From: Mikhail Bautin <mbautin@apache.org>
+Date: Thu, 20 Sep 2012 12:50:19 +0000
+Subject: [PATCH 1/2] [jira] [HBASE-6066] [89-fb] Some read performance improvements
+
+Author: michalgr
+
+Summary: Changes suggested in HBASE-6066
+
+Test Plan: I run unit tests.
+
+Reviewers: kranganathan, kannan, stack, mbautin, liyintang
+
+Reviewed By: kannan
+
+CC: HBase Diffs Facebook Group, lhofhansl, JIRA, tedyu
+
+Differential Revision: https://reviews.facebook.net/D4191
+
+git-svn-id: https://svn.apache.org/repos/asf/hbase/branches/0.89-fb@1387998 13f79535-47bb-0310-9956-ffa450edef68
+---
+ .../org/apache/hadoop/hbase/client/Result.java     |    4 +-
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |   41 +++++++++++------
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   13 ++++--
+ .../hadoop/hbase/regionserver/StoreScanner.java    |   46 +++++++++++++------
+ 4 files changed, 69 insertions(+), 35 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/Result.java b/src/main/java/org/apache/hadoop/hbase/client/Result.java
+index 8c3d40e..8ca2b5c 100644
+--- a/src/main/java/org/apache/hadoop/hbase/client/Result.java
++++ b/src/main/java/org/apache/hadoop/hbase/client/Result.java
+@@ -90,12 +90,14 @@ public class Result implements Writable, WritableWithSize {
+     }
+   }
+ 
++  private static final KeyValue[] EMPTY_KEY_VALUE_ARRAY = new KeyValue[0];
++
+   /**
+    * Instantiate a Result with the specified List of KeyValues.
+    * @param kvs List of KeyValues
+    */
+   public Result(List<KeyValue> kvs) {
+-    this(kvs.toArray(new KeyValue[0]));
++    this(kvs.toArray(EMPTY_KEY_VALUE_ARRAY));
+   }
+ 
+   /**
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 8fa8937..4b2975b 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -2985,8 +2985,7 @@ public class HRegion implements HeapSize {
+     KeyValueHeap storeHeap = null;
+     private final byte [] stopRow;
+     private Filter filter;
+-    private List<KeyValue> results = new ArrayList<KeyValue>();
+-    private int batch;
++    private final int batch;
+     private int isScan;
+     private boolean filterClosed = false;
+     private long readPt;
+@@ -3043,7 +3042,7 @@ public class HRegion implements HeapSize {
+     }
+ 
+     @Override
+-    public synchronized boolean next(List<KeyValue> outResults, int limit)
++    public boolean next(List<KeyValue> outResults, int limit)
+         throws IOException {
+       return next(outResults, limit, null);
+     }
+@@ -3066,10 +3065,17 @@ public class HRegion implements HeapSize {
+       // This could be a new thread from the last time we called next().
+       MultiVersionConsistencyControl.setThreadReadPoint(this.readPt);
+ 
+-      results.clear();
+-      boolean returnResult = nextInternal(limit, metric);
++      boolean returnResult;
++      if (outResults.isEmpty()) {
++         // Usually outResults is empty. This is true when next is called
++         // to handle scan or get operation.
++        returnResult = nextInternal(outResults, limit, metric);
++      } else {
++        List<KeyValue> tmpList = new ArrayList<KeyValue>();
++        returnResult = nextInternal(tmpList, limit, metric);
++        outResults.addAll(tmpList);
++      }
+ 
+-      outResults.addAll(results);
+       resetFilters();
+       if (isFilterDone()) {
+         return false;
+@@ -3078,14 +3084,14 @@ public class HRegion implements HeapSize {
+     }
+ 
+     @Override
+-    public synchronized boolean next(List<KeyValue> outResults)
++    public boolean next(List<KeyValue> outResults)
+         throws IOException {
+       // apply the batching limit by default
+       return next(outResults, batch, null);
+     }
+ 
+     @Override
+-    public synchronized boolean next(List<KeyValue> outResults, String metric)
++    public boolean next(List<KeyValue> outResults, String metric)
+         throws IOException {
+       // apply the batching limit by default
+       return next(outResults, batch, metric);
+@@ -3098,7 +3104,16 @@ public class HRegion implements HeapSize {
+       return this.filter != null && this.filter.filterAllRemaining();
+     }
+ 
+-    private boolean nextInternal(int limit, String metric) throws IOException {
++    /**
++     * @param results empty list in which results will be stored
++     */
++    private boolean nextInternal(List<KeyValue> results, int limit, String metric)
++        throws IOException {
++
++      if (!results.isEmpty()) {
++        throw new IllegalArgumentException("First parameter should be an empty list");
++      }
++
+       while (true) {
+         byte [] currentRow = peekRow();
+         if (isStopRow(currentRow)) {
+@@ -3112,6 +3127,7 @@ public class HRegion implements HeapSize {
+           return false;
+         } else if (filterRowKey(currentRow)) {
+           nextRow(currentRow);
++          results.clear();
+         } else {
+           byte [] nextRow;
+           do {
+@@ -3133,12 +3149,8 @@ public class HRegion implements HeapSize {
+           }
+ 
+           if (results.isEmpty() || filterRow()) {
+-            // this seems like a redundant step - we already consumed the row
+-            // there're no left overs.
+-            // the reasons for calling this method are:
+-            // 1. reset the filters.
+-            // 2. provide a hook to fast forward the row (used by subclasses)
+             nextRow(currentRow);
++            results.clear();
+ 
+             // This row was totally filtered out, if this is NOT the last row,
+             // we should continue on.
+@@ -3163,7 +3175,6 @@ public class HRegion implements HeapSize {
+       while (Bytes.equals(currentRow, peekRow())) {
+         this.storeHeap.next(MOCKED_LIST);
+       }
+-      results.clear();
+       resetFilters();
+     }
+ 
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 874c624..568b731 100755
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -2539,13 +2539,16 @@ public class HRegionServer implements HRegionInterface,
+       List<Result> results = new ArrayList<Result>(nbRows);
+       long currentScanResultSize = 0;
+       List<KeyValue> values = new ArrayList<KeyValue>();
+-      for (int i = 0; i < nbRows && currentScanResultSize < maxScannerResultSize; i++) {
+-        requestCount.incrementAndGet();
++
++      int i = 0;
++      for (; i < nbRows && currentScanResultSize < maxScannerResultSize; i++) {
+         // Collect values to be returned here
+         boolean moreRows = s.next(values, HRegion.METRIC_NEXTSIZE);
+         if (!values.isEmpty()) {
+-          for (KeyValue kv : values) {
+-            currentScanResultSize += kv.heapSize();
++          if (maxScannerResultSize < Long.MAX_VALUE){
++            for (KeyValue kv : values) {
++              currentScanResultSize += kv.heapSize();
++            }
+           }
+           results.add(new Result(values));
+         }
+@@ -2554,6 +2557,8 @@ public class HRegionServer implements HRegionInterface,
+         }
+         values.clear();
+       }
++      requestCount.addAndGet(i);
++
+       // Below is an ugly hack where we cast the InternalScanner to be a
+       // HRegion.RegionScanner.  The alternative is to change InternalScanner
+       // interface but its used everywhere whereas we just need a bit of info
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index b2e6a32..add518d 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -23,6 +23,7 @@ package org.apache.hadoop.hbase.regionserver;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.ListIterator;
+ import java.util.NavigableSet;
+ 
+ import org.apache.commons.logging.Log;
+@@ -329,8 +330,7 @@ class StoreScanner extends NonLazyKeyValueScanner
+     }
+     KeyValue kv;
+     KeyValue prevKV = null;
+-    List<KeyValue> results = new ArrayList<KeyValue>();
+-
++    int numNewKeyValues = 0;
+ 
+     Call call = HRegionServer.callContext.get();
+     long quotaRemaining = (call == null) ? Long.MAX_VALUE
+@@ -363,7 +363,6 @@ class StoreScanner extends NonLazyKeyValueScanner
+                 this.countPerRow > (storeLimit + storeOffset)) {
+               // do what SEEK_NEXT_ROW does.
+               if (!matcher.moreRowsMayExistAfter(kv)) {
+-                outResult.addAll(results);
+                 return false;
+               }
+               reseek(matcher.getKeyForNextRow(kv));
+@@ -381,12 +380,12 @@ class StoreScanner extends NonLazyKeyValueScanner
+                 throw new DoNotRetryIOException("Result too large");
+               }
+ 
+-              results.add(copyKv);
++              outResult.add(copyKv);
++              numNewKeyValues++;
+             }
+ 
+             if (qcode == ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW) {
+               if (!matcher.moreRowsMayExistAfter(kv)) {
+-                outResult.addAll(results);
+                 return false;
+               }
+               reseek(matcher.getKeyForNextRow(kv));
+@@ -396,29 +395,23 @@ class StoreScanner extends NonLazyKeyValueScanner
+               this.heap.next();
+             }
+ 
+-            if (limit > 0 && (results.size() == limit)) {
++            if (limit > 0 && (numNewKeyValues == limit)) {
+               break LOOP;
+             }
+             continue;
+ 
+           case DONE:
+-            // copy jazz
+-            outResult.addAll(results);
+             return true;
+ 
+           case DONE_SCAN:
+             close();
+ 
+-            // copy jazz
+-            outResult.addAll(results);
+-
+             return false;
+ 
+           case SEEK_NEXT_ROW:
+             // This is just a relatively simple end of scan fix, to short-cut end
+             // us if there is an endKey in the scan.
+             if (!matcher.moreRowsMayExistAfter(kv)) {
+-              outResult.addAll(results);
+               return false;
+             }
+ 
+@@ -446,6 +439,31 @@ class StoreScanner extends NonLazyKeyValueScanner
+             throw new RuntimeException("UNEXPECTED");
+         }
+       }
++    } catch (IOException e) {
++      /*
++       * Function should not modify its outResult argument if
++       * exception was thrown. In ths case we should remove
++       * last numNewKeyValues elements from outResults.
++       */
++
++      final int length = outResult.size();
++
++      // this should be rare situation, we can use reflection
++      if (outResult instanceof ArrayList<?>){
++        // efficient code for ArrayList
++        ArrayList<?> asArrayList = (ArrayList<?>)outResult;
++        asArrayList.subList(length - numNewKeyValues, length).clear();
++      } else {
++        // generic case
++        ListIterator<?> iterator = outResult.listIterator(length);
++        while (numNewKeyValues-- > 0) {
++          iterator.previous();
++          iterator.remove();
++        }
++      }
++
++      throw e;
++
+     } finally { 
+       // update the counter 
+       if (addedResultsSize > 0 && metric != null) {
+@@ -459,9 +477,7 @@ class StoreScanner extends NonLazyKeyValueScanner
+       }
+     }
+ 
+-    if (!results.isEmpty()) {
+-      // copy jazz
+-      outResult.addAll(results);
++    if (numNewKeyValues > 0) {
+       return true;
+     }
+ 
+-- 
+1.7.0.4
+

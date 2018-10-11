@@ -1,0 +1,519 @@
+From 6e737a763862396fb2e67a11d34d3b75ff4355b5 Mon Sep 17 00:00:00 2001
+From: stack <stack@apache.org>
+Date: Thu, 9 Jun 2016 17:26:57 -0700
+Subject: [PATCH] Speedup hack. Adds a fastpath that Todd pointed me at from
+ Kudu. If there is nothing in the queue of requests, have the Handlers push
+ themselves onto a Stack. When a request does come in, pull a Handler from the
+ Stack rather than put the request into the Queue and hand the Handler the
+ request directly. What is here is a hacked up BalancedQueueWithFastPath
+ (which makes no sense since the fast path wrecks havoc with ordering -- unit
+ tests fail on this). Primitive tests show this doing about 2x, almost back to
+ 0.98 numbers. Will be back to create a FifoRpcExecutor that does fast path.
+
+A hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueWithFastPathRpcExecutor.java
+ Hacked dispatch that checks a Stack of Handlers first for one to
+hand the request too.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+ Add support for fastpath.
+ Create a Handler instance and gather in here all to do w/ the running
+ of Handlers rather than have bare Thread.
+---
+ .../hbase/ipc/AdaptiveLifoCoDelCallQueue.java      |   4 +-
+ .../hadoop/hbase/ipc/BalancedQueueRpcExecutor.java |   2 +-
+ .../ipc/BalancedQueueWithFastPathRpcExecutor.java  |  77 ++++++++
+ .../org/apache/hadoop/hbase/ipc/RpcExecutor.java   | 202 ++++++++++++++-------
+ .../hadoop/hbase/ipc/SimpleRpcScheduler.java       |  15 +-
+ .../hadoop/hbase/ipc/TestSimpleRpcScheduler.java   |  10 +-
+ 6 files changed, 227 insertions(+), 83 deletions(-)
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueWithFastPathRpcExecutor.java
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/AdaptiveLifoCoDelCallQueue.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/AdaptiveLifoCoDelCallQueue.java
+index 08c488b..3d2c2d9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/AdaptiveLifoCoDelCallQueue.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/AdaptiveLifoCoDelCallQueue.java
+@@ -187,8 +187,8 @@ public class AdaptiveLifoCoDelCallQueue implements BlockingQueue<CallRunner> {
+ 
+   @Override
+   public CallRunner poll() {
+-    throw new UnsupportedOperationException("This class doesn't support anything,"
+-      + " but take() and offer() methods");
++    // TODO: Reexamine!!!
++    return this.queue.poll();
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
+index 3505221..15c6210 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueRpcExecutor.java
+@@ -103,4 +103,4 @@ public class BalancedQueueRpcExecutor extends RpcExecutor {
+   public List<BlockingQueue<CallRunner>> getQueues() {
+     return queues;
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueWithFastPathRpcExecutor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueWithFastPathRpcExecutor.java
+new file mode 100644
+index 0000000..dcf2172
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/BalancedQueueWithFastPathRpcExecutor.java
+@@ -0,0 +1,77 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.ipc;
++
++import java.util.Deque;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.ConcurrentLinkedDeque;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.Abortable;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * THIS IS WRONG. IT CAN"T BE A BALANCED QUEUE AND DO FAST PATH TOO... 
++ * Skip queuing Calls if a Handler is available. Just pass the Call direct to a waiting Handler
++ * thread. Try to keep the hot Handlers bubbling rather than let them go cold and lose context.
++ * Idea taken from Apace Kudu (incubating). See
++ * https://gerrit.cloudera.org/#/c/2938/7/src/kudu/rpc/service_queue.h
++ */
++@InterfaceAudience.Private
++public class BalancedQueueWithFastPathRpcExecutor extends BalancedQueueRpcExecutor {
++  private final Deque<Handler> handlerStack = new ConcurrentLinkedDeque<>();
++
++  public BalancedQueueWithFastPathRpcExecutor(String name, int handlerCount, int numQueues,
++      int maxQueueLength) {
++    super(name, handlerCount, numQueues, maxQueueLength);
++  }
++
++  public BalancedQueueWithFastPathRpcExecutor(String name, int handlerCount, int numQueues,
++      int maxQueueLength, Configuration conf, Abortable abortable) {
++    super(name, handlerCount, numQueues, maxQueueLength, conf, abortable);
++  }
++
++  public BalancedQueueWithFastPathRpcExecutor(String name, int handlerCount, int numQueues,
++      Class<? extends BlockingQueue> queueClass, Object... initargs) {
++    super(name, handlerCount, numQueues, queueClass, initargs);
++  }
++
++  public BalancedQueueWithFastPathRpcExecutor(String name, int handlerCount, int numQueues,
++      Configuration conf, Abortable abortable, Class<? extends BlockingQueue> queueClass,
++      Object... initargs) {
++    super(name, handlerCount, numQueues, conf, abortable, queueClass, initargs);
++  }
++
++  @Override
++  public boolean dispatch(CallRunner callTask) throws InterruptedException {
++    Handler handler = popReadyHandler();
++    return handler != null? handler.loadTask(callTask): super.dispatch(callTask);
++  }
++
++  /**
++   * @return Pop a Handler instance if one available ready-to-go or else return null.
++   */
++  Handler popReadyHandler() {
++    return this.handlerStack.poll();
++  }
++
++  @Override
++  protected Deque<Handler> getHandlerStack() {
++    return this.handlerStack;
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+index 880df36..ef2fe76 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+@@ -18,10 +18,13 @@
+ 
+ package org.apache.hadoop.hbase.ipc;
+ 
++
+ import java.util.ArrayList;
++import java.util.Deque;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.Semaphore;
+ import java.util.concurrent.ThreadLocalRandom;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -31,15 +34,23 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.Abortable;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Strings;
+ 
++/**
++ * Runs the CallRunners. Subclass and add particular behaviors such as FIFO, etc.
++ * <p>Has support for fast-pathing where we can skip queuing CallRunners if a Handler is available.
++ * In this case, we pass the CallRunner directly to the waiting Handler
++ * thread skipping the Q. Fast-pathing tries to keep the hot Handlers bubbling rather than let them
++ * go cold and lose context. Idea taken from Apace Kudu (incubating). See
++ * https://gerrit.cloudera.org/#/c/2938/7/src/kudu/rpc/service_queue.h  Fast-path'ing ruins
++ * any attempt at processing requests with a priority so only suited to FIFO. TODO: Point at
++ * fast-pathing examples.
++ */
+ @InterfaceAudience.Private
+-@InterfaceStability.Evolving
+ public abstract class RpcExecutor {
+   private static final Log LOG = LogFactory.getLog(RpcExecutor.class);
+ 
+@@ -48,7 +59,7 @@ public abstract class RpcExecutor {
+   protected volatile int currentQueueLimit;
+ 
+   private final AtomicInteger activeHandlerCount = new AtomicInteger(0);
+-  private final List<Thread> handlers;
++  private final List<Handler> handlers;
+   private final int handlerCount;
+   private final String name;
+   private final AtomicInteger failedHandlerCount = new AtomicInteger(0);
+@@ -59,7 +70,7 @@ public abstract class RpcExecutor {
+   private Abortable abortable = null;
+ 
+   public RpcExecutor(final String name, final int handlerCount) {
+-    this.handlers = new ArrayList<Thread>(handlerCount);
++    this.handlers = new ArrayList<Handler>(handlerCount);
+     this.handlerCount = handlerCount;
+     this.name = Strings.nullToEmpty(name);
+   }
+@@ -96,84 +107,144 @@ public abstract class RpcExecutor {
+   /** Returns the list of request queues */
+   protected abstract List<BlockingQueue<CallRunner>> getQueues();
+ 
++  /**
++   * Fast-path support. Subclasses that support fast-pathing should return a Deque instance in which
++   * to keep Handlers. Returning an instance here enables fast-path support.
++   */
++  protected Deque<Handler> getHandlerStack() {
++    return null;
++  }
++
+   protected void startHandlers(final int port) {
+     List<BlockingQueue<CallRunner>> callQueues = getQueues();
+     startHandlers(null, handlerCount, callQueues, 0, callQueues.size(), port);
+   }
+ 
+-  protected void startHandlers(final String nameSuffix, final int numHandlers,
+-      final List<BlockingQueue<CallRunner>> callQueues,
+-      final int qindex, final int qsize, final int port) {
+-    final String threadPrefix = name + Strings.nullToEmpty(nameSuffix);
+-    for (int i = 0; i < numHandlers; i++) {
+-      final int index = qindex + (i % qsize);
+-      Thread t = new Thread(new Runnable() {
+-        @Override
+-        public void run() {
+-          consumerLoop(callQueues.get(index));
+-        }
+-      });
+-      t.setDaemon(true);
+-      t.setName(threadPrefix + "RpcServer.handler=" + handlers.size() +
+-        ",queue=" + index + ",port=" + port);
+-      t.start();
+-      LOG.debug(threadPrefix + " Start Handler index=" + handlers.size() + " queue=" + index);
+-      handlers.add(t);
++  /**
++   * Handler thread to do CallRunner.
++   */
++  protected class Handler extends Thread {
++    final BlockingQueue<CallRunner> q;
++    final double handlerFailureThreshhold;
++    // Below are for fast-path support. Push this Handler on to the fastPathHandlerStack Deque
++    // if an empty queue of CallRunners so we are available for direct handoff when one comes in.
++    final Deque<Handler> fastPathHandlerStack;
++    // The task we get when fast-pathing.
++    private CallRunner loadedTask;
++    // Semaphore to coordinate loading of fastpathed loadedTask and our running it.
++    private Semaphore semaphore = new Semaphore(1);
++
++    Handler(final String name, final double handlerFailureThreshhold,
++        final BlockingQueue<CallRunner> q, final Deque<Handler> stack) {
++      super(name);
++      setDaemon(true);
++      this.q = q;
++      this.handlerFailureThreshhold = handlerFailureThreshhold;
++      this.fastPathHandlerStack = stack;
++      this.semaphore.drainPermits();
+     }
+-  }
+ 
+-  protected void consumerLoop(final BlockingQueue<CallRunner> myQueue) {
+-    boolean interrupted = false;
+-    double handlerFailureThreshhold =
+-        conf == null ? 1.0 : conf.getDouble(HConstants.REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT,
+-          HConstants.DEFAULT_REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT);
+-    try {
+-      while (running) {
+-        try {
+-          MonitoredRPCHandler status = RpcServer.getStatus();
+-          CallRunner task = myQueue.take();
+-          task.setStatus(status);
++    /**
++     * @param task Task gotten via fastpath.
++     * @return True if we successfully loaded our task
++     */
++    boolean loadTask(final CallRunner task) {
++      this.loadedTask = task;
++      this.semaphore.release();
++      return true;
++    }
++
++    @Override
++    public void run() {
++      boolean interrupted = false;
++      try {
++        while (running) {
+           try {
+-            activeHandlerCount.incrementAndGet();
+-            task.run();
+-          } catch (Throwable e) {
+-            if (e instanceof Error) {
+-              int failedCount = failedHandlerCount.incrementAndGet();
+-              if (handlerFailureThreshhold >= 0
+-                  && failedCount > handlerCount * handlerFailureThreshhold) {
+-                String message =
+-                    "Number of failed RpcServer handler exceeded threshhold "
+-                        + handlerFailureThreshhold + "  with failed reason: "
+-                        + StringUtils.stringifyException(e);
+-                if (abortable != null) {
+-                  abortable.abort(message, e);
+-                } else {
+-                  LOG.error("Received " + StringUtils.stringifyException(e)
+-                    + " but not aborting due to abortable being null");
+-                  throw e;
+-                }
++            // Get a task if one in the Q.
++            CallRunner task = this.q.poll();
++            if (task == null) {
++              // Else, if a fastPathHandlerStack present and no task in Q, register ourselves for
++              // the fastpath handoff done via fastPathHandlerStack.
++              if (this.fastPathHandlerStack != null) {
++                this.fastPathHandlerStack.push(this);
++                this.semaphore.acquire();
++                task = this.loadedTask;
+               } else {
+-                LOG.warn("RpcServer handler threads encountered errors "
+-                    + StringUtils.stringifyException(e));
++                // No fastpath available. Block until a task comes available.
++                task = this.q.take();
+               }
+-            } else {
+-              LOG.warn("RpcServer handler threads encountered exceptions "
+-                  + StringUtils.stringifyException(e));
+             }
+-          } finally {
+-            activeHandlerCount.decrementAndGet();
++            handle(task);
++          } catch (InterruptedException e) {
++            interrupted = true;
+           }
+-        } catch (InterruptedException e) {
+-          interrupted = true;
++        }
++      } catch (Exception e) {
++        LOG.warn(e);
++        throw e;
++      } finally {
++        if (interrupted) {
++          Thread.currentThread().interrupt();
+         }
+       }
+-    } finally {
+-      if (interrupted) {
+-        Thread.currentThread().interrupt();
++    }
++
++    void handle(CallRunner task) {
++      MonitoredRPCHandler status = RpcServer.getStatus();
++      task.setStatus(status);
++      try {
++        activeHandlerCount.incrementAndGet();
++        task.run();
++      } catch (Throwable e) {
++        if (e instanceof Error) {
++          int failedCount = failedHandlerCount.incrementAndGet();
++          if (this.handlerFailureThreshhold >= 0
++              && failedCount > handlerCount * this.handlerFailureThreshhold) {
++            String message =
++                "Number of failed RpcServer handler exceeded threshhold "
++                    + this.handlerFailureThreshhold + "  with failed reason: "
++                    + StringUtils.stringifyException(e);
++            if (abortable != null) {
++              abortable.abort(message, e);
++            } else {
++              LOG.error("Received " + StringUtils.stringifyException(e)
++                + " but not aborting due to abortable being null");
++              throw e;
++            }
++          } else {
++            LOG.warn("RpcServer handler threads encountered errors "
++                + StringUtils.stringifyException(e));
++          }
++        } else {
++          LOG.warn("RpcServer handler threads encountered exceptions "
++              + StringUtils.stringifyException(e));
++        }
++      } finally {
++        activeHandlerCount.decrementAndGet();
+       }
+     }
+   }
+ 
++  protected void startHandlers(final String nameSuffix, final int numHandlers,
++      final List<BlockingQueue<CallRunner>> callQueues,
++      final int qindex, final int qsize, final int port) {
++    final String threadPrefix = name + Strings.nullToEmpty(nameSuffix);
++    double handlerFailureThreshhold =
++        conf == null ? 1.0 : conf.getDouble(HConstants.REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT,
++          HConstants.DEFAULT_REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT);
++    final Deque<Handler> handlerStack = getHandlerStack();
++    for (int i = 0; i < numHandlers; i++) {
++      final int index = qindex + (i % qsize);
++      String name = threadPrefix + "RpcServer.handler=" + handlers.size() +
++          ",queue=" + index + ",port=" + port;
++      Handler handler =
++          new Handler(name, handlerFailureThreshhold, callQueues.get(index), handlerStack);
++      handler.start();
++      LOG.debug("Started " + name);
++      handlers.add(handler);
++    }
++  }
++
+   public static abstract class QueueBalancer {
+     /**
+      * @return the index of the next queue to which a request should be inserted
+@@ -194,7 +265,6 @@ public abstract class RpcExecutor {
+    * All requests go to the first queue, at index 0
+    */
+   private static QueueBalancer ONE_QUEUE = new QueueBalancer() {
+-
+     @Override
+     public int getNextQueue() {
+       return 0;
+@@ -227,4 +297,4 @@ public abstract class RpcExecutor {
+     }
+     currentQueueLimit = conf.getInt(configKey, currentQueueLimit);
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+index d9d61c1..037b42c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/SimpleRpcScheduler.java
+@@ -95,7 +95,7 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+     String callQueueType = conf.get(CALL_QUEUE_TYPE_CONF_KEY,
+       CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE);
+ 
+-    if (callQueueType.equals(CALL_QUEUE_TYPE_CODEL_CONF_VALUE)) {
++    if (isCodelQueueType(callQueueType)) {
+       // update CoDel Scheduler tunables
+       int codelTargetDelay = conf.getInt(CALL_QUEUE_CODEL_TARGET_DELAY,
+         CALL_QUEUE_CODEL_DEFAULT_TARGET_DELAY);
+@@ -203,7 +203,7 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+         callExecutor = new RWQueueRpcExecutor("RWQ.default", handlerCount, numCallQueues,
+             callqReadShare, callqScanShare, maxQueueLength, conf, abortable,
+             BoundedPriorityBlockingQueue.class, callPriority);
+-      } else if (callQueueType.equals(CALL_QUEUE_TYPE_CODEL_CONF_VALUE)) {
++      } else if (isCodelQueueType(callQueueType)) {
+         Object[] callQueueInitArgs = {maxQueueLength, codelTargetDelay, codelInterval,
+           codelLifoThreshold, numGeneralCallsDropped, numLifoModeSwitches};
+         callExecutor = new RWQueueRpcExecutor("RWQ.default", handlerCount,
+@@ -219,16 +219,17 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+       if (isDeadlineQueueType(callQueueType)) {
+         CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);
+         callExecutor =
+-          new BalancedQueueRpcExecutor("BalancedQ.default", handlerCount, numCallQueues,
++          new BalancedQueueWithFastPathRpcExecutor("BalancedFPQ.default", handlerCount,
++            numCallQueues,
+             conf, abortable, BoundedPriorityBlockingQueue.class, maxQueueLength, callPriority);
+-      } else if (callQueueType.equals(CALL_QUEUE_TYPE_CODEL_CONF_VALUE)) {
++      } else if (isCodelQueueType(callQueueType)) {
+         callExecutor =
+           new BalancedQueueRpcExecutor("BalancedQ.default", handlerCount, numCallQueues,
+             conf, abortable, AdaptiveLifoCoDelCallQueue.class, maxQueueLength,
+             codelTargetDelay, codelInterval, codelLifoThreshold,
+             numGeneralCallsDropped, numLifoModeSwitches);
+       } else {
+-        callExecutor = new BalancedQueueRpcExecutor("BalancedQ.default", handlerCount,
++        callExecutor = new BalancedQueueWithFastPathRpcExecutor("BalancedFPQ.default", handlerCount,
+             numCallQueues, maxQueueLength, conf, abortable);
+       }
+     }
+@@ -246,6 +247,10 @@ public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObs
+     return callQueueType.equals(CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE);
+   }
+ 
++  private static boolean isCodelQueueType(final String callQueueType) {
++    return callQueueType.equals(CALL_QUEUE_TYPE_CODEL_CONF_VALUE);
++  }
++
+   public SimpleRpcScheduler(
+ 	      Configuration conf,
+ 	      int handlerCount,
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
+index 2f71980..db4485a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/ipc/TestSimpleRpcScheduler.java
+@@ -40,19 +40,12 @@ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.LinkedBlockingQueue;
+ 
+-import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.ImmutableMap;
+-import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.Maps;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.client.Put;
+-import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandlerImpl;
+-import org.apache.hadoop.hbase.security.User;
+-import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.ipc.RpcServer.Call;
+ import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandlerImpl;
+ import org.apache.hadoop.hbase.protobuf.RequestConverter;
+@@ -60,7 +53,6 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanRequest;
+ import org.apache.hadoop.hbase.protobuf.generated.RPCProtos;
+ import org.apache.hadoop.hbase.protobuf.generated.RPCProtos.RequestHeader;
+ import org.apache.hadoop.hbase.security.User;
+-import org.apache.hadoop.hbase.testclassification.RPCTests;
+ import org.apache.hadoop.hbase.testclassification.SmallTests;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.hbase.util.EnvironmentEdge;
+@@ -243,7 +235,7 @@ public class TestSimpleRpcScheduler {
+       // -> WITH REORDER [10 10 10 10 10 10 50 100] -> 530 (Deadline Queue)
+       if (queueType.equals(SimpleRpcScheduler.CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE)) {
+         assertEquals(530, totalTime);
+-      } else /* if (queueType.equals(SimpleRpcScheduler.CALL_QUEUE_TYPE_FIFO_CONF_VALUE)) */ {
++      } else if (queueType.equals(SimpleRpcScheduler.CALL_QUEUE_TYPE_FIFO_CONF_VALUE)) {
+         assertEquals(930, totalTime);
+       }
+     } finally {
+-- 
+2.6.1

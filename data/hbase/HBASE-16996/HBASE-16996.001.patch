@@ -1,0 +1,274 @@
+From cdf36f373a8f701e75924e9bd07e335cd9d419bd Mon Sep 17 00:00:00 2001
+From: Josh Elser <elserj@apache.org>
+Date: Thu, 3 Nov 2016 14:04:01 -0400
+Subject: [PATCH 2/2] HBASE-16996 Basic crud operations around the new quota
+ type in the quota table
+
+---
+ .../apache/hadoop/hbase/quotas/QuotaTableUtil.java |  12 ++-
+ .../hadoop/hbase/quotas/MasterQuotaManager.java    |  29 +++++
+ .../apache/hadoop/hbase/quotas/TestQuotaAdmin.java | 119 ++++++++++++++++++++-
+ 3 files changed, 157 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
+index 116dd0c..511aab4 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/quotas/QuotaTableUtil.java
+@@ -52,7 +52,9 @@ import org.apache.hadoop.hbase.util.Strings;
+  * <pre>
+  *     ROW-KEY      FAM/QUAL        DATA
+  *   n.&lt;namespace&gt; q:s         &lt;global-quotas&gt;
++ *   n.&lt;namespace&gt; u:du        &lt;size in bytes&gt;
+  *   t.&lt;table&gt;     q:s         &lt;global-quotas&gt;
++ *   t.&lt;table&gt;     u:du        &lt;size in bytes&gt;
+  *   u.&lt;user&gt;      q:s         &lt;global-quotas&gt;
+  *   u.&lt;user&gt;      q:s.&lt;table&gt; &lt;table-quotas&gt;
+  *   u.&lt;user&gt;      q:s.&lt;ns&gt;:   &lt;namespace-quotas&gt;
+@@ -71,6 +73,7 @@ public class QuotaTableUtil {
+   protected static final byte[] QUOTA_FAMILY_USAGE = Bytes.toBytes("u");
+   protected static final byte[] QUOTA_QUALIFIER_SETTINGS = Bytes.toBytes("s");
+   protected static final byte[] QUOTA_QUALIFIER_SETTINGS_PREFIX = Bytes.toBytes("s.");
++  protected static final byte[] QUOTA_QUALIFIER_DISKUSAGE = Bytes.toBytes("du");
+   protected static final byte[] QUOTA_USER_ROW_KEY_PREFIX = Bytes.toBytes("u.");
+   protected static final byte[] QUOTA_TABLE_ROW_KEY_PREFIX = Bytes.toBytes("t.");
+   protected static final byte[] QUOTA_NAMESPACE_ROW_KEY_PREFIX = Bytes.toBytes("n.");
+@@ -298,11 +301,15 @@ public class QuotaTableUtil {
+    *  Quotas protobuf helpers
+    */
+   protected static Quotas quotasFromData(final byte[] data) throws IOException {
++    return quotasFromData(data, 0, data.length);
++  }
++
++  protected static Quotas quotasFromData(final byte[] data, int offset, int length) throws IOException {
+     int magicLen = ProtobufMagic.lengthOfPBMagic();
+-    if (!ProtobufMagic.isPBMagicPrefix(data, 0, magicLen)) {
++    if (!ProtobufMagic.isPBMagicPrefix(data, offset, magicLen)) {
+       throw new IOException("Missing pb magic prefix");
+     }
+-    return Quotas.parseFrom(new ByteArrayInputStream(data, magicLen, data.length - magicLen));
++    return Quotas.parseFrom(new ByteArrayInputStream(data, offset + magicLen, length - magicLen));
+   }
+ 
+   protected static byte[] quotasToData(final Quotas data) throws IOException {
+@@ -316,6 +323,7 @@ public class QuotaTableUtil {
+     boolean hasSettings = false;
+     hasSettings |= quotas.hasThrottle();
+     hasSettings |= quotas.hasBypassGlobals();
++    hasSettings |= quotas.hasSpace();
+     return !hasSettings;
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
+index 647a770..9cceb5e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/quotas/MasterQuotaManager.java
+@@ -37,6 +37,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.SetQuotaResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.Quotas;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.SpaceLimitRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.SpaceQuota;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.Throttle;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.ThrottleRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.TimedQuota;
+@@ -293,9 +295,11 @@ public class MasterQuotaManager implements RegionStateListener {
+     Quotas quotas = quotaOps.fetch();
+     quotaOps.preApply(quotas);
+ 
++    // Copy the user request into the Quotas object
+     Quotas.Builder builder = (quotas != null) ? quotas.toBuilder() : Quotas.newBuilder();
+     if (req.hasThrottle()) applyThrottle(builder, req.getThrottle());
+     if (req.hasBypassGlobals()) applyBypassGlobals(builder, req.getBypassGlobals());
++    if (req.hasSpaceLimit()) applySpaceLimit(builder, req.getSpaceLimit());
+ 
+     // Submit new changes
+     quotas = builder.build();
+@@ -437,6 +441,31 @@ public class MasterQuotaManager implements RegionStateListener {
+     }
+   }
+ 
++  /**
++   * Adds the information from the provided {@link SpaceLimitRequest} to the {@link Quotas} builder.
++   *
++   * @param quotas The builder to update.
++   * @param req The request to extract space quota information from.
++   */
++  void applySpaceLimit(final Quotas.Builder quotas, final SpaceLimitRequest req) {
++    if (req.hasQuota()) {
++      applySpaceQuota(quotas, req.getQuota());
++    }
++  }
++
++  /**
++   * Merges the provided {@link SpaceQuota} into the given {@link Quotas} builder.
++   *
++   * @param quotas The Quotas builder instance to update
++   * @param quota The SpaceQuota instance to update from
++   */
++  void applySpaceQuota(final Quotas.Builder quotas, final SpaceQuota quota) {
++    // Create a builder for Quotas
++    SpaceQuota.Builder builder = quotas.hasSpace() ? quotas.getSpace().toBuilder() : SpaceQuota.newBuilder();
++    // Update the values from the provided quota into the new one and set it on Quotas.
++    quotas.setSpace(builder.mergeFrom(quota).build());
++  }
++
+   private void validateTimedQuota(final TimedQuota timedQuota) throws IOException {
+     if (timedQuota.getSoftLimit() < 1) {
+       throw new DoNotRetryIOException(new UnsupportedOperationException(
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/quotas/TestQuotaAdmin.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/quotas/TestQuotaAdmin.java
+index d6e8952..1550df7 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/quotas/TestQuotaAdmin.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/quotas/TestQuotaAdmin.java
+@@ -22,20 +22,32 @@ import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellScanner;
+ import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
+ import org.apache.hadoop.hbase.client.Admin;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.client.ResultScanner;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.client.Table;
+ import org.apache.hadoop.hbase.security.User;
++import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.Quotas;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.QuotaProtos.SpaceLimitRequest;
+ import org.apache.hadoop.hbase.testclassification.ClientTests;
+ import org.apache.hadoop.hbase.testclassification.MediumTests;
+-
+ import org.junit.AfterClass;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ import org.junit.experimental.categories.Category;
+ 
++import com.google.common.collect.Iterables;
++
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
+ /**
+@@ -233,10 +245,115 @@ public class TestQuotaAdmin {
+     assertNumResults(0, null);
+   }
+ 
++  @Test
++  public void testSetAndGetSpaceQuota() throws Exception {
++    Admin admin = TEST_UTIL.getAdmin();
++    final TableName tn = TableName.valueOf("table1");
++    final long sizeLimit = 1024L * 1024L * 1024L * 1024L * 5L; // 5TB
++    final SpaceViolationPolicy violationPolicy = SpaceViolationPolicy.NO_WRITES;
++    QuotaSettings settings = QuotaSettingsFactory.limitTableSpace(tn, sizeLimit, violationPolicy);
++    admin.setQuota(settings);
++
++    // Verify the Quotas in the table
++    try (Table quotaTable = TEST_UTIL.getConnection().getTable(QuotaTableUtil.QUOTA_TABLE_NAME)) {
++      ResultScanner scanner = quotaTable.getScanner(new Scan());
++      try {
++        Result r = Iterables.getOnlyElement(scanner);
++        CellScanner cells = r.cellScanner();
++        assertTrue("Expected to find a cell", cells.advance());
++        assertSpaceQuota(sizeLimit, violationPolicy, cells.current());
++      } finally {
++        scanner.close();
++      }
++    }
++
++    // Verify we can retrieve it via the QuotaRetriever API
++    QuotaRetriever scanner = QuotaRetriever.open(admin.getConfiguration());
++    try {
++      assertSpaceQuota(sizeLimit, violationPolicy, Iterables.getOnlyElement(scanner));
++    } finally {
++      scanner.close();
++    }
++  }
++
++  @Test
++  public void testSetAndModifyQuota() throws Exception {
++    Admin admin = TEST_UTIL.getAdmin();
++    final TableName tn = TableName.valueOf("table1");
++    final long originalSizeLimit = 1024L * 1024L * 1024L * 1024L * 5L; // 5TB
++    final SpaceViolationPolicy violationPolicy = SpaceViolationPolicy.NO_WRITES;
++    QuotaSettings settings = QuotaSettingsFactory.limitTableSpace(tn, originalSizeLimit, violationPolicy);
++    admin.setQuota(settings);
++
++    // Verify the Quotas in the table
++    try (Table quotaTable = TEST_UTIL.getConnection().getTable(QuotaTableUtil.QUOTA_TABLE_NAME)) {
++      ResultScanner scanner = quotaTable.getScanner(new Scan());
++      try {
++        Result r = Iterables.getOnlyElement(scanner);
++        CellScanner cells = r.cellScanner();
++        assertTrue("Expected to find a cell", cells.advance());
++        assertSpaceQuota(originalSizeLimit, violationPolicy, cells.current());
++      } finally {
++        scanner.close();
++      }
++    }
++
++    // Verify we can retrieve it via the QuotaRetriever API
++    QuotaRetriever quotaScanner = QuotaRetriever.open(admin.getConfiguration());
++    try {
++      assertSpaceQuota(originalSizeLimit, violationPolicy, Iterables.getOnlyElement(quotaScanner));
++    } finally {
++      quotaScanner.close();
++    }
++
++    // Setting a new size and policy should be reflected
++    final long newSizeLimit = 1024L * 1024L * 1024L * 1024L; // 1TB
++    final SpaceViolationPolicy newViolationPolicy = SpaceViolationPolicy.NO_WRITES_COMPACTIONS;
++    QuotaSettings newSettings = QuotaSettingsFactory.limitTableSpace(tn, newSizeLimit, newViolationPolicy);
++    admin.setQuota(newSettings);
++
++    // Verify the new Quotas in the table
++    try (Table quotaTable = TEST_UTIL.getConnection().getTable(QuotaTableUtil.QUOTA_TABLE_NAME)) {
++      ResultScanner scanner = quotaTable.getScanner(new Scan());
++      try {
++        Result r = Iterables.getOnlyElement(scanner);
++        CellScanner cells = r.cellScanner();
++        assertTrue("Expected to find a cell", cells.advance());
++        assertSpaceQuota(newSizeLimit, newViolationPolicy, cells.current());
++      } finally {
++        scanner.close();
++      }
++    }
++
++    // Verify we can retrieve the new quota via the QuotaRetriever API
++    quotaScanner = QuotaRetriever.open(admin.getConfiguration());
++    try {
++      assertSpaceQuota(newSizeLimit, newViolationPolicy, Iterables.getOnlyElement(quotaScanner));
++    } finally {
++      quotaScanner.close();
++    }
++  }
++
+   private void assertNumResults(int expected, final QuotaFilter filter) throws Exception {
+     assertEquals(expected, countResults(filter));
+   }
+ 
++  private void assertSpaceQuota(long sizeLimit, SpaceViolationPolicy violationPolicy, Cell cell) throws Exception {
++    Quotas q = QuotaTableUtil.quotasFromData(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength());
++    assertTrue("Quota should have space quota defined", q.hasSpace());
++    QuotaProtos.SpaceQuota spaceQuota = q.getSpace();
++    assertEquals(sizeLimit, spaceQuota.getSoftLimit());
++    assertEquals(violationPolicy, ProtobufUtil.toViolationPolicy(spaceQuota.getViolationPolicy()));
++  }
++
++  private void assertSpaceQuota(long sizeLimit, SpaceViolationPolicy violationPolicy, QuotaSettings actualSettings) {
++    assertTrue("The actual QuotaSettings was not an instance of " + SpaceLimitSettings.class + " but of "
++        + actualSettings.getClass(), actualSettings instanceof SpaceLimitSettings);
++    SpaceLimitRequest spaceLimitRequest = ((SpaceLimitSettings) actualSettings).getProto();
++    assertEquals(sizeLimit, spaceLimitRequest.getQuota().getSoftLimit());
++    assertEquals(violationPolicy, ProtobufUtil.toViolationPolicy(spaceLimitRequest.getQuota().getViolationPolicy()));
++  }
++
+   private int countResults(final QuotaFilter filter) throws Exception {
+     QuotaRetriever scanner = QuotaRetriever.open(TEST_UTIL.getConfiguration(), filter);
+     try {
+-- 
+2.10.2
+

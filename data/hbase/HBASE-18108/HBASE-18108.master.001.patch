@@ -1,0 +1,473 @@
+From b479c321ee9f0e1f6adefb6c9ec08a0e3b7bc982 Mon Sep 17 00:00:00 2001
+From: Peter Somogyi <psomogyi@cloudera.com>
+Date: Thu, 5 Oct 2017 15:44:24 -0700
+Subject: [PATCH] HBASE-18108 Procedure WALs are archived but not cleaned; fix
+
+The archived Procedure WALs are moved to <hbase_root>/oldWALs directory
+next to WALs. TimeToLiveProcedureWALCleaner class was added which
+regularly cleans the Procedure WAL files from there.
+
+The TimeToLiveProcedureWALCleaner is now added to
+hbase.master.logcleaner.plugins to clean the 2 WALs in one run.
+
+A new config parameter is added hbase.master.proclogcleaner.ttl
+which specifies how long a Procedure WAL should stay in the
+archive directory.
+---
+ hbase-common/src/main/resources/hbase-default.xml  |   8 +-
+ .../org/apache/hadoop/hbase/master/HMaster.java    |   4 +-
+ .../master/cleaner/BaseFileCleanerDelegate.java    |   7 +-
+ .../hadoop/hbase/master/cleaner/LogCleaner.java    |  16 ++--
+ .../hbase/master/cleaner/TimeToLiveLogCleaner.java |  15 ++-
+ .../cleaner/TimeToLiveProcedureWALCleaner.java     |  86 +++++++++++++++++
+ .../master/procedure/MasterProcedureUtil.java      |  16 ++++
+ .../hbase/master/cleaner/TestLogsCleaner.java      | 102 ++++++++++++---------
+ 8 files changed, 196 insertions(+), 58 deletions(-)
+ create mode 100644 hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveProcedureWALCleaner.java
+
+diff --git a/hbase-common/src/main/resources/hbase-default.xml b/hbase-common/src/main/resources/hbase-default.xml
+index ea369153f9..c8121829cd 100644
+--- a/hbase-common/src/main/resources/hbase-default.xml
++++ b/hbase-common/src/main/resources/hbase-default.xml
+@@ -129,7 +129,7 @@ possible configurations would overwhelm and obscure the important.
+   </property>
+   <property>
+     <name>hbase.master.logcleaner.plugins</name>
+-    <value>org.apache.hadoop.hbase.master.cleaner.TimeToLiveLogCleaner</value>
++    <value>org.apache.hadoop.hbase.master.cleaner.TimeToLiveLogCleaner,org.apache.hadoop.hbase.master.cleaner.TimeToLiveProcedureWALCleaner</value>
+     <description>A comma-separated list of BaseLogCleanerDelegate invoked by
+     the LogsCleaner service. These WAL cleaners are called in order,
+     so put the cleaner that prunes the most files in front. To
+@@ -143,6 +143,12 @@ possible configurations would overwhelm and obscure the important.
+     <description>Maximum time a WAL can stay in the .oldlogdir directory,
+     after which it will be cleaned by a Master thread.</description>
+   </property>
++  <property>
++    <name>hbase.master.proclogcleaner.ttl</name>
++    <value>604800000</value>
++    <description>Maximum time a Procedure WAL can stay in the .oldlogdir directory,
++    after which it will be cleaned by a Master thread.</description>
++  </property>
+   <property>
+     <name>hbase.master.hfilecleaner.plugins</name>
+     <value>org.apache.hadoop.hbase.master.cleaner.TimeToLiveHFileCleaner</value>
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 9111f94182..dde9c0efa3 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -1198,10 +1198,10 @@ public class HMaster extends HRegionServer implements MasterServices {
+ 
+   private void startProcedureExecutor() throws IOException {
+     final MasterProcedureEnv procEnv = new MasterProcedureEnv(this);
++    final Path rootDir = FSUtils.getRootDir(conf);
+     final Path walDir = new Path(FSUtils.getWALRootDir(this.conf),
+         MasterProcedureConstants.MASTER_PROCEDURE_LOGDIR);
+-    // TODO: No cleaner currently! Make it a subdir!
+-    final Path walArchiveDir = new Path(walDir, "archive");
++    final Path walArchiveDir = new Path(rootDir, HConstants.HREGION_OLDLOGDIR_NAME);
+ 
+     final FileSystem walFs = walDir.getFileSystem(conf);
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/BaseFileCleanerDelegate.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/BaseFileCleanerDelegate.java
+index 920726f4a0..85c6dba023 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/BaseFileCleanerDelegate.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/BaseFileCleanerDelegate.java
+@@ -20,7 +20,6 @@ package org.apache.hadoop.hbase.master.cleaner;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.hbase.BaseConfigurable;
+ 
+-import org.apache.hadoop.hbase.shaded.com.google.common.base.Predicate;
+ import org.apache.hadoop.hbase.shaded.com.google.common.collect.Iterables;
+ 
+ import java.util.Map;
+@@ -34,11 +33,7 @@ implements FileCleanerDelegate {
+ 
+   @Override
+   public Iterable<FileStatus> getDeletableFiles(Iterable<FileStatus> files) {
+-    return Iterables.filter(files, new Predicate<FileStatus>() {
+-      @Override
+-      public boolean apply(FileStatus file) {
+-        return isFileDeletable(file);
+-      }});
++    return Iterables.filter(files, this::isFileDeletable);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/LogCleaner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/LogCleaner.java
+index d6e3d15ec0..8569cb5bc1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/LogCleaner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/LogCleaner.java
+@@ -25,12 +25,13 @@ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Stoppable;
++import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
+ 
+ /**
+- * This Chore, every time it runs, will attempt to delete the WALs in the old logs folder. The WAL
+- * is only deleted if none of the cleaner delegates says otherwise.
++ * This Chore, every time it runs, will attempt to delete the WALs and Procedure WALs in the old
++ * logs folder. The WAL is only deleted if none of the cleaner delegates says otherwise.
+  * @see BaseLogCleanerDelegate
+  */
+ @InterfaceAudience.Private
+@@ -38,19 +39,20 @@ public class LogCleaner extends CleanerChore<BaseLogCleanerDelegate> {
+   private static final Log LOG = LogFactory.getLog(LogCleaner.class.getName());
+ 
+   /**
+-   * @param p the period of time to sleep between each run
+-   * @param s the stopper
++   * @param period the period of time to sleep between each run
++   * @param stopper the stopper
+    * @param conf configuration to use
+    * @param fs handle to the FS
+    * @param oldLogDir the path to the archived logs
+    */
+-  public LogCleaner(final int p, final Stoppable s, Configuration conf, FileSystem fs,
++  public LogCleaner(final int period, final Stoppable stopper, Configuration conf, FileSystem fs,
+       Path oldLogDir) {
+-    super("LogsCleaner", p, s, conf, fs, oldLogDir, HBASE_MASTER_LOGCLEANER_PLUGINS);
++    super("LogsCleaner", period, stopper, conf, fs, oldLogDir, HBASE_MASTER_LOGCLEANER_PLUGINS);
+   }
+ 
+   @Override
+   protected boolean validate(Path file) {
+-    return AbstractFSWALProvider.validateWALFilename(file.getName());
++    return AbstractFSWALProvider.validateWALFilename(file.getName())
++        || MasterProcedureUtil.validateProcedureWALFilename(file.getName());
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveLogCleaner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveLogCleaner.java
+index 9504a1364c..1171713ae8 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveLogCleaner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveLogCleaner.java
+@@ -19,6 +19,7 @@ package org.apache.hadoop.hbase.master.cleaner;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+@@ -32,12 +33,21 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
+ public class TimeToLiveLogCleaner extends BaseLogCleanerDelegate {
+   private static final Log LOG = LogFactory.getLog(TimeToLiveLogCleaner.class.getName());
++  public static final String TTL_CONF_KEY = "hbase.master.logcleaner.ttl";
++  // default ttl = 10 minutes
++  public static final long DEFAULT_TTL = 600_000L;
+   // Configured time a log can be kept after it was closed
+   private long ttl;
+   private boolean stopped = false;
+ 
+   @Override
+   public boolean isLogDeletable(FileStatus fStat) {
++    // Files are validated for the second time here,
++    // if it causes a bottleneck this logic needs refactored
++    if (!isValidFile(fStat.getPath().getName())) {
++      return true;
++    }
++
+     long currentTime = EnvironmentEdgeManager.currentTime();
+     long time = fStat.getModificationTime();
+     long life = currentTime - time;
+@@ -57,9 +67,12 @@ public class TimeToLiveLogCleaner extends BaseLogCleanerDelegate {
+   @Override
+   public void setConf(Configuration conf) {
+     super.setConf(conf);
+-    this.ttl = conf.getLong("hbase.master.logcleaner.ttl", 600000);
++    this.ttl = conf.getLong(TTL_CONF_KEY, DEFAULT_TTL);
+   }
+ 
++  private boolean isValidFile(String filename) {
++    return AbstractFSWALProvider.validateWALFilename(filename);
++  }
+ 
+   @Override
+   public void stop(String why) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveProcedureWALCleaner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveProcedureWALCleaner.java
+new file mode 100644
+index 0000000000..3c7c6d6202
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/cleaner/TimeToLiveProcedureWALCleaner.java
+@@ -0,0 +1,86 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.master.cleaner;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.hbase.HBaseInterfaceAudience;
++import org.apache.hadoop.hbase.master.procedure.MasterProcedureUtil;
++import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
++import org.apache.yetus.audience.InterfaceAudience;
++
++/**
++ * Procedure WAL cleaner that uses the timestamp of the Procedure WAL to determine if it should be
++ * deleted. By default they are allowed to live for {@value #DEFAULT_TTL}
++ */
++@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
++public class TimeToLiveProcedureWALCleaner extends BaseFileCleanerDelegate {
++
++  private static final Log LOG = LogFactory.getLog(TimeToLiveProcedureWALCleaner.class.getName());
++  public static final String TTL_CONF_KEY = "hbase.master.proclogcleaner.ttl";
++  // default ttl = 7 days
++  public static final long DEFAULT_TTL = 604_800_000L;
++  // Configured time a procedure log can be kept after it was moved to the archive
++  private long ttl;
++  private boolean stopped = false;
++
++  @Override
++  public void setConf(Configuration conf) {
++    this.ttl = conf.getLong(TTL_CONF_KEY, DEFAULT_TTL);
++    super.setConf(conf);
++  }
++
++  @Override
++  public boolean isFileDeletable(FileStatus fStat) {
++    // Files are validated for the second time here,
++    // if it causes a bottleneck this logic needs refactored
++    if (!isValidFile(fStat.getPath().getName())) {
++      return true;
++    }
++
++    long currentTime = EnvironmentEdgeManager.currentTime();
++    long time = fStat.getModificationTime();
++    long life = currentTime - time;
++    if (LOG.isTraceEnabled()) {
++      LOG.trace("Procedure log life:" + life + ", ttl:" + ttl + ", current:" + currentTime +
++          ", from: " + time);
++    }
++    if (life < 0) {
++      LOG.warn("Found a procedure log (" + fStat.getPath() + ") newer than current time ("
++          + currentTime + " < " + time + "), probably a clock skew");
++      return false;
++    }
++    return life > ttl;
++  }
++
++  private boolean isValidFile(String filename) {
++    return MasterProcedureUtil.validateProcedureWALFilename(filename);
++  }
++
++  @Override
++  public void stop(String why) {
++    this.stopped = true;
++  }
++
++  @Override
++  public boolean isStopped() {
++    return this.stopped;
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/MasterProcedureUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/MasterProcedureUtil.java
+index 27e67b0961..7826f96f79 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/MasterProcedureUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/procedure/MasterProcedureUtil.java
+@@ -19,6 +19,7 @@
+ package org.apache.hadoop.hbase.master.procedure;
+ 
+ import java.io.IOException;
++import java.util.regex.Pattern;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+@@ -141,4 +142,19 @@ public final class MasterProcedureUtil {
+     }
+     return runnable.getProcId();
+   }
++
++  /**
++   * Pattern used to validate a Procedure WAL file name see
++   * {@link #validateProcedureWALFilename(String)} for description.
++   */
++  private static final Pattern pattern = Pattern.compile(".*pv-\\d{20}.log");
++
++  /**
++   * A Procedure WAL file name is of the format: pv-&lt;wal-id&gt;.log where wal-id is 20 digits.
++   * @param filename name of the file to validate
++   * @return <tt>true</tt> if the filename matches a Procedure WAL, <tt>false</tt> otherwise
++   */
++  public static boolean validateProcedureWALFilename(String filename) {
++    return pattern.matcher(filename).matches();
++  }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java
+index 1a30df3d1c..34a281bf08 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java
+@@ -86,75 +86,97 @@ public class TestLogsCleaner {
+     TEST_UTIL.shutdownMiniZKCluster();
+   }
+ 
++  /**
++   * This tests verifies LogCleaner works correctly with WALs and Procedure WALs located
++   * in the same oldWALs directory.
++   * Created files:
++   * - 2 invalid files
++   * - 5 old Procedure WALs
++   * - 30 old WALs from which 3 are in replication
++   * - 5 recent Procedure WALs
++   * - 1 recent WAL
++   * - 1 very new WAL (timestamp in future)
++   * Files which should stay:
++   * - 3 replication WALs
++   * - 2 new WALs
++   * - 5 latest Procedure WALs
++   * @throws Exception
++   */
+   @Test
+-  public void testLogCleaning() throws Exception{
++  public void testLogCleaning() throws Exception {
+     Configuration conf = TEST_UTIL.getConfiguration();
+-    // set TTL
+-    long ttl = 10000;
+-    conf.setLong("hbase.master.logcleaner.ttl", ttl);
++    // set TTLs
++    long ttlWAL = 2000;
++    long ttlProcWAL = 4000;
++    conf.setLong("hbase.master.logcleaner.ttl", ttlWAL);
++    conf.setLong("hbase.master.proclogcleaner.ttl", ttlProcWAL);
++
+     Replication.decorateMasterConfiguration(conf);
+     Server server = new DummyServer();
+-    ReplicationQueues repQueues =
+-        ReplicationFactory.getReplicationQueues(new ReplicationQueuesArguments(conf, server, server.getZooKeeper()));
++    ReplicationQueues repQueues = ReplicationFactory.getReplicationQueues(
++        new ReplicationQueuesArguments(conf, server, server.getZooKeeper()));
+     repQueues.init(server.getServerName().toString());
+-    final Path oldLogDir = new Path(TEST_UTIL.getDataTestDir(),
+-        HConstants.HREGION_OLDLOGDIR_NAME);
+-    String fakeMachineName =
+-      URLEncoder.encode(server.getServerName().toString(), "UTF8");
++    final Path oldLogDir = new Path(TEST_UTIL.getDataTestDir(), HConstants.HREGION_OLDLOGDIR_NAME);
++    String fakeMachineName = URLEncoder.encode(server.getServerName().toString(), "UTF8");
+ 
+     final FileSystem fs = FileSystem.get(conf);
+ 
+-    // Create 2 invalid files, 1 "recent" file, 1 very new file and 30 old files
+     long now = System.currentTimeMillis();
+     fs.delete(oldLogDir, true);
+     fs.mkdirs(oldLogDir);
++
+     // Case 1: 2 invalid files, which would be deleted directly
+     fs.createNewFile(new Path(oldLogDir, "a"));
+     fs.createNewFile(new Path(oldLogDir, fakeMachineName + "." + "a"));
+-    // Case 2: 1 "recent" file, not even deletable for the first log cleaner
+-    // (TimeToLiveLogCleaner), so we are not going down the chain
+-    System.out.println("Now is: " + now);
++
++    // Case 2: 5 Procedure WALs that are old which would be deleted
++    for (int i = 1; i < 6; i++) {
++      Path fileName = new Path(oldLogDir, String.format("pv-%020d.log", i));
++      fs.createNewFile(fileName);
++    }
++
++    // Sleep for sometime to get old procedure WALs
++    Thread.sleep(ttlProcWAL - ttlWAL);
++
++    // Case 3: old WALs which would be deletable
+     for (int i = 1; i < 31; i++) {
+-      // Case 3: old files which would be deletable for the first log cleaner
+-      // (TimeToLiveLogCleaner), and also for the second (ReplicationLogCleaner)
+-      Path fileName = new Path(oldLogDir, fakeMachineName + "." + (now - i) );
++      Path fileName = new Path(oldLogDir, fakeMachineName + "." + (now - i));
+       fs.createNewFile(fileName);
+-      // Case 4: put 3 old log files in ZK indicating that they are scheduled
+-      // for replication so these files would pass the first log cleaner
+-      // (TimeToLiveLogCleaner) but would be rejected by the second
+-      // (ReplicationLogCleaner)
+-      if (i % (30/3) == 1) {
++      // Case 4: put 3 WALs in ZK indicating that they are scheduled for replication so these
++      // files would pass TimeToLiveLogCleaner but would be rejected by ReplicationLogCleaner
++      if (i % (30 / 3) == 1) {
+         repQueues.addLog(fakeMachineName, fileName.getName());
+         System.out.println("Replication log file: " + fileName);
+       }
+     }
+ 
+-    // sleep for sometime to get newer modifcation time
+-    Thread.sleep(ttl);
++    // Case 5: 5 Procedure WALs that are new, will stay
++    for (int i = 6; i < 11; i++) {
++      Path fileName = new Path(oldLogDir, String.format("pv-%020d.log", i));
++      fs.createNewFile(fileName);
++    }
++
++    // Sleep for sometime to get newer modification time
++    Thread.sleep(ttlWAL);
+     fs.createNewFile(new Path(oldLogDir, fakeMachineName + "." + now));
+ 
+-    // Case 2: 1 newer file, not even deletable for the first log cleaner
+-    // (TimeToLiveLogCleaner), so we are not going down the chain
+-    fs.createNewFile(new Path(oldLogDir, fakeMachineName + "." + (now + 10000) ));
++    // Case 6: 1 newer WAL, not even deletable for TimeToLiveLogCleaner,
++    // so we are not going down the chain
++    fs.createNewFile(new Path(oldLogDir, fakeMachineName + "." + (now + ttlWAL)));
+ 
+     for (FileStatus stat : fs.listStatus(oldLogDir)) {
+       System.out.println(stat.getPath().toString());
+     }
+ 
+-    assertEquals(34, fs.listStatus(oldLogDir).length);
+-
+-    LogCleaner cleaner  = new LogCleaner(1000, server, conf, fs, oldLogDir);
++    assertEquals(44, fs.listStatus(oldLogDir).length);
+ 
++    LogCleaner cleaner = new LogCleaner(1000, server, conf, fs, oldLogDir);
+     cleaner.chore();
+ 
+-    // We end up with the current log file, a newer one and the 3 old log
+-    // files which are scheduled for replication
+-    TEST_UTIL.waitFor(1000, new Waiter.Predicate<Exception>() {
+-      @Override
+-      public boolean evaluate() throws Exception {
+-        return 5 == fs.listStatus(oldLogDir).length;
+-      }
+-    });
++    // We end up with the current WAL, a newer WAL, the 3 old WALs which are scheduled for
++    // replication and 5 newer Procedure WALs
++    TEST_UTIL.waitFor(1000,
++        (Waiter.Predicate<Exception>) () -> 10 == fs.listStatus(oldLogDir).length);
+ 
+     for (FileStatus file : fs.listStatus(oldLogDir)) {
+       System.out.println("Kept log files: " + file.getPath().getName());
+@@ -180,8 +202,7 @@ public class TestLogsCleaner {
+   }
+ 
+   /**
+-   * ReplicationLogCleaner should be able to ride over ZooKeeper errors without
+-   * aborting.
++   * ReplicationLogCleaner should be able to ride over ZooKeeper errors without aborting.
+    */
+   @Test
+   public void testZooKeeperAbort() throws Exception {
+@@ -283,7 +304,6 @@ public class TestLogsCleaner {
+ 
+     @Override
+     public ClusterConnection getClusterConnection() {
+-      // TODO Auto-generated method stub
+       return null;
+     }
+   }
+-- 
+2.14.2

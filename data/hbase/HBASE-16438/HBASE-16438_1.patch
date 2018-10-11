@@ -1,0 +1,1088 @@
+ .../apache/hadoop/hbase/ByteBufferChunkCell.java   |  42 ++++++
+ .../java/org/apache/hadoop/hbase/CellUtil.java     |  11 +-
+ .../java/org/apache/hadoop/hbase/ChunkCell.java    |  29 ++++
+ .../hadoop/hbase/NoTagByteBufferChunkCell.java     |  45 ++++++
+ .../apache/hadoop/hbase/regionserver/Chunk.java    |  38 ++++-
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   5 +-
+ .../hbase/regionserver/MSLABChunkCreator.java      | 125 ++++++++++++++++
+ .../hbase/regionserver/MemStoreChunkPool.java      |  34 ++---
+ .../hadoop/hbase/regionserver/MemStoreLABImpl.java |  27 +++-
+ .../hadoop/hbase/regionserver/OffheapChunk.java    |  25 +---
+ .../hadoop/hbase/regionserver/OnheapChunk.java     |  26 +---
+ .../apache/hadoop/hbase/HBaseTestingUtility.java   |   3 +
+ .../hbase/regionserver/TestCompactingMemStore.java |   3 +-
+ .../hbase/regionserver/TestDefaultMemStore.java    |  13 +-
+ .../hbase/regionserver/TestMemStoreChunkPool.java  |  10 +-
+ .../hadoop/hbase/regionserver/TestMemStoreLAB.java |  23 ++-
+ .../regionserver/TestMemstoreLABWithoutPool.java   | 165 +++++++++++++++++++++
+ 17 files changed, 539 insertions(+), 85 deletions(-)
+
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/ByteBufferChunkCell.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/ByteBufferChunkCell.java
+new file mode 100644
+index 0000000..87db80f
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/ByteBufferChunkCell.java
+@@ -0,0 +1,42 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase;
++
++import java.nio.ByteBuffer;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * ByteBuffer based ChunkCell with tags
++ */
++@InterfaceAudience.Private
++public class ByteBufferChunkCell extends ByteBufferKeyValue implements ChunkCell {
++  public ByteBufferChunkCell(ByteBuffer buf, int offset, int length) {
++    super(buf, offset, length);
++  }
++
++  public ByteBufferChunkCell(ByteBuffer buf, int offset, int length, long seqId) {
++    super(buf, offset, length, seqId);
++  }
++
++  @Override
++  public long getChunkId() {
++    // The chunkId is embedded at the 0th offset of the bytebuffer
++    return this.buf.getLong(0);
++  }
++}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+index 5930928..c68f0a9 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+@@ -3177,9 +3177,10 @@ public final class CellUtil {
+   }
+ 
+   /**
+-   * Clone the passed cell by copying its data into the passed buf.
++   * Clone the passed cell by copying its data into the passed buf and create a memstore
++   * chunk cell out of it
+    */
+-  public static Cell copyCellTo(Cell cell, ByteBuffer buf, int offset, int len) {
++  public static Cell copyToChunkCell(Cell cell, ByteBuffer buf, int offset, int len) {
+     int tagsLen = cell.getTagsLength();
+     if (cell instanceof ExtendedCell) {
+       ((ExtendedCell) cell).write(buf, offset);
+@@ -3189,14 +3190,16 @@ public final class CellUtil {
+       // serialization format only.
+       KeyValueUtil.appendTo(cell, buf, offset, true);
+     }
++    // TODO : write the seqid here. For writing seqId we should create a new cell type so
++    // that seqId is not used as the state
+     if (tagsLen == 0) {
+       // When tagsLen is 0, make a NoTagsByteBufferKeyValue version. This is an optimized class
+       // which directly return tagsLen as 0. So we avoid parsing many length components in
+       // reading the tagLength stored in the backing buffer. The Memstore addition of every Cell
+       // call getTagsLength().
+-      return new NoTagsByteBufferKeyValue(buf, offset, len, cell.getSequenceId());
++      return new NoTagByteBufferChunkCell(buf, offset, len, cell.getSequenceId());
+     } else {
+-      return new ByteBufferKeyValue(buf, offset, len, cell.getSequenceId());
++      return new ByteBufferChunkCell(buf, offset, len, cell.getSequenceId());
+     }
+   }
+ }
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/ChunkCell.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/ChunkCell.java
+new file mode 100644
+index 0000000..0e41a93
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/ChunkCell.java
+@@ -0,0 +1,29 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++/**
++ * A cell created out of the MSLAB pool's chunk. The chunkId can be extracted from the backing
++ * ByteBuffer
++ */
++@InterfaceAudience.Private
++public interface ChunkCell {
++  long getChunkId();
++}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/NoTagByteBufferChunkCell.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/NoTagByteBufferChunkCell.java
+new file mode 100644
+index 0000000..33f2e71
+--- /dev/null
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/NoTagByteBufferChunkCell.java
+@@ -0,0 +1,45 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase;
++
++import java.nio.ByteBuffer;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++@InterfaceAudience.Private
++
++/**
++ * ByteBuffer based ChunkCell with no tags
++ */
++public class NoTagByteBufferChunkCell extends NoTagsByteBufferKeyValue implements ChunkCell {
++
++  public NoTagByteBufferChunkCell(ByteBuffer buf, int offset, int length) {
++    super(buf, offset, length);
++  }
++
++  public NoTagByteBufferChunkCell(ByteBuffer buf, int offset, int length, long seqId) {
++    super(buf, offset, length, seqId);
++  }
++
++  @Override
++  public long getChunkId() {
++    // The chunkId is embedded at the 0th offset of the bytebuffer
++    return this.buf.getLong(0);
++  }
++
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Chunk.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Chunk.java
+index 2cbf0a3..f120459 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Chunk.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Chunk.java
+@@ -21,8 +21,10 @@ import java.nio.ByteBuffer;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
++import org.apache.hadoop.hbase.util.Bytes;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.base.Preconditions;
+ 
+ /**
+  * A chunk of memory out of which allocations are sliced.
+@@ -46,13 +48,22 @@ public abstract class Chunk {
+   /** Size of chunk in bytes */
+   protected final int size;
+ 
++  // The unique id associated with the chunk.
++  private long id = -1;
++
+   /**
+-   * Create an uninitialized chunk. Note that memory is not allocated yet, so this is cheap.
+-   *
++   * Create an uninitialized chunk. Note that memory is not allocated yet, so
++   * this is cheap.
+    * @param size in bytes
++   * @param id the chunk id
+    */
+-  Chunk(int size) {
++  public Chunk(int size, long id) {
+     this.size = size;
++    this.id = id;
++  }
++
++  long getId() {
++    return this.id;
+   }
+ 
+   /**
+@@ -60,7 +71,24 @@ public abstract class Chunk {
+    * constructed the chunk. It is thread-safe against other threads calling alloc(), who will block
+    * until the allocation is complete.
+    */
+-  public abstract void init();
++  public void init() {
++    assert nextFreeOffset.get() == UNINITIALIZED;
++    try {
++      allocateDataBuffer();
++    } catch (OutOfMemoryError e) {
++      boolean failInit = nextFreeOffset.compareAndSet(UNINITIALIZED, OOM);
++      assert failInit; // should be true.
++      throw e;
++    }
++    // Mark that it's ready for use
++    // Move 8 bytes since the first 8 bytes are having the chunkid in it
++    boolean initted = nextFreeOffset.compareAndSet(UNINITIALIZED, Bytes.SIZEOF_LONG);
++    // We should always succeed the above CAS since only one thread
++    // calls init()!
++    Preconditions.checkState(initted, "Multiple threads tried to init same chunk");
++  }
++
++  abstract void allocateDataBuffer();
+ 
+   /**
+    * Reset the offset to UNINITIALIZED before before reusing an old chunk
+@@ -96,7 +124,7 @@ public abstract class Chunk {
+       if (oldOffset + size > data.capacity()) {
+         return -1; // alloc doesn't fit
+       }
+-
++      // TODO : If seqID is to be written add 8 bytes here for nextFreeOFfset
+       // Try to atomically claim this chunk
+       if (nextFreeOffset.compareAndSet(oldOffset, oldOffset + size)) {
+         // we got the alloc
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index be4cca0..42d47af 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -1507,8 +1507,11 @@ public class HRegionServer extends HasThread implements
+       float initialCountPercentage = conf.getFloat(MemStoreLAB.CHUNK_POOL_INITIALSIZE_KEY,
+           MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT);
+       int chunkSize = conf.getInt(MemStoreLAB.CHUNK_SIZE_KEY, MemStoreLAB.CHUNK_SIZE_DEFAULT);
++      // init the chunkCreator
++      MSLABChunkCreator chunkCreator =
++          MSLABChunkCreator.initialize(chunkSize, offheap);
+       MemStoreChunkPool pool = MemStoreChunkPool.initialize(globalMemStoreSize, poolSizePercentage,
+-          initialCountPercentage, chunkSize, offheap);
++        initialCountPercentage, chunkCreator);
+       if (pool != null && this.hMemManager != null) {
+         // Register with Heap Memory manager
+         this.hMemManager.registerTuneObserver(pool);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MSLABChunkCreator.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MSLABChunkCreator.java
+new file mode 100644
+index 0000000..3cca80f
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MSLABChunkCreator.java
+@@ -0,0 +1,125 @@
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import java.util.Collection;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
++
++import com.google.common.annotations.VisibleForTesting;
++
++/**
++ * Does the management of memstoreLAB chunk creations. A monotonically incrementing id is associated
++ * with every chunk
++ */
++@InterfaceAudience.Private
++public class MSLABChunkCreator {
++  // monotonically increasing chunkid
++  private AtomicLong chunkID = new AtomicLong(1);
++  // maps the chunk against the monotonically increasing chunk id. We need to preserver the
++  // natural ordering of the key
++  private ConcurrentHashMap<Long, Chunk> chunkIdMap =
++      new ConcurrentHashMap<Long, Chunk>();
++  private int chunkSize;
++  private boolean offheap;
++  @VisibleForTesting
++  static MSLABChunkCreator INSTANCE;
++
++  @VisibleForTesting
++  MSLABChunkCreator(int chunkSize, boolean offheap) {
++    this.chunkSize = chunkSize;
++    this.offheap = offheap;
++  }
++
++  /**
++   * Return the instance of MSLABChunkCreator
++   * @param chunkSize the chunkSize
++   * @param offheap indicates if the chunk is to be created offheap or not
++   * @return singleton MSLABChunkCreator
++   */
++  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "LI_LAZY_INIT_STATIC",
++      justification = "Method is called by single thread at the starting of RS")
++  @VisibleForTesting
++  public static MSLABChunkCreator initialize(int chunkSize, boolean offheap) {
++    if (INSTANCE != null) return INSTANCE;
++    INSTANCE = new MSLABChunkCreator(chunkSize, offheap);
++    return INSTANCE;
++  }
++
++  static MSLABChunkCreator getChunkCreator() {
++    return INSTANCE;
++  }
++
++  /**
++   * Creates the chunk either onheap or offheap
++   * @return the chunk
++   */
++  Chunk createChunk() {
++    return createChunk(false);
++  }
++
++  /**
++   * Creates the chunk either onheap or offheap
++   * @param forceOnheapOnly indicates if the chunks have to be onheap only though the chunkCreator is
++   *          built for offheap
++   * @return the chunk
++   */
++  Chunk createChunk(boolean forceOnheapOnly) {
++    Chunk memstoreLABChunk;
++    long id = chunkID.getAndIncrement();
++    if (this.offheap && !forceOnheapOnly) {
++      memstoreLABChunk = new OffheapChunk(chunkSize, id);
++    } else {
++      memstoreLABChunk = new OnheapChunk(chunkSize, id);
++    }
++    chunkIdMap.put(id, memstoreLABChunk);
++    return memstoreLABChunk;
++  }
++
++  Chunk getChunk(long id) {
++    return this.chunkIdMap.get(id);
++  }
++
++  int getChunkSize() {
++    return this.chunkSize;
++  }
++
++  boolean isOffheap() {
++    return this.offheap;
++  }
++
++  void removeChunks(Collection<Long> chunkIds) {
++    for (long chunkId : chunkIds) {
++      this.chunkIdMap.remove(chunkId);
++    }
++  }
++
++  @VisibleForTesting
++  // Used only in tests
++  int size() {
++    return this.chunkIdMap.size();
++  }
++
++  @VisibleForTesting
++  void clearChunks() {
++    this.chunkIdMap.clear();
++  }
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreChunkPool.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreChunkPool.java
+index b7ac212..9411a3e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreChunkPool.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreChunkPool.java
+@@ -42,7 +42,7 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+  * collection on JVM.
+  * 
+  * The pool instance is globally unique and could be obtained through
+- * {@link MemStoreChunkPool#initialize(long, float, float, int, boolean)}
++ * {@link MemStoreChunkPool#initialize(long, float, float, MSLABChunkCreator)}
+  * 
+  * {@link MemStoreChunkPool#getChunk()} is called when MemStoreLAB allocating
+  * bytes, and {@link MemStoreChunkPool#putbackChunks(BlockingQueue)} is called
+@@ -62,7 +62,6 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+ 
+   // A queue of reclaimed chunks
+   private final BlockingQueue<Chunk> reclaimedChunks;
+-  private final int chunkSize;
+   private final float poolSizePercentage;
+ 
+   /** Statistics thread schedule pool */
+@@ -71,17 +70,16 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+   private static final int statThreadPeriod = 60 * 5;
+   private final AtomicLong chunkCount = new AtomicLong();
+   private final AtomicLong reusedChunkCount = new AtomicLong();
+-  private final boolean offheap;
++  private MSLABChunkCreator chunkCreator;
+ 
+-  MemStoreChunkPool(int chunkSize, int maxCount, int initialCount, float poolSizePercentage,
+-      boolean offheap) {
++  MemStoreChunkPool(int maxCount, int initialCount, float poolSizePercentage,
++      MSLABChunkCreator chunkCreator) {
+     this.maxCount = maxCount;
+-    this.chunkSize = chunkSize;
+     this.poolSizePercentage = poolSizePercentage;
+-    this.offheap = offheap;
++    this.chunkCreator = chunkCreator;
+     this.reclaimedChunks = new LinkedBlockingQueue<>();
+     for (int i = 0; i < initialCount; i++) {
+-      Chunk chunk = this.offheap ? new OffheapChunk(chunkSize) : new OnheapChunk(chunkSize);
++      Chunk chunk = this.chunkCreator.createChunk();
+       chunk.init();
+       reclaimedChunks.add(chunk);
+     }
+@@ -113,7 +111,7 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+       while (true) {
+         long created = this.chunkCount.get();
+         if (created < this.maxCount) {
+-          chunk = this.offheap ? new OffheapChunk(this.chunkSize) : new OnheapChunk(this.chunkSize);
++          chunk = this.chunkCreator.createChunk();
+           if (this.chunkCount.compareAndSet(created, created + 1)) {
+             break;
+           }
+@@ -191,7 +189,7 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+   @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "LI_LAZY_INIT_STATIC",
+       justification = "Method is called by single thread at the starting of RS")
+   static MemStoreChunkPool initialize(long globalMemStoreSize, float poolSizePercentage,
+-      float initialCountPercentage, int chunkSize, boolean offheap) {
++      float initialCountPercentage, MSLABChunkCreator chunkCreator) {
+     if (GLOBAL_INSTANCE != null) return GLOBAL_INSTANCE;
+     if (chunkPoolDisabled) return null;
+ 
+@@ -203,16 +201,17 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+       throw new IllegalArgumentException(
+           MemStoreLAB.CHUNK_POOL_MAXSIZE_KEY + " must be between 0.0 and 1.0");
+     }
+-    int maxCount = (int) (globalMemStoreSize * poolSizePercentage / chunkSize);
++    int maxCount = (int) (globalMemStoreSize * poolSizePercentage / chunkCreator.getChunkSize());
+     if (initialCountPercentage > 1.0 || initialCountPercentage < 0) {
+       throw new IllegalArgumentException(
+           MemStoreLAB.CHUNK_POOL_INITIALSIZE_KEY + " must be between 0.0 and 1.0");
+     }
+     int initialCount = (int) (initialCountPercentage * maxCount);
+-    LOG.info("Allocating MemStoreChunkPool with chunk size " + StringUtils.byteDesc(chunkSize)
+-        + ", max count " + maxCount + ", initial count " + initialCount);
+-    GLOBAL_INSTANCE = new MemStoreChunkPool(chunkSize, maxCount, initialCount, poolSizePercentage,
+-        offheap);
++    LOG.info("Allocating MemStoreChunkPool with chunk size "
++        + StringUtils.byteDesc(chunkCreator.getChunkSize()) + ", max count " + maxCount
++        + ", initial count " + initialCount);
++    GLOBAL_INSTANCE =
++        new MemStoreChunkPool(maxCount, initialCount, poolSizePercentage, chunkCreator);
+     return GLOBAL_INSTANCE;
+   }
+ 
+@@ -235,11 +234,12 @@ public class MemStoreChunkPool implements HeapMemoryTuneObserver {
+   @Override
+   public void onHeapMemoryTune(long newMemstoreSize, long newBlockCacheSize) {
+     // don't do any tuning in case of offheap memstore
+-    if (this.offheap) {
++    if (this.chunkCreator.isOffheap()) {
+       LOG.warn("Not tuning the chunk pool as it is offheap");
+       return;
+     }
+-    int newMaxCount = (int) (newMemstoreSize * poolSizePercentage / chunkSize);
++    int newMaxCount =
++        (int) (newMemstoreSize * poolSizePercentage / this.chunkCreator.getChunkSize());
+     if (newMaxCount != this.maxCount) {
+       // We need an adjustment in the chunks numbers
+       if (newMaxCount > this.maxCount) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+index 4e87135..7614acb 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+@@ -18,7 +18,9 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
++import java.util.Map;
+ import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+@@ -74,6 +76,7 @@ public class MemStoreLABImpl implements MemStoreLAB {
+   private final int chunkSize;
+   private final int maxAlloc;
+   private final MemStoreChunkPool chunkPool;
++  private final MSLABChunkCreator chunkCreator;
+ 
+   // This flag is for closing this instance, its set when clearing snapshot of
+   // memstore
+@@ -83,6 +86,8 @@ public class MemStoreLABImpl implements MemStoreLAB {
+   private AtomicBoolean reclaimed = new AtomicBoolean(false);
+   // Current count of open scanners which reading data from this MemStoreLAB
+   private final AtomicInteger openScannerCount = new AtomicInteger();
++  // Stores all the chunkIds that are used by this MSLAB when there is no chunkPool
++  private final Map<Long, Boolean> chunkIds = new ConcurrentHashMap<Long, Boolean>();
+ 
+   // Used in testing
+   public MemStoreLABImpl() {
+@@ -93,19 +98,18 @@ public class MemStoreLABImpl implements MemStoreLAB {
+     chunkSize = conf.getInt(CHUNK_SIZE_KEY, CHUNK_SIZE_DEFAULT);
+     maxAlloc = conf.getInt(MAX_ALLOC_KEY, MAX_ALLOC_DEFAULT);
+     this.chunkPool = MemStoreChunkPool.getPool();
++    this.chunkCreator = MSLABChunkCreator.getChunkCreator();
+     // currently chunkQueue is only used for chunkPool
+     if (this.chunkPool != null) {
+       // set queue length to chunk pool max count to avoid keeping reference of
+       // too many non-reclaimable chunks
+       pooledChunkQueue = new LinkedBlockingQueue<>(chunkPool.getMaxCount());
+     }
+-
+     // if we don't exclude allocations >CHUNK_SIZE, we'd infiniteloop on one!
+     Preconditions.checkArgument(maxAlloc <= chunkSize,
+         MAX_ALLOC_KEY + " must be less than " + CHUNK_SIZE_KEY);
+   }
+ 
+-
+   @Override
+   public Cell copyCellInto(Cell cell) {
+     int size = KeyValueUtil.length(cell);
+@@ -130,7 +134,7 @@ public class MemStoreLABImpl implements MemStoreLAB {
+       // try to retire this chunk
+       tryRetireChunk(c);
+     }
+-    return CellUtil.copyCellTo(cell, c.getData(), allocOffset, size);
++    return CellUtil.copyToChunkCell(cell, c.getData(), allocOffset, size);
+   }
+ 
+   /**
+@@ -142,8 +146,10 @@ public class MemStoreLABImpl implements MemStoreLAB {
+     this.closed = true;
+     // We could put back the chunks to pool for reusing only when there is no
+     // opening scanner which will read their data
+-    if (chunkPool != null && openScannerCount.get() == 0
+-        && reclaimed.compareAndSet(false, true)) {
++    int count  = openScannerCount.get();
++    if (this.chunkPool == null && count == 0) {
++      this.chunkCreator.removeChunks(this.chunkIds.keySet());
++    } else if (chunkPool != null && count == 0 && reclaimed.compareAndSet(false, true)) {
+       chunkPool.putbackChunks(this.pooledChunkQueue);
+     }
+   }
+@@ -162,7 +168,9 @@ public class MemStoreLABImpl implements MemStoreLAB {
+   @Override
+   public void decScannerCount() {
+     int count = this.openScannerCount.decrementAndGet();
+-    if (this.closed && chunkPool != null && count == 0
++    if (this.closed && this.chunkPool == null && count == 0) {
++      this.chunkCreator.removeChunks(this.chunkIds.keySet());
++    } else if (this.closed && chunkPool != null && count == 0
+         && reclaimed.compareAndSet(false, true)) {
+       chunkPool.putbackChunks(this.pooledChunkQueue);
+     }
+@@ -208,7 +216,12 @@ public class MemStoreLABImpl implements MemStoreLAB {
+         // This is chunk from pool
+         pooledChunk = true;
+       } else {
+-        c = new OnheapChunk(chunkSize);// When chunk is not from pool, always make it as on heap.
++        // When chunk is not from pool, always make it as on heap.
++        c = this.chunkCreator.createChunk(true);
++        if (chunkPool == null) {
++          // better to store chunkid though it is still no the curChunk
++          chunkIds.put(c.getId(), true);
++        }
+       }
+       if (curChunk.compareAndSet(null, c)) {
+         // we won race - now we need to actually do the expensive
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OffheapChunk.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OffheapChunk.java
+index ed98cfa..484d28d 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OffheapChunk.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OffheapChunk.java
+@@ -21,34 +21,21 @@ import java.nio.ByteBuffer;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ 
+-import com.google.common.base.Preconditions;
+-
+ /**
+  * An off heap chunk implementation.
+  */
+ @InterfaceAudience.Private
+ public class OffheapChunk extends Chunk {
+ 
+-  OffheapChunk(int size) {
+-    super(size);
++  OffheapChunk(int size, long id) {
++    super(size, id);
+   }
+ 
+   @Override
+-  public void init() {
+-    assert nextFreeOffset.get() == UNINITIALIZED;
+-    try {
+-      if (data == null) {
+-        data = ByteBuffer.allocateDirect(this.size);
+-      }
+-    } catch (OutOfMemoryError e) {
+-      boolean failInit = nextFreeOffset.compareAndSet(UNINITIALIZED, OOM);
+-      assert failInit; // should be true.
+-      throw e;
++  void allocateDataBuffer() {
++    if (data == null) {
++      data = ByteBuffer.allocateDirect(this.size);
++      data.putLong(0, this.getId());
+     }
+-    // Mark that it's ready for use
+-    boolean initted = nextFreeOffset.compareAndSet(UNINITIALIZED, 0);
+-    // We should always succeed the above CAS since only one thread
+-    // calls init()!
+-    Preconditions.checkState(initted, "Multiple threads tried to init same chunk");
+   }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OnheapChunk.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OnheapChunk.java
+index bd33cb5..4bd0ed5 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OnheapChunk.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/OnheapChunk.java
+@@ -21,33 +21,21 @@ import java.nio.ByteBuffer;
+ 
+ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ 
+-import com.google.common.base.Preconditions;
+-
+ /**
+  * An on heap chunk implementation.
+  */
+ @InterfaceAudience.Private
+ public class OnheapChunk extends Chunk {
+ 
+-  OnheapChunk(int size) {
+-    super(size);
++  OnheapChunk(int size, long id) {
++    super(size, id);
+   }
+ 
+-  public void init() {
+-    assert nextFreeOffset.get() == UNINITIALIZED;
+-    try {
+-      if (data == null) {
+-        data = ByteBuffer.allocate(this.size);
+-      }
+-    } catch (OutOfMemoryError e) {
+-      boolean failInit = nextFreeOffset.compareAndSet(UNINITIALIZED, OOM);
+-      assert failInit; // should be true.
+-      throw e;
++  @Override
++  void allocateDataBuffer() {
++    if (data == null) {
++      data = ByteBuffer.allocate(this.size);
++      data.putLong(0, this.getId());
+     }
+-    // Mark that it's ready for use
+-    boolean initted = nextFreeOffset.compareAndSet(UNINITIALIZED, 0);
+-    // We should always succeed the above CAS since only one thread
+-    // calls init()!
+-    Preconditions.checkState(initted, "Multiple threads tried to init same chunk");
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+index a6c7f68..0b96d8b 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+@@ -98,6 +98,8 @@ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.HRegionServer;
+ import org.apache.hadoop.hbase.regionserver.HStore;
+ import org.apache.hadoop.hbase.regionserver.InternalScanner;
++import org.apache.hadoop.hbase.regionserver.MSLABChunkCreator;
++import org.apache.hadoop.hbase.regionserver.MemStoreLABImpl;
+ import org.apache.hadoop.hbase.regionserver.Region;
+ import org.apache.hadoop.hbase.regionserver.RegionScanner;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
+@@ -2414,6 +2416,7 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
+   public static HRegion createRegionAndWAL(final HRegionInfo info, final Path rootDir,
+       final Configuration conf, final HTableDescriptor htd, boolean initialize)
+       throws IOException {
++    MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false);
+     WAL wal = createWal(conf, rootDir, info);
+     return HRegion.createHRegion(info, rootDir, conf, htd, wal, initialize);
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+index 63bbe65..a294e02 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+@@ -92,7 +92,8 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
+         .getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf, false));
+     chunkPool = MemStoreChunkPool.initialize(globalMemStoreLimit, 0.2f,
+-        MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT, MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false);
++      MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,
++      MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false));
+     assertTrue(chunkPool != null);
+   }
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+index e6d3147..10b2517 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestDefaultMemStore.java
+@@ -51,6 +51,7 @@ import org.apache.hadoop.hbase.util.EnvironmentEdge;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.FSTableDescriptors;
+ import org.apache.hadoop.hbase.wal.WALFactory;
++import org.junit.AfterClass;
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+@@ -84,6 +85,7 @@ public class TestDefaultMemStore {
+   protected static final byte[] FAMILY = Bytes.toBytes("column");
+   protected MultiVersionConcurrencyControl mvcc;
+   protected AtomicLong startSeqNum = new AtomicLong(0);
++  protected MSLABChunkCreator chunkCreator;
+ 
+   private String getName() {
+     return this.name.getMethodName();
+@@ -92,9 +94,16 @@ public class TestDefaultMemStore {
+   @Before
+   public void setUp() throws Exception {
+     internalSetUp();
++    this.chunkCreator =
++        MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false);
+     this.memstore = new DefaultMemStore();
+   }
+ 
++  @AfterClass
++  public static void tearDownClass() throws Exception {
++    MSLABChunkCreator.getChunkCreator().clearChunks();
++  }
++
+   protected void internalSetUp() throws Exception {
+     this.mvcc = new MultiVersionConcurrencyControl();
+   }
+@@ -131,7 +140,9 @@ public class TestDefaultMemStore {
+       assertEquals(Segment.getCellLength(kv), sizeChangeForSecondCell.getDataSize());
+       // make sure chunk size increased even when writing the same cell, if using MSLAB
+       if (msLab instanceof MemStoreLABImpl) {
+-        assertEquals(2 * Segment.getCellLength(kv),
++        // since we add the chunkID at the 0th offset of the chunk and the
++        // chunkid is a long we need to account for those 8 bytes
++        assertEquals(2 * Segment.getCellLength(kv) + Bytes.SIZEOF_LONG,
+           ((MemStoreLABImpl) msLab).getCurrentChunk().getNextFreeOffset());
+       }
+     } else {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreChunkPool.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreChunkPool.java
+index 42aad5c..bdf2fa6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreChunkPool.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreChunkPool.java
+@@ -60,7 +60,8 @@ public class TestMemStoreChunkPool {
+     long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
+         .getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf, false));
+     chunkPool = MemStoreChunkPool.initialize(globalMemStoreLimit, 0.2f,
+-        MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT, MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false);
++      MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,
++      MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false));
+     assertTrue(chunkPool != null);
+   }
+ 
+@@ -90,7 +91,7 @@ public class TestMemStoreChunkPool {
+       int size = KeyValueUtil.length(kv);
+       ByteBufferKeyValue newKv = (ByteBufferKeyValue) mslab.copyCellInto(kv);
+       if (newKv.getBuffer() != lastBuffer) {
+-        expectedOff = 0;
++        expectedOff = 8;
+         lastBuffer = newKv.getBuffer();
+       }
+       assertEquals(expectedOff, newKv.getOffset());
+@@ -222,7 +223,9 @@ public class TestMemStoreChunkPool {
+     final int initialCount = 5;
+     final int chunkSize = 30;
+     final int valSize = 7;
+-    MemStoreChunkPool pool = new MemStoreChunkPool(chunkSize, maxCount, initialCount, 1, false);
++    MSLABChunkCreator oldCreator = MSLABChunkCreator.getChunkCreator();
++    MSLABChunkCreator newCreator = new MSLABChunkCreator(chunkSize, false);
++    MemStoreChunkPool pool = new MemStoreChunkPool(maxCount, initialCount, 1, newCreator);
+     assertEquals(initialCount, pool.getPoolSize());
+     assertEquals(maxCount, pool.getMaxCount());
+     MemStoreChunkPool.GLOBAL_INSTANCE = pool;// Replace the global ref with the new one we created.
+@@ -255,6 +258,7 @@ public class TestMemStoreChunkPool {
+       assertTrue(pool.getPoolSize() <= maxCount);
+     } finally {
+       MemStoreChunkPool.GLOBAL_INSTANCE = oldPool;
++      MSLABChunkCreator.INSTANCE = oldCreator;
+     }
+   }
+ }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreLAB.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreLAB.java
+index 141b802..b6ed2a6 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreLAB.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemStoreLAB.java
+@@ -64,7 +64,7 @@ public class TestMemStoreLAB {
+     long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
+         .getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf, false));
+     MemStoreChunkPool.initialize(globalMemStoreLimit, 0.2f, MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,
+-        MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false);
++      MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false));
+   }
+ 
+   /**
+@@ -76,6 +76,7 @@ public class TestMemStoreLAB {
+     MemStoreLAB mslab = new MemStoreLABImpl();
+     int expectedOff = 0;
+     ByteBuffer lastBuffer = null;
++    long lastChunkId = -1;
+     // 100K iterations by 0-1K alloc -> 50MB expected
+     // should be reasonable for unit test and also cover wraparound
+     // behavior
+@@ -85,8 +86,13 @@ public class TestMemStoreLAB {
+       int size = KeyValueUtil.length(kv);
+       ByteBufferKeyValue newKv = (ByteBufferKeyValue) mslab.copyCellInto(kv);
+       if (newKv.getBuffer() != lastBuffer) {
+-        expectedOff = 0;
++        // since we add the chunkID at the 0th offset of the chunk and the
++        // chunkid is a long we need to account for those 8 bytes
++        expectedOff = Bytes.SIZEOF_LONG;
+         lastBuffer = newKv.getBuffer();
++        long chunkId = newKv.getBuffer().getLong(0);
++        assertTrue("chunkid should be different", chunkId != lastChunkId);
++        lastChunkId = chunkId;
+       }
+       assertEquals(expectedOff, newKv.getOffset());
+       assertTrue("Allocation overruns buffer",
+@@ -136,23 +142,21 @@ public class TestMemStoreLAB {
+       };
+       ctx.addThread(t);
+     }
+-    
++
+     ctx.startThreads();
+     while (totalAllocated.get() < 50*1024*1024 && ctx.shouldRun()) {
+       Thread.sleep(10);
+     }
+     ctx.stop();
+-    
+     // Partition the allocations by the actual byte[] they point into,
+     // make sure offsets are unique for each chunk
+     Map<ByteBuffer, Map<Integer, AllocRecord>> mapsByChunk =
+       Maps.newHashMap();
+-    
++
+     int sizeCounted = 0;
+     for (AllocRecord rec : Iterables.concat(allocations)) {
+       sizeCounted += rec.size;
+       if (rec.size == 0) continue;
+-      
+       Map<Integer, AllocRecord> mapForThisByteArray =
+         mapsByChunk.get(rec.alloc);
+       if (mapForThisByteArray == null) {
+@@ -167,7 +171,9 @@ public class TestMemStoreLAB {
+     
+     // Now check each byte array to make sure allocations don't overlap
+     for (Map<Integer, AllocRecord> allocsInChunk : mapsByChunk.values()) {
+-      int expectedOff = 0;
++      // since we add the chunkID at the 0th offset of the chunk and the
++      // chunkid is a long we need to account for those 8 bytes
++      int expectedOff = Bytes.SIZEOF_LONG;
+       for (AllocRecord alloc : allocsInChunk.values()) {
+         assertEquals(expectedOff, alloc.offset);
+         assertTrue("Allocation overruns buffer",
+@@ -175,7 +181,6 @@ public class TestMemStoreLAB {
+         expectedOff += alloc.size;
+       }
+     }
+-
+   }
+ 
+   /**
+@@ -223,6 +228,8 @@ public class TestMemStoreLAB {
+     }
+     // close the mslab
+     mslab.close();
++    // none of the chunkIds would have been returned back
++    assertTrue("All the chunks must have been cleared", MSLABChunkCreator.INSTANCE.size() != 0);
+     // make sure all chunks reclaimed or removed from chunk queue
+     int queueLength = mslab.getPooledChunks().size();
+     assertTrue("All chunks in chunk queue should be reclaimed or removed"
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemstoreLABWithoutPool.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemstoreLABWithoutPool.java
+new file mode 100644
+index 0000000..3199c63
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMemstoreLABWithoutPool.java
+@@ -0,0 +1,165 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.lang.management.ManagementFactory;
++import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.hbase.ByteBufferKeyValue;
++import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.KeyValueUtil;
++import org.apache.hadoop.hbase.io.util.MemorySizeUtil;
++import org.apache.hadoop.hbase.testclassification.RegionServerTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category({RegionServerTests.class, SmallTests.class})
++public class TestMemstoreLABWithoutPool {
++  private final static Configuration conf = new Configuration();
++
++  private static final byte[] rk = Bytes.toBytes("r1");
++  private static final byte[] cf = Bytes.toBytes("f");
++  private static final byte[] q = Bytes.toBytes("q");
++
++  @BeforeClass
++  public static void setUpBeforeClass() throws Exception {
++    long globalMemStoreLimit = (long) (ManagementFactory.getMemoryMXBean().getHeapMemoryUsage()
++        .getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf, false));
++    // disable pool
++    MemStoreChunkPool.initialize(globalMemStoreLimit, 0.0f, MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,
++      MSLABChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT, false));
++  }
++
++  /**
++   * Test a bunch of random allocations
++   */
++  @Test
++  public void testLABRandomAllocation() {
++    Random rand = new Random();
++    MemStoreLAB mslab = new MemStoreLABImpl();
++    int expectedOff = 0;
++    ByteBuffer lastBuffer = null;
++    long lastChunkId = -1;
++    // 100K iterations by 0-1K alloc -> 50MB expected
++    // should be reasonable for unit test and also cover wraparound
++    // behavior
++    for (int i = 0; i < 100000; i++) {
++      int valSize = rand.nextInt(1000);
++      KeyValue kv = new KeyValue(rk, cf, q, new byte[valSize]);
++      int size = KeyValueUtil.length(kv);
++      ByteBufferKeyValue newKv = (ByteBufferKeyValue) mslab.copyCellInto(kv);
++      if (newKv.getBuffer() != lastBuffer) {
++        // since we add the chunkID at the 0th offset of the chunk and the
++        // chunkid is a long we need to account for those 8 bytes
++        expectedOff = Bytes.SIZEOF_LONG;
++        lastBuffer = newKv.getBuffer();
++        long chunkId = newKv.getBuffer().getLong(0);
++        assertTrue("chunkid should be different", chunkId != lastChunkId);
++        lastChunkId = chunkId;
++      }
++      assertEquals(expectedOff, newKv.getOffset());
++      assertTrue("Allocation overruns buffer",
++          newKv.getOffset() + size <= newKv.getBuffer().capacity());
++      expectedOff += size;
++    }
++  }
++
++  /**
++   * Test frequent chunk retirement with chunk pool triggered by lots of threads, making sure
++   * there's no memory leak (HBASE-16195)
++   * @throws Exception if any error occurred
++   */
++  @Test
++  public void testLABChunkQueueWithMultipleMSLABs() throws Exception {
++    Configuration conf = HBaseConfiguration.create();
++    MemStoreLABImpl[] mslab = new MemStoreLABImpl[10];
++    for (int i = 0; i < 10; i++) {
++      mslab[i] = new MemStoreLABImpl(conf);
++    }
++    // launch multiple threads to trigger frequent chunk retirement
++    List<Thread> threads = new ArrayList<>();
++    // create smaller sized kvs
++    final KeyValue kv = new KeyValue(Bytes.toBytes("r"), Bytes.toBytes("f"), Bytes.toBytes("q"),
++        new byte[0]);
++    for (int i = 0; i < 10; i++) {
++      for (int j = 0; j < 10; j++) {
++        threads.add(getChunkQueueTestThread(mslab[i], "testLABChunkQueue-" + j, kv));
++      }
++    }
++    for (Thread thread : threads) {
++      thread.start();
++    }
++    // let it run for some time
++    Thread.sleep(1000);
++    for (Thread thread : threads) {
++      thread.interrupt();
++    }
++    boolean threadsRunning = true;
++    while (threadsRunning) {
++      for (Thread thread : threads) {
++        if (thread.isAlive()) {
++          threadsRunning = true;
++          break;
++        }
++      }
++      threadsRunning = false;
++    }
++    // close the mslab
++    for (int i = 0; i < 10; i++) {
++      mslab[i].close();
++    }
++    // all of the chunkIds would have been returned back
++    assertTrue("All the chunks must have been cleared", MSLABChunkCreator.INSTANCE.size() == 0);
++  }
++
++  private Thread getChunkQueueTestThread(final MemStoreLABImpl mslab, String threadName,
++      Cell cellToCopyInto) {
++    Thread thread = new Thread() {
++      boolean stopped = false;
++
++      @Override
++      public void run() {
++        while (!stopped) {
++          // keep triggering chunk retirement
++          mslab.copyCellInto(cellToCopyInto);
++        }
++      }
++
++      @Override
++      public void interrupt() {
++        this.stopped = true;
++      }
++    };
++    thread.setName(threadName);
++    thread.setDaemon(true);
++    return thread;
++  }
++}

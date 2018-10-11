@@ -1,0 +1,473 @@
+From d5c92be1018b870f73f1103594cb7d88bdc5b65b Mon Sep 17 00:00:00 2001
+From: Michael Stack <stack@apache.org>
+Date: Wed, 2 May 2018 11:30:03 -0700
+Subject: [PATCH] HBASE-20520 Failed effort upping default HDFS blocksize,
+ hbase.regionserver.hlog.blocksize
+
+---
+ .../hbase/regionserver/wal/AbstractFSWAL.java      |  12 ++-
+ .../wal/AbstractProtobufLogWriter.java             |   8 +-
+ .../hadoop/hbase/regionserver/wal/AsyncFSWAL.java  |   4 +-
+ .../hadoop/hbase/regionserver/wal/FSHLog.java      |   2 +-
+ .../hadoop/hbase/regionserver/wal/WALUtil.java     |  16 ++++
+ .../hadoop/hbase/wal/AsyncFSWALProvider.java       |  21 +++--
+ .../apache/hadoop/hbase/wal/FSHLogProvider.java    |  21 +++--
+ .../org/apache/hadoop/hbase/wal/WALFactory.java    |  11 ++-
+ .../regionserver/wal/AbstractTestWALReplay.java    |   2 +-
+ .../regionserver/wal/TestWALConfiguration.java     | 100 +++++++++++++++++++++
+ .../apache/hadoop/hbase/wal/IOTestProvider.java    |   9 +-
+ src/main/asciidoc/_chapters/upgrading.adoc         |   2 +-
+ 12 files changed, 175 insertions(+), 33 deletions(-)
+ create mode 100644 hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALConfiguration.java
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
+index ce8dafa4a5..825ad17a4e 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractFSWAL.java
+@@ -178,6 +178,11 @@ public abstract class AbstractFSWAL<W extends WriterBase> implements WAL {
+   // If > than this size, roll the log.
+   protected final long logrollsize;
+ 
++  /**
++   * Block size to use writing files.
++   */
++  protected final long blocksize;
++
+   /*
+    * If more than this many logs, force flush of oldest region to oldest edit goes to disk. If too
+    * many and we crash, then will take forever replaying. Keep the number of logs tidy.
+@@ -405,10 +410,9 @@ public abstract class AbstractFSWAL<W extends WriterBase> implements WAL {
+     // size as those made in hbase-1 (to prevent surprise), we now have default block size as
+     // 2 times the DFS default: i.e. 2 * DFS default block size rolling at 50% full will generally
+     // make similar size logs to 1 * DFS default block size rolling at 95% full. See HBASE-19148.
+-    final long blocksize = this.conf.getLong("hbase.regionserver.hlog.blocksize",
+-      CommonFSUtils.getDefaultBlockSize(this.fs, this.walDir) * 2);
+-    this.logrollsize =
+-      (long) (blocksize * conf.getFloat("hbase.regionserver.logroll.multiplier", 0.5f));
++    this.blocksize = WALUtil.getWALBlockSize(this.conf, this.fs, this.walDir);
++    float multiplier = conf.getFloat("hbase.regionserver.logroll.multiplier", 0.5f);
++    this.logrollsize = (long)(this.blocksize * multiplier);
+ 
+     boolean maxLogsDefined = conf.get("hbase.regionserver.maxlogs") != null;
+     if (maxLogsDefined) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractProtobufLogWriter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractProtobufLogWriter.java
+index 475b890bcf..50ac101984 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractProtobufLogWriter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AbstractProtobufLogWriter.java
+@@ -153,18 +153,16 @@ public abstract class AbstractProtobufLogWriter {
+     return doCompress;
+   }
+ 
+-  public void init(FileSystem fs, Path path, Configuration conf, boolean overwritable)
+-      throws IOException, StreamLacksCapabilityException {
++  public void init(FileSystem fs, Path path, Configuration conf, boolean overwritable,
++      long blocksize) throws IOException, StreamLacksCapabilityException {
+     this.conf = conf;
+     boolean doCompress = initializeCompressionContext(conf, path);
+     this.trailerWarnSize = conf.getInt(WAL_TRAILER_WARN_SIZE, DEFAULT_WAL_TRAILER_WARN_SIZE);
+     int bufferSize = FSUtils.getDefaultBufferSize(fs);
+     short replication = (short) conf.getInt("hbase.regionserver.hlog.replication",
+       FSUtils.getDefaultReplication(fs, path));
+-    long blockSize = conf.getLong("hbase.regionserver.hlog.blocksize",
+-      FSUtils.getDefaultBlockSize(fs, path));
+ 
+-    initOutput(fs, path, overwritable, bufferSize, replication, blockSize);
++    initOutput(fs, path, overwritable, bufferSize, replication, blocksize);
+ 
+     boolean doTagCompress = doCompress
+         && conf.getBoolean(CompressionContext.ENABLE_WAL_TAGS_COMPRESSION, true);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AsyncFSWAL.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AsyncFSWAL.java
+index e34818f451..d032d837d9 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AsyncFSWAL.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/AsyncFSWAL.java
+@@ -609,8 +609,8 @@ public class AsyncFSWAL extends AbstractFSWAL<AsyncWriter> {
+ 
+   @Override
+   protected AsyncWriter createWriterInstance(Path path) throws IOException {
+-    return AsyncFSWALProvider.createAsyncWriter(conf, fs, path, false, eventLoopGroup,
+-      channelClass);
++    return AsyncFSWALProvider.createAsyncWriter(conf, fs, path, false,
++        this.blocksize, eventLoopGroup, channelClass);
+   }
+ 
+   private void waitForSafePoint() {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index b1ae1dc73e..2224184e63 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -270,7 +270,7 @@ public class FSHLog extends AbstractFSWAL<Writer> {
+    */
+   @Override
+   protected Writer createWriterInstance(final Path path) throws IOException {
+-    Writer writer = FSHLogProvider.createWriter(conf, fs, path, false);
++    Writer writer = FSHLogProvider.createWriter(conf, fs, path, false, this.blocksize);
+     if (writer instanceof ProtobufLogWriter) {
+       preemptiveSync((ProtobufLogWriter) writer);
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALUtil.java
+index 19b2ab1ceb..1b17adc90c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/WALUtil.java
+@@ -22,8 +22,12 @@ package org.apache.hadoop.hbase.regionserver.wal;
+ import java.io.IOException;
+ import java.util.NavigableMap;
+ 
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.client.RegionInfo;
+ import org.apache.hadoop.hbase.regionserver.MultiVersionConcurrencyControl;
++import org.apache.hadoop.hbase.util.CommonFSUtils;
+ import org.apache.hadoop.hbase.wal.WAL;
+ import org.apache.hadoop.hbase.wal.WALEdit;
+ import org.apache.hadoop.hbase.wal.WALKeyImpl;
+@@ -163,4 +167,16 @@ public class WALUtil {
+     }
+     return walKey;
+   }
++
++  /**
++   * Blocksize returned here is 2x the default HDFS blocksize unless explicitly set in
++   * Configuration. Works in tandem with hbase.regionserver.logroll.multiplier. See comment in
++   * AbstractFSWAL in Constructor where we set blocksize and logrollsize for why.
++   * @return Blocksize to use writing WALs.
++   */
++  public static long getWALBlockSize(Configuration conf, FileSystem fs, Path dir)
++      throws IOException {
++    return conf.getLong("hbase.regionserver.hlog.blocksize",
++        CommonFSUtils.getDefaultBlockSize(fs, dir) * 2);
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AsyncFSWALProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AsyncFSWALProvider.java
+index 9c62bed35d..c920279253 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AsyncFSWALProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/AsyncFSWALProvider.java
+@@ -24,6 +24,7 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.regionserver.wal.AsyncFSWAL;
+ import org.apache.hadoop.hbase.regionserver.wal.AsyncProtobufLogWriter;
++import org.apache.hadoop.hbase.regionserver.wal.WALUtil;
+ import org.apache.hadoop.hbase.util.CommonFSUtils;
+ import org.apache.hadoop.hbase.util.CommonFSUtils.StreamLacksCapabilityException;
+ import org.apache.hadoop.hbase.util.Pair;
+@@ -54,7 +55,7 @@ public class AsyncFSWALProvider extends AbstractFSWALProvider<AsyncFSWAL> {
+      * @throws StreamLacksCapabilityException if the given FileSystem can't provide streams that
+      *         meet the needs of the given Writer implementation.
+      */
+-    void init(FileSystem fs, Path path, Configuration c, boolean overwritable)
++    void init(FileSystem fs, Path path, Configuration c, boolean overwritable, long blocksize)
+         throws IOException, CommonFSUtils.StreamLacksCapabilityException;
+   }
+ 
+@@ -85,18 +86,28 @@ public class AsyncFSWALProvider extends AbstractFSWALProvider<AsyncFSWAL> {
+   }
+ 
+   /**
+-   * public because of AsyncFSWAL. Should be package-private
++   * Public because of AsyncFSWAL. Should be package-private
+    */
+   public static AsyncWriter createAsyncWriter(Configuration conf, FileSystem fs, Path path,
+-      boolean overwritable, EventLoopGroup eventLoopGroup, Class<? extends Channel> channelClass)
+-      throws IOException {
++      boolean overwritable, EventLoopGroup eventLoopGroup,
++      Class<? extends Channel> channelClass) throws IOException {
++    return createAsyncWriter(conf, fs, path, overwritable, WALUtil.getWALBlockSize(conf, fs, path),
++        eventLoopGroup, channelClass);
++  }
++
++  /**
++   * Public because of AsyncFSWAL. Should be package-private
++   */
++  public static AsyncWriter createAsyncWriter(Configuration conf, FileSystem fs, Path path,
++      boolean overwritable, long blocksize, EventLoopGroup eventLoopGroup,
++      Class<? extends Channel> channelClass) throws IOException {
+     // Configuration already does caching for the Class lookup.
+     Class<? extends AsyncWriter> logWriterClass = conf.getClass(
+       "hbase.regionserver.hlog.async.writer.impl", AsyncProtobufLogWriter.class, AsyncWriter.class);
+     try {
+       AsyncWriter writer = logWriterClass.getConstructor(EventLoopGroup.class, Class.class)
+           .newInstance(eventLoopGroup, channelClass);
+-      writer.init(fs, path, conf, overwritable);
++      writer.init(fs, path, conf, overwritable, blocksize);
+       return writer;
+     } catch (Exception e) {
+       if (e instanceof CommonFSUtils.StreamLacksCapabilityException) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/FSHLogProvider.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/FSHLogProvider.java
+index b0a924fa4c..efcd377a84 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/FSHLogProvider.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/FSHLogProvider.java
+@@ -24,8 +24,10 @@ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.regionserver.wal.FSHLog;
+ import org.apache.hadoop.hbase.regionserver.wal.ProtobufLogWriter;
++import org.apache.hadoop.hbase.regionserver.wal.WALUtil;
+ import org.apache.hadoop.hbase.util.CommonFSUtils;
+ import org.apache.hadoop.hbase.util.CommonFSUtils.StreamLacksCapabilityException;
++import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.yetus.audience.InterfaceStability;
+ import org.slf4j.Logger;
+@@ -47,22 +49,31 @@ public class FSHLogProvider extends AbstractFSWALProvider<FSHLog> {
+      * @throws StreamLacksCapabilityException if the given FileSystem can't provide streams that
+      *         meet the needs of the given Writer implementation.
+      */
+-    void init(FileSystem fs, Path path, Configuration c, boolean overwritable)
++    void init(FileSystem fs, Path path, Configuration c, boolean overwritable, long blocksize)
+         throws IOException, CommonFSUtils.StreamLacksCapabilityException;
+   }
+ 
+   /**
+-   * public because of FSHLog. Should be package-private
++   * Public because of FSHLog. Should be package-private
+    */
+   public static Writer createWriter(final Configuration conf, final FileSystem fs, final Path path,
+       final boolean overwritable) throws IOException {
++    return createWriter(conf, fs, path, overwritable, WALUtil.getWALBlockSize(conf, fs, path));
++  }
++
++  /**
++   * Public because of FSHLog. Should be package-private
++   */
++  public static Writer createWriter(final Configuration conf, final FileSystem fs, final Path path,
++    final boolean overwritable, long blocksize) throws IOException {
+     // Configuration already does caching for the Class lookup.
+-    Class<? extends Writer> logWriterClass = conf.getClass("hbase.regionserver.hlog.writer.impl",
+-      ProtobufLogWriter.class, Writer.class);
++    Class<? extends Writer> logWriterClass =
++        conf.getClass("hbase.regionserver.hlog.writer.impl", ProtobufLogWriter.class,
++            Writer.class);
+     Writer writer = null;
+     try {
+       writer = logWriterClass.getDeclaredConstructor().newInstance();
+-      writer.init(fs, path, conf, overwritable);
++      writer.init(fs, path, conf, overwritable, blocksize);
+       return writer;
+     } catch (Exception e) { 
+       if (e instanceof CommonFSUtils.StreamLacksCapabilityException) {
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+index 1410b532e0..7727b108c6 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALFactory.java
+@@ -335,18 +335,19 @@ public class WALFactory {
+ 
+   /**
+    * Create a writer for the WAL.
++   * Uses defaults.
+    * <p>
+-   * should be package-private. public only for tests and
++   * Should be package-private. public only for tests and
+    * {@link org.apache.hadoop.hbase.regionserver.wal.Compressor}
+    * @return A WAL writer. Close when done with it.
+-   * @throws IOException
+    */
+   public Writer createWALWriter(final FileSystem fs, final Path path) throws IOException {
+     return FSHLogProvider.createWriter(conf, fs, path, false);
+   }
+ 
+   /**
+-   * should be package-private, visible for recovery testing.
++   * Should be package-private, visible for recovery testing.
++   * Uses defaults.
+    * @return an overwritable writer for recovered edits. caller should close.
+    */
+   @VisibleForTesting
+@@ -362,7 +363,7 @@ public class WALFactory {
+   private static final AtomicReference<WALFactory> singleton = new AtomicReference<>();
+   private static final String SINGLETON_ID = WALFactory.class.getName();
+   
+-  // public only for FSHLog
++  // Public only for FSHLog
+   public static WALFactory getInstance(Configuration configuration) {
+     WALFactory factory = singleton.get();
+     if (null == factory) {
+@@ -415,6 +416,7 @@ public class WALFactory {
+ 
+   /**
+    * If you already have a WALFactory, you should favor the instance method.
++   * Uses defaults.
+    * @return a Writer that will overwrite files. Caller must close.
+    */
+   static Writer createRecoveredEditsWriter(final FileSystem fs, final Path path,
+@@ -425,6 +427,7 @@ public class WALFactory {
+ 
+   /**
+    * If you already have a WALFactory, you should favor the instance method.
++   * Uses defaults.
+    * @return a writer that won't overwrite files. Caller must close.
+    */
+   @VisibleForTesting
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/AbstractTestWALReplay.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/AbstractTestWALReplay.java
+index 52abf59f81..d20188a98f 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/AbstractTestWALReplay.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/AbstractTestWALReplay.java
+@@ -1226,7 +1226,7 @@ public abstract class AbstractTestWALReplay {
+       StreamLacksCapabilityException {
+     fs.mkdirs(file.getParent());
+     ProtobufLogWriter writer = new ProtobufLogWriter();
+-    writer.init(fs, file, conf, true);
++    writer.init(fs, file, conf, true, WALUtil.getWALBlockSize(conf, fs, file));
+     for (FSWALEntry entry : entries) {
+       writer.append(entry);
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALConfiguration.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALConfiguration.java
+new file mode 100644
+index 0000000000..4f03be5b94
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALConfiguration.java
+@@ -0,0 +1,100 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.hbase.HBaseClassTestRule;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.testclassification.RegionServerTests;
++import org.apache.hadoop.hbase.testclassification.SmallTests;
++import org.apache.hadoop.hbase.wal.WAL;
++import org.apache.hadoop.hbase.wal.WALFactory;
++import org.apache.hadoop.hbase.wal.WALProvider;
++import org.junit.Before;
++import org.junit.ClassRule;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++import org.junit.rules.TestName;
++import org.junit.runner.RunWith;
++import org.junit.runners.Parameterized;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++/**
++ * Ensure configuration changes are having an effect on WAL.
++ * There is a lot of reflection around WAL setup; could be skipping Configuration changes.
++ */
++@RunWith(Parameterized.class)
++@Category({ RegionServerTests.class, SmallTests.class })
++public class TestWALConfiguration {
++  private static final Logger LOG = LoggerFactory.getLogger(TestWALConfiguration.class);
++  static final HBaseTestingUtility TEST_UTIL = new HBaseTestingUtility();
++  @ClassRule
++  public static final HBaseClassTestRule CLASS_RULE =
++      HBaseClassTestRule.forClass(TestWALConfiguration.class);
++
++  @Rule
++  public TestName name = new TestName();
++
++  @Parameterized.Parameter
++  public String walProvider;
++
++  @Parameterized.Parameters(name = "{index}: provider={0}")
++  public static Iterable<Object[]> data() {
++    return Arrays.asList(new Object[] { "filesystem" }, new Object[] { "asyncfs" });
++  }
++
++  @Before
++  public void before() {
++    TEST_UTIL.getConfiguration().set(WALFactory.WAL_PROVIDER, walProvider);
++  }
++
++  /**
++   * Test blocksize change from HBASE-20520 takes on both asycnfs and old wal provider.
++   * Hard to verify more than this given the blocksize is passed down to HDFS on create -- not
++   * kept local to the streams themselves.
++   */
++  @Test
++  public void testBlocksizeDefaultsToTwiceHDFSBlockSize() throws IOException {
++    TableName tableName = TableName.valueOf("test");
++    final WALFactory walFactory = new WALFactory(TEST_UTIL.getConfiguration(), this.walProvider);
++    Configuration conf = TEST_UTIL.getConfiguration();
++    WALProvider provider = walFactory.getWALProvider();
++    // Get a WAL instance from the provider. Check its blocksize.
++    WAL wal = provider.getWAL(null);
++    if (wal instanceof AbstractFSWAL) {
++      long expectedDefaultBlockSize =
++          WALUtil.getWALBlockSize(conf, FileSystem.get(conf), TEST_UTIL.getDataTestDir());
++      long blocksize = ((AbstractFSWAL)wal).blocksize;
++      assertEquals(expectedDefaultBlockSize, blocksize);
++      LOG.info("Found blocksize of {} on {}", blocksize, wal);
++    } else {
++      fail("Unknown provider " + provider);
++    }
++  }
++}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+index 7bd017d909..8145cc77bb 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/wal/IOTestProvider.java
+@@ -92,7 +92,6 @@ public class IOTestProvider implements WALProvider {
+   /**
+    * @param factory factory that made us, identity used for FS layout. may not be null
+    * @param conf may not be null
+-   * @param listeners may be null
+    * @param providerId differentiate between providers from one facotry, used for FS layout. may be
+    *                   null
+    */
+@@ -210,7 +209,7 @@ public class IOTestProvider implements WALProvider {
+         LOG.info("creating new writer instance.");
+         final ProtobufLogWriter writer = new IOTestWriter();
+         try {
+-          writer.init(fs, path, conf, false);
++          writer.init(fs, path, conf, false, this.blocksize);
+         } catch (CommonFSUtils.StreamLacksCapabilityException exception) {
+           throw new IOException("Can't create writer instance because underlying FileSystem " +
+               "doesn't support needed stream capabilities.", exception);
+@@ -237,8 +236,8 @@ public class IOTestProvider implements WALProvider {
+     private boolean doSyncs;
+ 
+     @Override
+-    public void init(FileSystem fs, Path path, Configuration conf, boolean overwritable)
+-        throws IOException, CommonFSUtils.StreamLacksCapabilityException {
++    public void init(FileSystem fs, Path path, Configuration conf, boolean overwritable,
++        long blocksize) throws IOException, CommonFSUtils.StreamLacksCapabilityException {
+       Collection<String> operations = conf.getStringCollection(ALLOWED_OPERATIONS);
+       if (operations.isEmpty() || operations.contains(AllowedOperations.all.name())) {
+         doAppends = doSyncs = true;
+@@ -250,7 +249,7 @@ public class IOTestProvider implements WALProvider {
+       }
+       LOG.info("IOTestWriter initialized with appends " + (doAppends ? "enabled" : "disabled") +
+           " and syncs " + (doSyncs ? "enabled" : "disabled"));
+-      super.init(fs, path, conf, overwritable);
++      super.init(fs, path, conf, overwritable, blocksize);
+     }
+ 
+     @Override
+diff --git a/src/main/asciidoc/_chapters/upgrading.adoc b/src/main/asciidoc/_chapters/upgrading.adoc
+index f7b101a873..da4430a39a 100644
+--- a/src/main/asciidoc/_chapters/upgrading.adoc
++++ b/src/main/asciidoc/_chapters/upgrading.adoc
+@@ -378,7 +378,7 @@ The following configuration settings changed their default value. Where applicab
+ * hbase.client.retries.number is now set to 10. Previously it was 35. Downstream users are advised to use client timeouts as described in section <<config_timeouts>> instead.
+ * hbase.client.serverside.retries.multiplier is now set to 3. Previously it was 10. Downstream users are advised to use client timesout as describe in section <<config_timeouts>> instead.
+ * hbase.master.fileSplitTimeout is now set to 10 minutes. Previously it was 30 seconds.
+-* hbase.regionserver.logroll.multiplier is now set to 0.5. Previously it was 0.95.
++* hbase.regionserver.logroll.multiplier is now set to 0.5. Previously it was 0.95. This change is tied with the following doubling of block size. Combined, these two configuration changes should make for WALs of about the same size as those in hbase-1.x but there should be less incidence of small blocks because we fail to roll the WAL before we hit the blocksize threshold. See link:https://issues.apache.org/jira/browse/HBASE-19148[HBASE-19148] for discussion.
+ * hbase.regionserver.hlog.blocksize defaults to 2x the HDFS default block size for the WAL dir. Previously it was equal to the HDFS default block size for the WAL dir.
+ * hbase.client.start.log.errors.counter changed to 5. Previously it was 9.
+ * hbase.ipc.server.callqueue.type changed to 'fifo'. In HBase versions 1.0 - 1.2 it was 'deadline'. In prior and later 1.x versions it already defaults to 'fifo'.
+-- 
+2.16.3

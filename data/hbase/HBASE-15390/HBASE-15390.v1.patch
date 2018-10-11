@@ -1,0 +1,361 @@
+From b499cca6577341cf757a4f923459927ba9ae8280 Mon Sep 17 00:00:00 2001
+From: Mikhail Antonov <antonov@apache.org>
+Date: Wed, 16 Mar 2016 12:48:10 -0700
+Subject: [PATCH] HBASE-15390 Unnecessary MetaCache evictions cause elevated
+ number of requests to meta
+
+---
+ .../hadoop/hbase/CallQueueTooBigException.java     |  4 ++
+ .../apache/hadoop/hbase/client/AsyncProcess.java   |  2 +-
+ .../hbase/client/ConnectionImplementation.java     |  7 ++
+ .../org/apache/hadoop/hbase/client/MetaCache.java  | 79 +++++++++++-----------
+ .../hadoop/hbase/client/MetricsConnection.java     | 33 ++++++++-
+ .../hbase/exceptions/ClientExceptionsUtil.java     | 26 ++-----
+ 6 files changed, 89 insertions(+), 62 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/CallQueueTooBigException.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/CallQueueTooBigException.java
+index d07c657..95ca988 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/CallQueueTooBigException.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/CallQueueTooBigException.java
+@@ -30,4 +30,8 @@ public class CallQueueTooBigException extends IOException {
+   public CallQueueTooBigException() {
+     super();
+   }
++
++  public CallQueueTooBigException(String message) {
++    super(message);
++  }
+ }
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+index 7b0016c..2563a4b 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+@@ -1179,7 +1179,7 @@ class AsyncProcess {
+       Retry canRetry = errorsByServer.canTryMore(numAttempt)
+           ? Retry.YES : Retry.NO_RETRIES_EXHAUSTED;
+ 
+-      if (tableName == null) {
++      if (tableName == null && ClientExceptionsUtil.isMetaClearingException(t)) {
+         // tableName is null when we made a cross-table RPC call.
+         connection.clearCaches(server);
+       }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+index 64eb9fb..fd4dc6d 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+@@ -1860,6 +1860,9 @@ class ConnectionImplementation implements ClusterConnection, Closeable {
+ 
+     if (regionName == null) {
+       // we do not know which region, so just remove the cache entry for the row and server
++      if (metrics != null) {
++        metrics.incrCacheDroppingExceptions(exception);
++      }
+       metaCache.clearCache(tableName, rowkey, source);
+       return;
+     }
+@@ -1899,6 +1902,10 @@ class ConnectionImplementation implements ClusterConnection, Closeable {
+       }
+     }
+ 
++    if (metrics != null) {
++      metrics.incrCacheDroppingExceptions(exception);
++    }
++
+     // If we're here, it means that can cannot be sure about the location, so we remove it from
+     // the cache. Do not send the source because source can be a new server in the same host:port
+     metaCache.clearCache(regionInfo);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
+index bec4845..800bba6 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaCache.java
+@@ -278,8 +278,13 @@ public class MetaCache {
+       }
+       this.cachedServers.remove(serverName);
+     }
+-    if (deletedSomething && LOG.isTraceEnabled()) {
+-      LOG.trace("Removed all cached region locations that map to " + serverName);
++    if (deletedSomething) {
++      if (metrics != null) {
++        metrics.incrMetaCacheNumClearServer();
++      }
++      if (LOG.isTraceEnabled()) {
++        LOG.trace("Removed all cached region locations that map to " + serverName);
++      }
+     }
+   }
+ 
+@@ -298,34 +303,6 @@ public class MetaCache {
+    * @param tableName tableName
+    * @param row
+    */
+-  public void clearCache(final TableName tableName, final byte [] row, int replicaId) {
+-    ConcurrentMap<byte[], RegionLocations> tableLocations = getTableLocations(tableName);
+-
+-    boolean removed = false;
+-    RegionLocations regionLocations = getCachedLocation(tableName, row);
+-    if (regionLocations != null) {
+-      HRegionLocation toBeRemoved = regionLocations.getRegionLocation(replicaId);
+-      RegionLocations updatedLocations = regionLocations.remove(replicaId);
+-      if (updatedLocations != regionLocations) {
+-        byte[] startKey = regionLocations.getRegionLocation().getRegionInfo().getStartKey();
+-        if (updatedLocations.isEmpty()) {
+-          removed = tableLocations.remove(startKey, regionLocations);
+-        } else {
+-          removed = tableLocations.replace(startKey, regionLocations, updatedLocations);
+-        }
+-      }
+-
+-      if (removed && LOG.isTraceEnabled() && toBeRemoved != null) {
+-        LOG.trace("Removed " + toBeRemoved + " from cache");
+-      }
+-    }
+-  }
+-
+-  /**
+-   * Delete a cached location, no matter what it is. Called when we were told to not use cache.
+-   * @param tableName tableName
+-   * @param row
+-   */
+   public void clearCache(final TableName tableName, final byte [] row) {
+     ConcurrentMap<byte[], RegionLocations> tableLocations = getTableLocations(tableName);
+ 
+@@ -333,8 +310,13 @@ public class MetaCache {
+     if (regionLocations != null) {
+       byte[] startKey = regionLocations.getRegionLocation().getRegionInfo().getStartKey();
+       boolean removed = tableLocations.remove(startKey, regionLocations);
+-      if (removed && LOG.isTraceEnabled()) {
+-        LOG.trace("Removed " + regionLocations + " from cache");
++      if (removed) {
++        if (metrics != null) {
++          metrics.incrMetaCacheNumClearRegion();
++        }
++        if (LOG.isTraceEnabled()) {
++          LOG.trace("Removed " + regionLocations + " from cache");
++        }
+       }
+     }
+   }
+@@ -356,9 +338,14 @@ public class MetaCache {
+         } else {
+           removed = tableLocations.replace(startKey, regionLocations, updatedLocations);
+         }
+-        if (removed && LOG.isTraceEnabled()) {
+-          LOG.trace("Removed locations of table: " + tableName + " ,row: " + Bytes.toString(row)
+-            + " mapping to server: " + serverName + " from cache");
++        if (removed) {
++          if (metrics != null) {
++            metrics.incrMetaCacheNumClearRegion();
++          }
++          if (LOG.isTraceEnabled()) {
++            LOG.trace("Removed locations of table: " + tableName + " ,row: " + Bytes.toString(row)
++              + " mapping to server: " + serverName + " from cache");
++          }
+         }
+       }
+     }
+@@ -375,15 +362,20 @@ public class MetaCache {
+       HRegionLocation oldLocation = regionLocations.getRegionLocation(hri.getReplicaId());
+       if (oldLocation == null) return;
+       RegionLocations updatedLocations = regionLocations.remove(oldLocation);
+-      boolean removed = false;
++      boolean removed;
+       if (updatedLocations != regionLocations) {
+         if (updatedLocations.isEmpty()) {
+           removed = tableLocations.remove(hri.getStartKey(), regionLocations);
+         } else {
+           removed = tableLocations.replace(hri.getStartKey(), regionLocations, updatedLocations);
+         }
+-        if (removed && LOG.isTraceEnabled()) {
+-          LOG.trace("Removed " + oldLocation + " from cache");
++        if (removed) {
++          if (metrics != null) {
++            metrics.incrMetaCacheNumClearRegion();
++          }
++          if (LOG.isTraceEnabled()) {
++            LOG.trace("Removed " + oldLocation + " from cache");
++          }
+         }
+       }
+     }
+@@ -398,7 +390,7 @@ public class MetaCache {
+     RegionLocations regionLocations = tableLocations.get(location.getRegionInfo().getStartKey());
+     if (regionLocations != null) {
+       RegionLocations updatedLocations = regionLocations.remove(location);
+-      boolean removed = false;
++      boolean removed;
+       if (updatedLocations != regionLocations) {
+         if (updatedLocations.isEmpty()) {
+           removed = tableLocations.remove(location.getRegionInfo().getStartKey(), regionLocations);
+@@ -406,8 +398,13 @@ public class MetaCache {
+           removed = tableLocations.replace(location.getRegionInfo().getStartKey(), regionLocations,
+               updatedLocations);
+         }
+-        if (removed && LOG.isTraceEnabled()) {
+-          LOG.trace("Removed " + location + " from cache");
++        if (removed) {
++          if (metrics != null) {
++            metrics.incrMetaCacheNumClearRegion();
++          }
++          if (LOG.isTraceEnabled()) {
++            LOG.trace("Removed " + location + " from cache");
++          }
+         }
+       }
+     }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
+index 400f505..4467417 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetricsConnection.java
+@@ -62,6 +62,7 @@ public class MetricsConnection implements StatisticTrackable {
+   private static final String RESP_BASE = "rpcCallResponseSizeBytes_";
+   private static final String MEMLOAD_BASE = "memstoreLoad_";
+   private static final String HEAP_BASE = "heapOccupancy_";
++  private static final String CACHE_BASE = "cacheDroppingExceptions_";
+   private static final String CLIENT_SVC = ClientService.getDescriptor().getName();
+ 
+   /** A container class for collecting details about the RPC call as it percolates. */
+@@ -263,6 +264,12 @@ public class MetricsConnection implements StatisticTrackable {
+     }
+   };
+ 
++  private final NewMetric<Counter> counterFactory = new NewMetric<Counter>() {
++    @Override public Counter newMetric(Class<?> clazz, String name, String scope) {
++      return registry.counter(name(clazz, name, scope));
++    }
++  };
++
+   // static metrics
+ 
+   @VisibleForTesting protected final Counter metaCacheHits;
+@@ -275,6 +282,8 @@ public class MetricsConnection implements StatisticTrackable {
+   @VisibleForTesting protected final CallTracker putTracker;
+   @VisibleForTesting protected final CallTracker multiTracker;
+   @VisibleForTesting protected final RunnerStats runnerStats;
++  private final Counter metaCacheNumClearServer;
++  private final Counter metaCacheNumClearRegion;
+ 
+   // dynamic metrics
+ 
+@@ -286,6 +295,8 @@ public class MetricsConnection implements StatisticTrackable {
+   @VisibleForTesting protected final ConcurrentMap<String, Histogram> rpcHistograms =
+       new ConcurrentHashMap<>(CAPACITY * 2 /* tracking both request and response sizes */,
+           LOAD_FACTOR, CONCURRENCY_LEVEL);
++  private final ConcurrentMap<String, Counter> cacheDroppingExceptions =
++    new ConcurrentHashMap<>(CAPACITY, LOAD_FACTOR, CONCURRENCY_LEVEL);
+ 
+   public MetricsConnection(final ConnectionImplementation conn) {
+     this.scope = conn.toString();
+@@ -309,6 +320,10 @@ public class MetricsConnection implements StatisticTrackable {
+         });
+     this.metaCacheHits = registry.counter(name(this.getClass(), "metaCacheHits", scope));
+     this.metaCacheMisses = registry.counter(name(this.getClass(), "metaCacheMisses", scope));
++    this.metaCacheNumClearServer = registry.counter(name(this.getClass(),
++      "metaCacheNumClearServer", scope));
++    this.metaCacheNumClearRegion = registry.counter(name(this.getClass(),
++      "metaCacheNumClearRegion", scope));
+     this.getTracker = new CallTracker(this.registry, "Get", scope);
+     this.scanTracker = new CallTracker(this.registry, "Scan", scope);
+     this.appendTracker = new CallTracker(this.registry, "Mutate", "Append", scope);
+@@ -342,6 +357,16 @@ public class MetricsConnection implements StatisticTrackable {
+     metaCacheMisses.inc();
+   }
+ 
++  /** Increment the number of meta cache drops requested for entire RegionServer. */
++  public void incrMetaCacheNumClearServer() {
++    metaCacheNumClearServer.inc();
++  }
++
++  /** Increment the number of meta cache drops requested for individual region. */
++  public void incrMetaCacheNumClearRegion() {
++    metaCacheNumClearRegion.inc();
++  }
++
+   /** Increment the number of normal runner counts. */
+   public void incrNormalRunners() {
+     this.runnerStats.incrNormalRunners();
+@@ -364,7 +389,8 @@ public class MetricsConnection implements StatisticTrackable {
+     T t = map.get(key);
+     if (t == null) {
+       t = factory.newMetric(this.getClass(), key, scope);
+-      map.putIfAbsent(key, t);
++      T tmp = map.putIfAbsent(key, t);
++      t = (tmp == null) ? t : tmp;
+     }
+     return t;
+   }
+@@ -436,4 +462,9 @@ public class MetricsConnection implements StatisticTrackable {
+     // Fallback to dynamic registry lookup for DDL methods.
+     updateRpcGeneric(method, stats);
+   }
++
++  public void incrCacheDroppingExceptions(Object exception) {
++    getMetric(CACHE_BASE + exception.getClass().getSimpleName(),
++      cacheDroppingExceptions, counterFactory).inc();
++  }
+ }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ClientExceptionsUtil.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ClientExceptionsUtil.java
+index f7224d5..f586dce 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ClientExceptionsUtil.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ClientExceptionsUtil.java
+@@ -38,7 +38,6 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.classification.InterfaceStability;
+ import org.apache.hadoop.hbase.ipc.CallTimeoutException;
+ import org.apache.hadoop.hbase.ipc.FailedServerException;
+-import org.apache.hadoop.hbase.ipc.RemoteWithExtrasException;
+ import org.apache.hadoop.hbase.quotas.ThrottlingException;
+ import org.apache.hadoop.ipc.RemoteException;
+ 
+@@ -62,7 +61,7 @@ public final class ClientExceptionsUtil {
+     return (cur instanceof RegionMovedException || cur instanceof RegionOpeningException
+         || cur instanceof RegionTooBusyException || cur instanceof ThrottlingException
+         || cur instanceof MultiActionResultTooLarge || cur instanceof RetryImmediatelyException
+-        || isCallQueueTooBigException(cur) || cur instanceof NotServingRegionException);
++        || cur instanceof CallQueueTooBigException || cur instanceof NotServingRegionException);
+   }
+ 
+ 
+@@ -86,12 +85,8 @@ public final class ClientExceptionsUtil {
+       }
+       if (cur instanceof RemoteException) {
+         RemoteException re = (RemoteException) cur;
+-        cur = re.unwrapRemoteException(
+-            RegionOpeningException.class, RegionMovedException.class,
+-            RegionTooBusyException.class);
+-        if (cur == null) {
+-          cur = re.unwrapRemoteException();
+-        }
++        cur = re.unwrapRemoteException();
++
+         // unwrapRemoteException can return the exception given as a parameter when it cannot
+         //  unwrap it. In this case, there is no need to look further
+         // noinspection ObjectEquality
+@@ -109,21 +104,14 @@ public final class ClientExceptionsUtil {
+   }
+ 
+   /**
+-   * Checks if the exception is CallQueueTooBig exception, or tries to unwrap
+-   * {@link RemoteWithExtrasException} to see if we've got {@link CallQueueTooBigException}.
++   * Checks if the exception is CallQueueTooBig exception (maybe wrapped
++   * into some RemoteException).
+    * @param t exception to check
+    * @return true if it's a CQTBE, false otherwise
+    */
+   public static boolean isCallQueueTooBigException(Throwable t) {
+-    if (t instanceof CallQueueTooBigException) {
+-      return true;
+-    }
+-    if (t instanceof RemoteWithExtrasException) {
+-      return CallQueueTooBigException.class.getName().equals(
+-        ((RemoteWithExtrasException) t).getClassName().trim());
+-    } else {
+-      return false;
+-    }
++    t = findException(t);
++    return (t instanceof CallQueueTooBigException);
+   }
+ 
+   /**
+-- 
+2.7.3
+

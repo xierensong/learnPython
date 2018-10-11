@@ -1,0 +1,2414 @@
+diff --git a/src/main/java/org/apache/hadoop/hbase/HConstants.java b/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index a44a0b9..3453051 100644
+--- a/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -20,8 +20,11 @@
+ package org.apache.hadoop.hbase;
+ 
+ import org.apache.hadoop.hbase.ipc.HRegionInterface;
++import org.apache.hadoop.hbase.regionserver.wal.OrphanHLogAfterSplitException;
+ import org.apache.hadoop.hbase.util.Bytes;
+ 
++import java.io.IOException;
++
+ /**
+  * HConstants holds a bunch of HBase-related constants
+  */
+@@ -364,6 +367,11 @@ public final class HConstants {
+   public static final String HBASE_MASTER_LOGCLEANER_PLUGINS =
+       "hbase.master.logcleaner.plugins";
+ 
++  public static final String LOG_SPLITTER_IMPL = "hbase.hlog.splitter.impl";
++  public static final byte [] OHLASPE_BYTES = OrphanHLogAfterSplitException
++      .class.getName().getBytes();
++  public static final byte [] IOEXCEPTION_BYTES = IOException
++      .class.getName().getBytes();
+   private HConstants() {
+     // Can't be instantiated with this ctor.
+   }
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 2f340d4..f4418f1 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -237,6 +237,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+   // HLog and HLog roller. log is protected rather than private to avoid
+   // eclipse warning when accessed by inner classes
+   protected volatile HLog hlog;
++  LogSplitterThread hlogSplitter;
+   LogRoller hlogRoller;
+ 
+   // flag set after we're done setting up server threads (used for testing)
+@@ -525,7 +526,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+     return this.clusterStatusTracker.isClusterUp();
+   }
+ 
+-  private void initializeThreads() throws IOException {
++  private void initializeThreads() throws IOException, KeeperException {
+ 
+     // Cache flushing thread.
+     this.cacheFlusher = new MemStoreFlusher(conf, this);
+@@ -646,6 +647,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+     if (this.compactSplitThread != null) this.compactSplitThread.interruptIfNecessary();
+     if (this.hlogRoller != null) this.hlogRoller.interruptIfNecessary();
+     if (this.majorCompactionChecker != null) this.majorCompactionChecker.interrupt();
++    if (this.hlogSplitter != null) this.hlogSplitter.interruptIfNecessary();
+ 
+     if (this.killed) {
+       // Just skip out w/o closing regions.
+@@ -877,7 +879,11 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+       this.fs = FileSystem.get(this.conf);
+       this.rootDir = new Path(this.conf.get(HConstants.HBASE_DIR));
+       this.hlog = setupWALAndReplication();
+-      // Init in here rather than in constructor after thread name has been set
++    this.hlogSplitter = new LogSplitterThread(this,
++          this.rootDir,
++          new Path(rootDir, HConstants.HREGION_OLDLOGDIR_NAME));
++      
++      // Init in here rather than in2w constructor after thread name has been set
+       this.metrics = new RegionServerMetrics();
+       startServiceThreads();
+       LOG.info("Serving as " + this.serverInfo.getServerName() +
+@@ -1245,6 +1251,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+         handler);
+     Threads.setDaemonThreadRunning(this.majorCompactionChecker, n
+         + ".majorCompactionChecker", handler);
++    Threads.setDaemonThreadRunning(this.hlogSplitter, n + ".logSplitter", handler);
+ 
+     // Leases is not a Thread. Internally it runs a daemon thread. If it gets
+     // an unhandled exception, it will just exit.
+@@ -1301,6 +1308,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+     // Verify that all threads are alive
+     if (!(leases.isAlive() && compactSplitThread.isAlive()
+         && cacheFlusher.isAlive() && hlogRoller.isAlive()
++        && hlogSplitter.isAlive() 
+         && this.majorCompactionChecker.isAlive())) {
+       stop("One or more threads are no longer alive -- stop");
+       return false;
+@@ -1416,6 +1424,7 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+     Threads.shutdown(this.cacheFlusher);
+     Threads.shutdown(this.compactSplitThread);
+     Threads.shutdown(this.hlogRoller);
++    Threads.shutdown(this.hlogSplitter);
+     this.service.shutdown();
+     if (this.replicationHandler != null) {
+       this.replicationHandler.join();
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/LogSplitterThread.java b/src/main/java/org/apache/hadoop/hbase/regionserver/LogSplitterThread.java
+new file mode 100644
+index 0000000..29fc121
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/LogSplitterThread.java
+@@ -0,0 +1,183 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.regionserver.wal.HLogSplitter;
++import org.apache.hadoop.hbase.regionserver.wal.OrphanHLogAfterSplitException;
++import org.apache.hadoop.hbase.zookeeper.DistributedLogSplittingCoordinator;
++
++import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.WatchedEvent;
++import org.apache.zookeeper.Watcher;
++
++import java.io.IOException;
++import java.util.List;
++
++/**
++ * Watches zookeeper to handle Log Splitting.
++ *
++ * NOTE: This class extends Thread rather than Chore because the sleep time can
++ * be interrupted when there is something to do, rather than the Chore sleep
++ * time which is invariant.
++ */
++public class LogSplitterThread extends Thread implements Watcher {
++  private final long frequency;
++  private final HRegionServer server;
++  protected static Configuration conf;
++  private final static String LOGSPLITTER_FREQUENCY =
++      "hbase.regionserver.thread.logsplitter.frequency";
++  private DistributedLogSplittingCoordinator dlc;
++  static final Log LOG = LogFactory.getLog(LogSplitterThread.class);
++  private Path rootDir;
++  private Path oldLogDir;
++
++  /**
++   * The main constructor which handles log splitting
++   *
++   * @param server    The regionserver I sit in
++   * @param rootDir   The rootDir that the regionserver uses.
++   * @param oldLogDir The oldLogDir from the regionserver.
++   * @throws KeeperException Can be caused by the DistributedLogSplittingCoordinator
++   * @throws IOException Can be caused by the DistributedLogSplittingCoordinator
++   */
++  public LogSplitterThread(final HRegionServer server,
++                           Path rootDir,
++                           Path oldLogDir)
++      throws KeeperException, IOException {
++    super();
++    this.server = server;
++    conf = server.getConfiguration();
++    this.dlc = new DistributedLogSplittingCoordinator(conf);
++    this.frequency = conf.getLong(LOGSPLITTER_FREQUENCY, 20000);
++    this.oldLogDir = oldLogDir;
++    this.rootDir = rootDir;
++  }
++
++  public static void resetConf(Configuration conf){
++    LogSplitterThread.conf = conf;
++  }
++
++  /**
++   * Actually trigger a split, either on startup or based on ZooKeeper.
++   *
++   * @throws InterruptedException can be caused by dlc
++   * @throws org.apache.zookeeper.KeeperException can be caused by dlc
++   *
++   */
++  private void fireSplit() throws KeeperException, InterruptedException {
++    while (dlc.hasSplitsWatcher(this) > 0) {
++      DistributedLogSplittingCoordinator.SplitDescriptor splitDescriptor =
++          dlc.topSplit();
++
++      if (splitDescriptor == null) {
++        LOG.debug("Nothing left to do, looks like I lost the race");
++        return;
++      }
++
++      try {
++        Path srcDir = new Path(splitDescriptor.getLogLocation());
++        FileSystem fs = FileSystem.get(conf);
++        HLogSplitter  logSplitter = HLogSplitter.createLogSplitter(conf,
++            rootDir,
++            srcDir,
++            oldLogDir,
++            fs);
++        FileStatus[] files = fs.listStatus(srcDir);
++        List<Path> splits = logSplitter.splitLog(files);
++        dlc.finnishSplit(splitDescriptor.getNodeName(), splits);
++      } catch (OrphanHLogAfterSplitException e) {
++        dlc.orphanHLogSplit(splitDescriptor.getNodeName());
++        LOG.error("OrphanHLog when trying to split: " + e);
++      } catch (IOException e) {
++        dlc.IOException(splitDescriptor.getNodeName());
++        LOG.error("IOError when trying to split: " + e);
++      }
++    }
++  }
++
++  /**
++   * Is triggered by zookeeper when an event happens on our watched queue.
++   * @param event A description of what event happened
++   */
++  public void process(WatchedEvent event) {
++    synchronized (this) {
++      if (event.getType() == Event.EventType.None) {
++        switch (event.getState()) {
++        case SyncConnected:
++          break;
++        case Expired:
++          break;
++        case Disconnected:
++          break;
++        }
++      } else {
++        try {
++          LOG.debug("Firing split for event " + event.getType());
++          fireSplit();
++        } catch (KeeperException e) {
++          LOG.error("Failed to attach to stale log queue:" + e);
++        } catch (InterruptedException e) {
++          LOG.error("Interrupted while attaching stale log queue");
++        }
++      }
++    }
++  }
++
++  @Override
++  public void run() {
++    LOG.info("LogSplitter Running.");
++    try {
++      int current_nodes = dlc.hasSplitsWatcher(this);
++      LOG.info(current_nodes);
++      if (current_nodes > 0) {
++        fireSplit();
++      }
++
++    } catch (KeeperException e) {
++      LOG.error("Failed to attach to stale log queue");
++    } catch (InterruptedException e) {
++      LOG.error("Interrupted while attaching stale log queue");
++    }
++
++    while (!server.isStopped()) {
++      try {
++        Thread.sleep(this.frequency);
++      } catch (InterruptedException e) {
++        break;
++      }
++    }
++    LOG.info("LogSplitter exiting.");
++  }
++
++  /**
++   * Called by region server to wake up this thread if it sleeping. It is
++   * sleeping if rollLock is not held.
++   */
++  public void interruptIfNecessary() {
++    this.interrupt();
++  }
++}
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/wal/DistributedHLogSplitter.java b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/DistributedHLogSplitter.java
+new file mode 100644
+index 0000000..3bd94fe
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/DistributedHLogSplitter.java
+@@ -0,0 +1,105 @@
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import com.google.common.base.Preconditions;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.zookeeper.DistributedLogSplittingCoordinator;
++import org.apache.zookeeper.KeeperException;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++public class DistributedHLogSplitter extends HLogSplitter {
++  private static final int ISSPLITTINGWAITTIME = 1000;
++
++  public DistributedHLogSplitter(Configuration conf,
++                                 Path rootDir,
++                                 Path srcDir,
++                                 Path oldLogDir,
++                                 FileSystem fs) {
++    super(conf, rootDir, srcDir, oldLogDir, fs);
++  }
++
++  @Override
++  public List<Path> splitLog() throws IOException {
++    Preconditions.checkState(!hasSplit,
++        "An HLogSplitter instance may only be used once");
++    hasSplit = true;
++
++    long startTime = System.currentTimeMillis();
++    ArrayList<Path> splits = null;
++
++    if (!fs.exists(srcDir)) {
++      LOG.debug("srcDir: " + srcDir + " does'nt exist");
++      return null;
++    }
++
++    try {
++      LOG.debug("Pushing: " + srcDir);
++      splits = new ArrayList<Path>();
++      DistributedLogSplittingCoordinator dlc;
++      dlc = new DistributedLogSplittingCoordinator(conf);
++      dlc.pushSplit(srcDir);
++    } catch (InterruptedException e) {
++      IOException io;
++      io = new IOException("KeeperException while trying enqueue " + "splits");
++      io.initCause(e);
++      throw io;
++    } catch (KeeperException e) {
++      IOException io;
++      io = new IOException("InterruptedException while trying enqueue splits");
++      io.initCause(e);
++      throw io;
++    }
++
++    try {
++      DistributedLogSplittingCoordinator dlc;
++      dlc = new DistributedLogSplittingCoordinator(conf);
++
++      while (dlc.isSplitting() > 0) {
++        Thread.sleep(ISSPLITTINGWAITTIME);
++        LOG.debug("Sleeping waiting " + ISSPLITTINGWAITTIME + " ms on " +
++            "splitting");
++      }
++    } catch (InterruptedException e1) {
++      IOException io;
++      io = new IOException("KeeperException while waiting for splitting");
++      io.initCause(e1);
++      throw io;
++    } catch (KeeperException e1) {
++      IOException io;
++      io = new IOException("InterruptedException while waiting for splitting");
++      io.initCause(e1);
++      throw io;
++    }
++
++    try {
++      DistributedLogSplittingCoordinator dlc;
++      dlc = new DistributedLogSplittingCoordinator(conf);
++
++      while (dlc.countSplitResults() > 0) {
++        splits.add(dlc.popSplitResult());
++      }
++    } catch (KeeperException e) {
++      IOException io;
++      io = new IOException("KeeperException while trying dequeing " + "splits");
++      io.initCause(e);
++      throw io;
++    } catch (InterruptedException e) {
++      IOException io;
++      io = new IOException("InterruptedException while trying dequeing splits");
++      io.initCause(e);
++      throw io;
++    }
++
++    splitTime = System.currentTimeMillis() - startTime;
++    LOG.info(new StringBuilder()
++        .append("hlog file splitting completed in ")
++        .append(splitTime).append(" ms for ")
++        .append(srcDir.toString())
++        .toString());
++    return splits;
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+index 550f759..3c5b77a 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogSplitter.java
+@@ -76,8 +76,8 @@ public class HLogSplitter {
+   
+   static final Log LOG = LogFactory.getLog(HLogSplitter.class);
+ 
+-  private boolean hasSplit = false;
+-  private long splitTime = 0;
++  protected boolean hasSplit = false;
++  protected long splitTime = 0;
+   private long splitSize = 0;
+ 
+ 
+@@ -238,7 +238,7 @@ public class HLogSplitter {
+    * After the process is complete, the log files are archived to a separate
+    * directory.
+    */
+-  private List<Path> splitLog(final FileStatus[] logfiles) throws IOException {
++  public List<Path> splitLog(final FileStatus[] logfiles) throws IOException {
+     List<Path> processedLogs = new ArrayList<Path>();
+     List<Path> corruptedLogs = new ArrayList<Path>();
+     List<Path> splits = null;
+diff --git a/src/main/java/org/apache/hadoop/hbase/zookeeper/DistributedLogSplittingCoordinator.java b/src/main/java/org/apache/hadoop/hbase/zookeeper/DistributedLogSplittingCoordinator.java
+new file mode 100644
+index 0000000..8ced008
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/zookeeper/DistributedLogSplittingCoordinator.java
+@@ -0,0 +1,360 @@
++package org.apache.hadoop.hbase.zookeeper;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.List;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.Abortable;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.regionserver.wal.OrphanHLogAfterSplitException;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.zookeeper.KeeperException;
++import org.apache.zookeeper.Watcher;
++
++import static org.apache.hadoop.hbase.zookeeper.ZKUtil.joinZNode;
++
++public class DistributedLogSplittingCoordinator implements Abortable {
++  /**
++   * A metadata container created every time a split happens in a distributed
++   * manner.
++   */
++  private boolean globalSplitLock = true;
++  private final String splitWorkQueue;
++  private final String splitLock;
++  private final String splitResultQueue;
++  private static ZooKeeperWatcher zkw;
++  static final Log LOG = LogFactory
++      .getLog(DistributedLogSplittingCoordinator.class);
++
++
++  public static class SplitDescriptor {
++    private String nodeName;
++    private String logLocation;
++
++    /**
++     * Return the ZooKeeper node path associated with this split descriptor.
++     *
++     * @return the znode's name
++     */
++    public String getNodeName() {
++      return nodeName;
++    }
++
++    /**
++     * Set the ZooKeeper node's path associated with this split descriptor.
++     *
++     * @param nodeName the znode's name
++     */
++    public void setNodeName(String nodeName) {
++      this.nodeName = nodeName;
++    }
++
++    /**
++     * Return the log location assocaited with this ZooKeeper node.
++     *
++     * @return The log location
++     */
++    public String getLogLocation() {
++      return logLocation;
++    }
++
++    /**
++     * Set the Log location associated with the ZooKeeper node.
++     *
++     * @param logLocation the log location.
++     */
++    public void setLogLocation(String logLocation) {
++      this.logLocation = logLocation;
++    }
++  }
++
++  public DistributedLogSplittingCoordinator(Configuration conf)
++      throws KeeperException, IOException {
++
++    String myClassName = DistributedLogSplittingCoordinator.class.toString();
++    zkw = new ZooKeeperWatcher(conf, myClassName, this);
++    String splitWorkQueueName = conf.get("zookeeper.znode.splitworkqueue",
++        "/splitworkqueue");
++    String splitLockName = conf.get("zookeeper.znode.splitlock", "/splitlock");
++    String splitResultQueueName = conf.get("zookeeper.znode.splitresultqueue",
++        "/splitresult");
++    splitWorkQueue = splitWorkQueueName;
++    splitLock = splitLockName;
++    splitResultQueue = splitResultQueueName;
++
++  }
++
++  /**
++   * A function which returns whether or not their are logs to be split.
++   *
++   * @param w A watcher which gets updated whenever their is an event to split
++   *          queue
++   * @return the number of log directories left to be split.
++   * @throws KeeperException getChildren can throw a Keeper
++   * @throws InterruptedException getChildren can throw a Interrupted exception
++   */
++
++  public int hasSplitsWatcher(Watcher w)
++      throws KeeperException, InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    return zkw.getZooKeeper().getChildren(splitWorkQueue, w).size();
++  }
++
++  /**
++   * Add a log directory to be split
++   *
++   * @param logDir The directory which contains logs
++   * @throws KeeperException Create nodes can throw a KeeperException
++   * @throws InterruptedException Create nodes can throw a InterruptedException
++   */
++  public void pushSplit(Path logDir) throws KeeperException,
++      InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    ZKUtil.createPersistentSequential(zkw,
++        joinZNode(splitWorkQueue, "logDir"),
++        logDir.toString().getBytes());
++  }
++
++  /**
++   * Get the top split and install a lock on it.
++   *
++   * @return The metadata associated with the split.
++   * @throws KeeperException getData or node creation can throw a
++   * KeeperException
++   * @throws InterruptedException getData or node creation can throw a
++   * InterruptedException
++   */
++  public SplitDescriptor topSplit() throws KeeperException,
++      InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    ZKUtil.createAndFailSilent(zkw, splitLock);
++    SplitDescriptor splitDescriptor;
++
++    String node =
++        ZKUtil.listChildrenNoWatch(zkw, splitWorkQueue).listIterator().next();
++
++    byte[] data = ZKUtil.getData(zkw, joinZNode(splitWorkQueue, node));
++
++    if (data == null) {
++      LOG.error("Null data for node:" + splitWorkQueue + ":" + node);
++    }
++
++    String lockNode = joinZNode(splitLock, node);
++
++    if (globalSplitLock) {
++      lockNode = joinZNode(splitLock, "lock");
++    }
++
++    LOG.debug("Attempting to create lock node:" + lockNode);
++
++    if (!ZKUtil.createEphemeralNodeAndWatch(zkw, lockNode, data)) {
++      LOG.debug("Lost lock race");
++      return null;
++    }
++
++    LOG.debug("Lock node complete");
++    String hadoopPath = new String(data);
++
++    splitDescriptor = new SplitDescriptor();
++    splitDescriptor.setNodeName(node);
++    splitDescriptor.setLogLocation(hadoopPath);
++
++    LOG.debug("returned node:" + splitWorkQueue + ":" + node + " With data: "
++        + new String(data));
++
++    return splitDescriptor;
++  }
++
++  /**
++   * A cleanup function which actually safely removes the lock and queued work
++   * unit, marking that we are done splitting. This also creates a splitResult
++   * to be collected by the master
++   *
++   * @param splitNode The split node which is now finished.
++   * @throws KeeperException Creation of nodes can cause a keeper exception
++   * @throws InterruptedException Creation of nodes can cause a Interrupted
++   *  exception
++   */
++  public void orphanHLogSplit(String splitNode) throws KeeperException,
++      InterruptedException {
++    LOG.error("Marking OrphanHLog Split");
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    ZKUtil.createAndFailSilent(zkw, splitLock);
++    ZKUtil.createAndFailSilent(zkw, splitResultQueue);
++
++    ZKUtil.createPersistentSequential(zkw,
++        joinZNode(splitResultQueue, "result"),
++        HConstants.OHLASPE_BYTES);
++    String splitZNode = joinZNode(splitWorkQueue, splitNode);
++    String splitLockZNode = joinZNode(splitLock, splitNode);
++
++    if (globalSplitLock) {
++      splitLockZNode = joinZNode(splitLock, "lock");
++    }
++
++    ZKUtil.deleteNode(zkw, splitZNode);
++    ZKUtil.deleteNode(zkw, splitLockZNode);
++  }
++
++  public void IOException(String splitNode) throws KeeperException,
++      InterruptedException {
++    LOG.error("Marking IOException Split");
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    ZKUtil.createAndFailSilent(zkw, splitLock);
++    ZKUtil.createAndFailSilent(zkw, splitResultQueue);
++
++    ZKUtil.createPersistentSequential(zkw,
++        joinZNode(splitResultQueue, "result"),
++        HConstants.IOEXCEPTION_BYTES);
++    String splitZNode = joinZNode(splitWorkQueue, splitNode);
++    String splitLockZNode = joinZNode(splitLock, splitNode);
++
++    if (globalSplitLock) {
++      splitLockZNode = joinZNode(splitLock, "lock");
++    }
++
++    ZKUtil.deleteNode(zkw, splitZNode);
++    ZKUtil.deleteNode(zkw, splitLockZNode);
++  }
++
++  /**
++   * A cleanup function which actually safely removes the lock and queued work
++   * unit, marking that we are done splitting. This also creates a splitResult
++   * to be collected by the master
++   *
++   * @param splitNode The split node which is now finished.
++   * @param splitPath The resultant split locations.
++   * @throws KeeperException Creating a node can cause a Keeper exception
++   * @throws InterruptedException Creating a node can cause a Interrupted
++   *  exception
++   */
++  public void finnishSplit(String splitNode, List<Path> splitPath)
++      throws KeeperException, InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    ZKUtil.createAndFailSilent(zkw, splitLock);
++
++    pushSplitResults(splitPath);
++    String splitZNode = joinZNode(splitWorkQueue, splitNode);
++
++    String splitLockZNode = joinZNode(splitLock, splitNode);
++
++    if (globalSplitLock) {
++      splitLockZNode = joinZNode(splitLock, "lock");
++    }
++
++    ZKUtil.deleteNode(zkw, splitZNode);
++    ZKUtil.deleteNode(zkw, splitLockZNode);
++  }
++
++  /**
++   * Do we have any splits left?
++   *
++   * @return the number of split results left.
++   * @throws KeeperException Listing a node can cause a keeper exception
++   * @throws InterruptedException Listing a node can cause a Interrupted
++   * exception
++   */
++  public int isSplitting() throws KeeperException, InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitWorkQueue);
++    return ZKUtil.listChildrenNoWatch(zkw, splitWorkQueue).size();
++  }
++
++
++  /**
++   * Do we have any split results left?
++   *
++   * @return the number of split results left.
++   * @throws KeeperException Listing of nodes can cause an Keeper exception
++   * @throws InterruptedException Listing of nodes can cause an interrupted
++   * exception
++   */
++  public int countSplitResults() throws KeeperException, InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitResultQueue);
++    return ZKUtil.listChildrenNoWatch(zkw, splitResultQueue).size();
++  }
++
++  /**
++   * Take the results of a split and add them to a queue to be collected by the
++   * master
++   *
++   * @param splitPath A number of split resultants.
++   * @throws KeeperException Creating a node can cause a keeper exception
++   * @throws InterruptedException  Creating a node can cause a Interrupted
++   *  exception
++   */
++  public void pushSplitResults(List<Path> splitPath) throws KeeperException,
++      InterruptedException {
++    ZKUtil.createAndFailSilent(zkw, splitResultQueue);
++    byte[] splitData;
++
++    if (null == splitPath) {
++      ZKUtil.createPersistentSequential(zkw,
++          joinZNode(splitResultQueue, "result"),
++          HConstants.EMPTY_BYTE_ARRAY);
++    } else {
++      for (Path split : splitPath) {
++        splitData = (null == split) ? HConstants.EMPTY_BYTE_ARRAY : Bytes
++            .toBytes(split.toString());
++
++        LOG.debug("push Split Result:" + new String(splitData));
++        ZKUtil.createPersistentSequential(zkw,
++            joinZNode(splitResultQueue, "result"), splitData);
++      }
++    }
++  }
++
++  /**
++   * Grab the oldest split result to be consumed
++   *
++   * @return The location of a split.
++   * @throws KeeperException Creating a node can cause a keeper exception
++   * @throws InterruptedException  Creating a node can cause a Interrupted
++   *  exception
++   * @throws IOException We will throw an IOException if we have no splits
++   */
++
++  public Path popSplitResult() throws KeeperException, InterruptedException,
++      IOException {
++    ZKUtil.createAndFailSilent(zkw, splitResultQueue);
++    List<String> outstandingSplitResults;
++    outstandingSplitResults = ZKUtil.listChildrenNoWatch(zkw, splitResultQueue);
++
++    for (String outstandingSplitResult : outstandingSplitResults) {
++      String zNode = joinZNode(splitResultQueue, outstandingSplitResult);
++      byte[] splitResultData = ZKUtil.getData(zkw, zNode);
++      if (Arrays.equals(splitResultData, HConstants.OHLASPE_BYTES)) {
++        ZKUtil.deleteNode(zkw, zNode);
++        throw new OrphanHLogAfterSplitException("OrphanHLogAfterSplit for: "
++            + zNode);
++      } else if (Arrays.equals(splitResultData, HConstants.IOEXCEPTION_BYTES)) {
++        ZKUtil.deleteNode(zkw, zNode);
++        throw new IOException("IOException for: " + zNode);
++      } else if (splitResultData != null) {
++        String splitResult = new String(splitResultData);
++
++        if (splitResult.equals("")) {
++          LOG.debug("splitResult was blank");
++          ZKUtil.deleteNode(zkw, zNode);
++        } else {
++          ZKUtil.deleteNode(zkw, zNode);
++          return new Path(new String(splitResultData));
++        }
++
++      } else {
++        LOG.debug("splitResultData is null");
++        ZKUtil.deleteNode(zkw, zNode);
++      }
++    }
++    throw new IOException("No splits");
++  }
++
++  @Override
++  public void abort(String why, Throwable e) {
++    // Currently does nothing but throw the passed message and exception
++    throw new RuntimeException(why, e);
++  }
++}
+diff --git a/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java b/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+index ead223f..7873ebb 100644
+--- a/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
++++ b/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+@@ -1112,4 +1112,29 @@ public class ZKUtil {
+               RegionTransitionData.fromBytes(data).toString()
+               : StringUtils.abbreviate(Bytes.toString(data), 32)))));
+   }
++
++  /**
++   * Creates the specified node and all parent nodes required for it to exist.
++   * 
++   * No watches are set.
++   * 
++   * The nodes created are persistent, sequential and open access.
++   * 
++   * @param zkw
++   *          zk reference
++   * @param znode
++   *          path of node
++   * @throws KeeperException
++   *           if unexpected zookeeper exception
++   * @throws InterruptedException
++   */
++  public static void createPersistentSequential(ZooKeeperWatcher zkw,
++      String znode, byte[] data) throws KeeperException, InterruptedException {
++    if (znode == null) {
++      return;
++    }
++    zkw.getZooKeeper().create(znode, data, Ids.OPEN_ACL_UNSAFE,
++        CreateMode.PERSISTENT_SEQUENTIAL);
++  }
++
+ }
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/BaseTestHLogSplit.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/BaseTestHLogSplit.java
+new file mode 100644
+index 0000000..05e8af2
+--- /dev/null
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/BaseTestHLogSplit.java
+@@ -0,0 +1,540 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import com.google.common.base.Joiner;
++import com.google.common.collect.ImmutableList;
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FSDataInputStream;
++import org.apache.hadoop.fs.FSDataOutputStream;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HBaseTestingUtility;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.regionserver.HRegion;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Threads;
++import org.apache.hadoop.ipc.RemoteException;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.mockito.Mockito;
++import org.mockito.invocation.InvocationOnMock;
++import org.mockito.stubbing.Answer;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++
++public class BaseTestHLogSplit {
++  protected final static Log LOG = LogFactory.getLog(BaseTestHLogSplit.class);
++
++  protected FileSystem fs;
++
++  protected final static HBaseTestingUtility
++      TEST_UTIL = new HBaseTestingUtility();
++  protected static final Configuration conf = TEST_UTIL.getConfiguration();
++
++  protected static final int NUM_WRITERS = 10;
++  protected static final int ENTRIES = 10; // entries per writer per region
++
++  protected HLog.Writer[] writer = new HLog.Writer[NUM_WRITERS];
++  protected long seq = 0;
++  protected static final byte[] TABLE_NAME = "t1".getBytes();
++  protected static final byte[] FAMILY = "f1".getBytes();
++  protected static final byte[] QUALIFIER = "q1".getBytes();
++  protected static final byte[] VALUE = "v1".getBytes();
++  protected static final String HLOG_FILE_PREFIX = "hlog.dat.";
++  protected static List<String> regions;
++  protected static final String HBASE_SKIP_ERRORS = "hbase.hlog.split.skip.errors";
++
++  protected static Path hbaseDir  = new Path("/hbase");
++  protected static Path hlogDir  = new Path(hbaseDir, "hlog");
++  protected static Path oldLogDir = new Path(hbaseDir, "hlog.old");
++  protected static Path corruptDir = new Path(hbaseDir, ".corrupt");
++  protected static Path tabledir =  new Path(hbaseDir,
++      Bytes.toString(TABLE_NAME));
++
++  static enum Corruptions {
++    INSERT_GARBAGE_ON_FIRST_LINE,
++    INSERT_GARBAGE_IN_THE_MIDDLE,
++    APPEND_GARBAGE,
++    TRUNCATE,
++  }
++
++  @BeforeClass
++  public static void setUpBeforeClass() {
++    TEST_UTIL.getConfiguration().
++        setInt("hbase.regionserver.flushlogentries", 1);
++    TEST_UTIL.getConfiguration().
++        setBoolean("dfs.support.append", true);
++    TEST_UTIL.getConfiguration().
++            setStrings("hbase.rootdir", hbaseDir.toString());
++    TEST_UTIL.getConfiguration().
++        setClass("hbase.regionserver.hlog.writer.impl",
++            InstrumentedSequenceFileLogWriter.class, HLog.Writer.class);
++    TEST_UTIL.getConfiguration().setBoolean(HBASE_SKIP_ERRORS, false);
++  }
++
++  @Before
++  public void setUp() throws Exception {
++    flushToConsole("Cleaning up cluster for new test\n"
++        + "--------------------------");
++    fs = TEST_UTIL.getDFSCluster().getFileSystem();
++    FileStatus[] entries = fs.listStatus(hbaseDir);
++    if (entries != null) {
++
++      flushToConsole("Num entries in /:" + entries.length);
++      for (FileStatus dir : entries) {
++        assertTrue("Deleting " + dir.getPath(),
++            fs.delete(dir.getPath(), true));
++      }
++    }
++    seq = 0;
++    regions = new ArrayList<String>();
++    Collections.addAll(regions, "bbb", "ccc");
++    InstrumentedSequenceFileLogWriter.activateFailure = false;
++    // Set the soft lease for hdfs to be down from default of 5 minutes or so.
++    TEST_UTIL.setNameNodeNameSystemLeasePeriod(100, 50000);
++  }
++
++  /**
++   * Sets up a log splitter with a mock reader and writer. The mock reader generates
++   * a specified number of edits spread across 5 regions. The mock writer optionally
++   * sleeps for each edit it is fed.
++   * *
++   * After the split is complete, verifies that the statistics show the correct number
++   * of edits output into each region.
++   *
++   * @param numFakeEdits   number of fake edits to push through pipeline
++   * @param bufferSize     size of in-memory buffer
++   * @param writerSlowness writer threads will sleep this many ms per edit
++   * @throws java.io.IOException HDFS can throw IOExceptions
++   */
++  protected void doTestThreading(final int numFakeEdits,
++                                 final int bufferSize,
++                                 final int writerSlowness) throws IOException {
++
++    Configuration localConf = new Configuration(conf);
++    localConf.setInt("hbase.regionserver.hlog.splitlog.buffersize", bufferSize);
++
++    // Create a fake log file (we'll override the reader to produce a stream of edits)
++    FSDataOutputStream out = fs.create(new Path(hlogDir, HLOG_FILE_PREFIX + ".fake"));
++    out.close();
++
++    // Make region dirs for our destination regions so the output doesn't get skipped
++    final List<String> regions = ImmutableList.of("r0", "r1", "r2", "r3", "r4");
++    makeRegionDirs(fs, regions);
++
++    // Create a splitter that reads and writes the data without touching disk
++    HLogSplitter logSplitter = new HLogSplitter(
++        localConf, hbaseDir, hlogDir, oldLogDir, fs) {
++
++      /* Produce a mock writer that doesn't write anywhere */
++      protected HLog.Writer createWriter(FileSystem fs, Path logfile, Configuration conf)
++          throws IOException {
++        HLog.Writer mockWriter = Mockito.mock(HLog.Writer.class);
++        Mockito.doAnswer(new Answer<Void>() {
++          int expectedIndex = 0;
++
++          @Override
++          public Void answer(InvocationOnMock invocation) {
++            if (writerSlowness > 0) {
++              try {
++                Thread.sleep(writerSlowness);
++              } catch (InterruptedException ie) {
++                Thread.currentThread().interrupt();
++              }
++            }
++            HLog.Entry entry = (HLog.Entry) invocation.getArguments()[0];
++            WALEdit edit = entry.getEdit();
++            List<KeyValue> keyValues = edit.getKeyValues();
++            assertEquals(1, keyValues.size());
++            KeyValue kv = keyValues.get(0);
++
++            // Check that the edits come in the right order.
++            assertEquals(expectedIndex, Bytes.toInt(kv.getRow()));
++            expectedIndex++;
++            return null;
++          }
++        }).when(mockWriter).append(Mockito.<HLog.Entry>any());
++        return mockWriter;
++      }
++
++
++      /* Produce a mock reader that generates fake entries */
++      protected HLog.Reader getReader(FileSystem fs, Path curLogFile, Configuration conf)
++          throws IOException {
++        HLog.Reader mockReader = Mockito.mock(HLog.Reader.class);
++        Mockito.doAnswer(new Answer<HLog.Entry>() {
++          int index = 0;
++
++          @Override
++          public HLog.Entry answer(InvocationOnMock invocation) throws Throwable {
++            if (index >= numFakeEdits) return null;
++
++            // Generate r0 through r4 in round robin fashion
++            int regionIdx = index % regions.size();
++            byte region[] = new byte[]{(byte) 'r', (byte) (0x30 + regionIdx)};
++
++            HLog.Entry ret = createTestEntry(TABLE_NAME, region,
++                Bytes.toBytes(index / regions.size()),
++                FAMILY, QUALIFIER, VALUE, index);
++            index++;
++            return ret;
++          }
++        }).when(mockReader).next();
++        return mockReader;
++      }
++    };
++
++    logSplitter.splitLog();
++
++    // Verify number of written edits per region
++
++    Map<byte[], Long> outputCounts = logSplitter.getOutputCounts();
++    for (Map.Entry<byte[], Long> entry : outputCounts.entrySet()) {
++      LOG.info("Got " + entry.getValue() + " output edits for region " +
++          Bytes.toString(entry.getKey()));
++
++      assertEquals((long) entry.getValue(), numFakeEdits / regions.size());
++    }
++    assertEquals(regions.size(), outputCounts.size());
++  }
++
++
++  /**
++   * This thread will keep writing to the file after the split process has started
++   * It simulates a region server that was considered dead but woke up and wrote
++   * some more to he last log entry
++   */
++  class ZombieLastLogWriterRegionServer extends Thread {
++    AtomicLong editsCount;
++    AtomicBoolean stop;
++    Path log;
++    HLog.Writer lastLogWriter;
++
++    public ZombieLastLogWriterRegionServer(HLog.Writer writer, AtomicLong counter, AtomicBoolean stop) {
++      this.stop = stop;
++      this.editsCount = counter;
++      this.lastLogWriter = writer;
++    }
++
++    @Override
++    public void run() {
++      if (stop.get()) {
++        return;
++      }
++      flushToConsole("starting");
++      while (true) {
++        try {
++          String region = "juliet";
++
++          fs.mkdirs(new Path(new Path(hbaseDir, region), region));
++          appendEntry(lastLogWriter, TABLE_NAME, region.getBytes(),
++              ("r" + editsCount).getBytes(), FAMILY, QUALIFIER, VALUE, 0);
++          lastLogWriter.sync();
++          editsCount.incrementAndGet();
++          try {
++            Thread.sleep(1);
++          } catch (InterruptedException e) {
++            //
++          }
++
++
++        } catch (IOException ex) {
++          if (ex instanceof RemoteException) {
++            flushToConsole("Juliet: got RemoteException " +
++                ex.getMessage() + " while writing " + (editsCount.get() + 1));
++            break;
++          } else {
++            assertTrue("Failed to write " + editsCount.get(), false);
++          }
++
++        }
++      }
++
++
++    }
++  }
++
++  /**
++   * This thread will keep adding new log files
++   * It simulates a region server that was considered dead but woke up and wrote
++   * some more to a new hlog
++   */
++  class ZombieNewLogWriterRegionServer extends Thread {
++    AtomicBoolean stop;
++
++    public ZombieNewLogWriterRegionServer(AtomicBoolean stop) {
++      super("ZombieNewLogWriterRegionServer");
++      this.stop = stop;
++    }
++
++    @Override
++    public void run() {
++      if (stop.get()) {
++        return;
++      }
++      Path tableDir = new Path(hbaseDir, new String(TABLE_NAME));
++      Path regionDir = new Path(tableDir, regions.get(0));
++      Path recoveredEdits = new Path(regionDir, HLogSplitter.RECOVERED_EDITS);
++      String region = "juliet";
++      Path julietLog = new Path(hlogDir, HLOG_FILE_PREFIX + ".juliet");
++      try {
++
++        while (!fs.exists(recoveredEdits) && !stop.get()) {
++          flushToConsole("Juliet: split not started, sleeping a bit...");
++          Threads.sleep(100);
++        }
++
++        fs.mkdirs(new Path(tableDir, region));
++        HLog.Writer writer = HLog.createWriter(fs,
++            julietLog, conf);
++        appendEntry(writer, "juliet".getBytes(), ("juliet").getBytes(),
++            ("r").getBytes(), FAMILY, QUALIFIER, VALUE, 0);
++        writer.close();
++        flushToConsole("Juliet file creator: created file " + julietLog);
++      } catch (IOException e1) {
++        assertTrue("Failed to create file " + julietLog, false);
++      }
++    }
++  }
++
++  private void flushToConsole(String s) {
++    System.out.println(s);
++    System.out.flush();
++  }
++
++
++  protected void generateHLogs(int leaveOpen) throws IOException {
++    generateHLogs(NUM_WRITERS, ENTRIES, leaveOpen);
++  }
++
++  private void makeRegionDirs(FileSystem fs, List<String> regions) throws IOException {
++    for (String region : regions) {
++      flushToConsole("Creating dir for region " + region);
++      fs.mkdirs(new Path(tabledir, region));
++    }
++  }
++
++  protected void generateHLogs(int writers, int entries, int leaveOpen) throws
++      IOException {
++    makeRegionDirs(fs, regions);
++    for (int i = 0; i < writers; i++) {
++      writer[i] = HLog.createWriter(fs, new Path(hlogDir, HLOG_FILE_PREFIX + i), conf);
++      for (int j = 0; j < entries; j++) {
++        int prefix = 0;
++        for (String region : regions) {
++          String row_key = region + prefix++ + i + j;
++          appendEntry(writer[i], TABLE_NAME, region.getBytes(),
++              row_key.getBytes(), FAMILY, QUALIFIER, VALUE, seq);
++        }
++      }
++      if (i != leaveOpen) {
++        writer[i].close();
++        flushToConsole("Closing writer " + i);
++      }
++    }
++  }
++
++  protected Path getLogForRegion(Path rootdir, byte[] table, String region)
++      throws IOException {
++    Path tdir = HTableDescriptor.getTableDir(rootdir, table);
++    Path editsdir = HLog.getRegionDirRecoveredEditsDir(HRegion.getRegionDir(tdir,
++        Bytes.toString(region.getBytes())));
++    FileStatus[] files = this.fs.listStatus(editsdir);
++    assertEquals(1, files.length);
++    return files[0].getPath();
++  }
++
++  protected void corruptHLog(Path path, Corruptions corruption, boolean close,
++                             FileSystem fs) throws IOException {
++
++    FSDataOutputStream out;
++    int fileSize = (int) fs.listStatus(path)[0].getLen();
++
++    FSDataInputStream in = fs.open(path);
++    byte[] corrupted_bytes = new byte[fileSize];
++    in.readFully(0, corrupted_bytes, 0, fileSize);
++    in.close();
++
++    switch (corruption) {
++    case APPEND_GARBAGE:
++      out = fs.append(path);
++      out.write("-----".getBytes());
++      closeOrFlush(close, out);
++      break;
++
++    case INSERT_GARBAGE_ON_FIRST_LINE:
++      fs.delete(path, false);
++      out = fs.create(path);
++      out.write(0);
++      out.write(corrupted_bytes);
++      closeOrFlush(close, out);
++      break;
++
++    case INSERT_GARBAGE_IN_THE_MIDDLE:
++      fs.delete(path, false);
++      out = fs.create(path);
++      int middle = (int) Math.floor(corrupted_bytes.length / 2);
++      out.write(corrupted_bytes, 0, middle);
++      out.write(0);
++      out.write(corrupted_bytes, middle, corrupted_bytes.length - middle);
++      closeOrFlush(close, out);
++      break;
++
++    case TRUNCATE:
++      fs.delete(path, false);
++      out = fs.create(path);
++      out.write(corrupted_bytes, 0, fileSize - 32);
++      closeOrFlush(close, out);
++
++      break;
++    }
++
++
++  }
++
++  private void closeOrFlush(boolean close, FSDataOutputStream out)
++      throws IOException {
++    if (close) {
++      out.close();
++    } else {
++      out.sync();
++      // Not in 0out.hflush();
++    }
++  }
++
++  @SuppressWarnings("unused")
++  private void dumpHLog(Path log, FileSystem fs, Configuration conf) throws IOException {
++    HLog.Entry entry;
++    HLog.Reader in = HLog.getReader(fs, log, conf);
++    while ((entry = in.next()) != null) {
++      System.out.println(entry);
++    }
++  }
++
++  protected int countHLog(Path log, FileSystem fs, Configuration conf) throws
++      IOException {
++    int count = 0;
++    HLog.Reader in = HLog.getReader(fs, log, conf);
++    while (in.next() != null) {
++      count++;
++    }
++    return count;
++  }
++
++
++  public long appendEntry(HLog.Writer writer, byte[] table, byte[] region,
++                          byte[] row, byte[] family, byte[] qualifier,
++                          byte[] value, long seq)
++      throws IOException {
++
++    writer.append(createTestEntry(table, region, row, family, qualifier, value, seq));
++    writer.sync();
++    return seq;
++  }
++
++  private HLog.Entry createTestEntry(
++      byte[] table, byte[] region,
++      byte[] row, byte[] family, byte[] qualifier,
++      byte[] value, long seq) {
++    long time = System.nanoTime();
++    WALEdit edit = new WALEdit();
++    seq++;
++    edit.add(new KeyValue(row, family, qualifier, time, KeyValue.Type.Put, value));
++    return new HLog.Entry(new HLogKey(region, table, seq, time), edit);
++  }
++
++
++  protected void injectEmptyFile(String suffix, boolean closeFile)
++      throws IOException {
++    HLog.Writer writer = HLog.createWriter(
++        fs, new Path(hlogDir, HLOG_FILE_PREFIX + suffix), conf);
++    if (closeFile) writer.close();
++  }
++
++  @SuppressWarnings("unused")
++  private void listLogs(FileSystem fs, Path dir) throws IOException {
++    for (FileStatus file : fs.listStatus(dir)) {
++      System.out.println(file.getPath());
++    }
++
++  }
++
++  protected int compareHLogSplitDirs(Path p1, Path p2) throws IOException {
++    FileStatus[] f1 = fs.listStatus(p1);
++    FileStatus[] f2 = fs.listStatus(p2);
++    assertNotNull("Path " + p1 + " doesn't exist", f1);
++    assertNotNull("Path " + p2 + " doesn't exist", f2);
++
++    System.out.println("Files in " + p1 + ": " +
++        Joiner.on(",").join(FileUtil.stat2Paths(f1)));
++    System.out.println("Files in " + p2 + ": " +
++        Joiner.on(",").join(FileUtil.stat2Paths(f2)));
++    assertEquals(f1.length, f2.length);
++
++    for (int i = 0; i < f1.length; i++) {
++      // Regions now have a directory named RECOVERED_EDITS_DIR and in here
++      // are split edit files. In below presume only 1.
++      Path rd1 = HLog.getRegionDirRecoveredEditsDir(f1[i].getPath());
++      FileStatus[] rd1fs = fs.listStatus(rd1);
++      assertEquals(1, rd1fs.length);
++      Path rd2 = HLog.getRegionDirRecoveredEditsDir(f2[i].getPath());
++      FileStatus[] rd2fs = fs.listStatus(rd2);
++      assertEquals(1, rd2fs.length);
++      if (!logsAreEqual(rd1fs[0].getPath(), rd2fs[0].getPath())) {
++        return -1;
++      }
++    }
++    return 0;
++  }
++
++  protected boolean logsAreEqual(Path p1, Path p2) throws IOException {
++    HLog.Reader in1, in2;
++    in1 = HLog.getReader(fs, p1, conf);
++    in2 = HLog.getReader(fs, p2, conf);
++    HLog.Entry entry1;
++    HLog.Entry entry2;
++    while ((entry1 = in1.next()) != null) {
++      entry2 = in2.next();
++      if ((entry1.getKey().compareTo(entry2.getKey()) != 0) ||
++          (!entry1.getEdit().toString().equals(entry2.getEdit().toString()))) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++}
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplit.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplit.java
+new file mode 100644
+index 0000000..8a86516
+--- /dev/null
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplit.java
+@@ -0,0 +1,51 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import static org.apache.hadoop.hbase.HConstants.LOG_SPLITTER_IMPL;
++
++/**
++ * Testing {@link org.apache.hadoop.hbase.regionserver.wal.HLog} splitting code.
++ */
++public class DistributedTestHLogSplit extends TestHLogSplit {
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++    TEST_UTIL.getConfiguration().setClass(LOG_SPLITTER_IMPL,
++        DistributedHLogSplitter.class,
++        HLogSplitter.class);
++    TEST_UTIL.startMiniCluster();
++
++    hbaseDir = new Path(TEST_UTIL.getConfiguration().get("hbase.rootdir"));
++    hlogDir = new Path(hbaseDir, "hlog");
++    oldLogDir = new Path(hbaseDir, ".oldlogs");
++    corruptDir = new Path(hbaseDir, ".corrupt");
++    tabledir = new Path(hbaseDir, Bytes.toString(TABLE_NAME));
++
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++}
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplitIgnoreErrors.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplitIgnoreErrors.java
+new file mode 100644
+index 0000000..902e7d2
+--- /dev/null
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/DistributedTestHLogSplitIgnoreErrors.java
+@@ -0,0 +1,51 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import static org.apache.hadoop.hbase.HConstants.LOG_SPLITTER_IMPL;
++
++/**
++ * Testing {@link HLog} splitting code.
++ */
++public class DistributedTestHLogSplitIgnoreErrors extends TestHLogSplitIgnoreErrors {
++
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++    TEST_UTIL.getConfiguration().setBoolean(HBASE_SKIP_ERRORS, true);
++    TEST_UTIL.getConfiguration().setClass(LOG_SPLITTER_IMPL, DistributedHLogSplitter.class, HLogSplitter.class);
++    TEST_UTIL.startMiniCluster();
++
++    hbaseDir = new Path(TEST_UTIL.getConfiguration().get("hbase.rootdir"));
++    hlogDir = new Path(hbaseDir, "hlog");
++    oldLogDir = new Path(hbaseDir, "hlog.old");
++    corruptDir = new Path(hbaseDir, ".corrupt");
++    tabledir = new Path(hbaseDir, Bytes.toString(TABLE_NAME));
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
++}
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLog.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLog.java
+index 08ba8cb..fbf9065 100644
+--- a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLog.java
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLog.java
+@@ -54,6 +54,7 @@ import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
+ import org.apache.hadoop.io.SequenceFile;
+ import org.apache.log4j.Level;
+ import org.junit.After;
++import org.junit.AfterClass;
+ import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+@@ -117,6 +118,12 @@ public class TestHLog  {
+     oldLogDir = new Path(hbaseDir, ".oldlogs");
+     dir = new Path(hbaseDir, getName());
+   }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws IOException {
++    TEST_UTIL.shutdownMiniCluster();
++  }
++
+   private static String getName() {
+     // TODO Auto-generated method stub
+     return "TestHLog";
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplit.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplit.java
+index 5555d32..5bd3302 100644
+--- a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplit.java
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplit.java
+@@ -19,105 +19,43 @@
+  */
+ package org.apache.hadoop.hbase.regionserver.wal;
+ 
+-import static org.junit.Assert.*;
+-
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.List;
+-import java.util.Map;
+ import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.concurrent.atomic.AtomicLong;
+ 
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FSDataInputStream;
+-import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.FileUtil;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.hbase.regionserver.wal.HLog.Entry;
++import org.apache.hadoop.hbase.regionserver.LogSplitterThread;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
+-import org.apache.hadoop.hbase.HBaseTestingUtility;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+-import org.apache.hadoop.hbase.HTableDescriptor;
+-import org.apache.hadoop.hbase.KeyValue;
+-import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.util.Bytes;
+-import org.apache.hadoop.hbase.util.Threads;
+ import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
+-import org.apache.hadoop.ipc.RemoteException;
+-import org.junit.After;
+ import org.junit.AfterClass;
+ import org.junit.Assert;
+-import org.junit.Before;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
+ import org.mockito.Mockito;
+-import org.mockito.invocation.InvocationOnMock;
+-import org.mockito.stubbing.Answer;
+ 
+ import com.google.common.base.Joiner;
+-import com.google.common.collect.ImmutableList;
++
++import static org.apache.hadoop.hbase.HConstants.LOG_SPLITTER_IMPL;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
+ 
+ /**
+  * Testing {@link HLog} splitting code.
+  */
+-public class TestHLogSplit {
+-
+-  private final static Log LOG = LogFactory.getLog(TestHLogSplit.class);
+-
+-  private Configuration conf;
+-  private FileSystem fs;
+-
+-  private final static HBaseTestingUtility
+-          TEST_UTIL = new HBaseTestingUtility();
+-
+-
+-  private static final Path hbaseDir = new Path("/hbase");
+-  private static final Path hlogDir = new Path(hbaseDir, "hlog");
+-  private static final Path oldLogDir = new Path(hbaseDir, "hlog.old");
+-  private static final Path corruptDir = new Path(hbaseDir, ".corrupt");
+-
+-  private static final int NUM_WRITERS = 10;
+-  private static final int ENTRIES = 10; // entries per writer per region
+-
+-  private HLog.Writer[] writer = new HLog.Writer[NUM_WRITERS];
+-  private long seq = 0;
+-  private static final byte[] TABLE_NAME = "t1".getBytes();
+-  private static final byte[] FAMILY = "f1".getBytes();
+-  private static final byte[] QUALIFIER = "q1".getBytes();
+-  private static final byte[] VALUE = "v1".getBytes();
+-  private static final String HLOG_FILE_PREFIX = "hlog.dat.";
+-  private static List<String> regions;
+-  private static final String HBASE_SKIP_ERRORS = "hbase.hlog.split.skip.errors";
+-  private static final Path tabledir =
+-      new Path(hbaseDir, Bytes.toString(TABLE_NAME));
+-
+-  static enum Corruptions {
+-    INSERT_GARBAGE_ON_FIRST_LINE,
+-    INSERT_GARBAGE_IN_THE_MIDDLE,
+-    APPEND_GARBAGE,
+-    TRUNCATE,
+-  }
+-
++public class TestHLogSplit extends BaseTestHLogSplit {
+   @BeforeClass
+-  public static void setUpBeforeClass() throws Exception {
+-    TEST_UTIL.getConfiguration().
+-            setInt("hbase.regionserver.flushlogentries", 1);
+-    TEST_UTIL.getConfiguration().
+-            setBoolean("dfs.support.append", true);
+-    TEST_UTIL.getConfiguration().
+-            setStrings("hbase.rootdir", hbaseDir.toString());
+-    TEST_UTIL.getConfiguration().
+-            setClass("hbase.regionserver.hlog.writer.impl",
+-                InstrumentedSequenceFileLogWriter.class, HLog.Writer.class);
+-
+-    TEST_UTIL.startMiniDFSCluster(2);
++  public static void setupBeforeClass() throws Exception {
++   TEST_UTIL.startMiniDFSCluster(2);
+   }
+ 
+   @AfterClass
+@@ -125,30 +63,6 @@ public class TestHLogSplit {
+     TEST_UTIL.shutdownMiniDFSCluster();
+   }
+ 
+-  @Before
+-  public void setUp() throws Exception {
+-    flushToConsole("Cleaning up cluster for new test\n"
+-        + "--------------------------");
+-    conf = TEST_UTIL.getConfiguration();
+-    fs = TEST_UTIL.getDFSCluster().getFileSystem();
+-    FileStatus[] entries = fs.listStatus(new Path("/"));
+-    flushToConsole("Num entries in /:" + entries.length);
+-    for (FileStatus dir : entries){
+-      assertTrue("Deleting " + dir.getPath(),
+-          fs.delete(dir.getPath(), true));
+-    }
+-    seq = 0;
+-    regions = new ArrayList<String>();
+-    Collections.addAll(regions, "bbb", "ccc");
+-    InstrumentedSequenceFileLogWriter.activateFailure = false;
+-    // Set the soft lease for hdfs to be down from default of 5 minutes or so.
+-    TEST_UTIL.setNameNodeNameSystemLeasePeriod(100, 50000);
+-  }
+-
+-  @After
+-  public void tearDown() throws Exception {
+-  }
+-
+   /**
+    * @throws IOException 
+    * @see https://issues.apache.org/jira/browse/HBASE-3020
+@@ -272,122 +186,33 @@ public class TestHLogSplit {
+ 
+   }
+ 
+-
+-  @Test
+-  public void testTralingGarbageCorruptionFileSkipErrorsPasses() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, true);
+-    generateHLogs(Integer.MAX_VALUE);
+-    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
+-            Corruptions.APPEND_GARBAGE, true, fs);
+-    fs.initialize(fs.getUri(), conf);
+-
+-    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+-        hbaseDir, hlogDir, oldLogDir, fs);
+-    logSplitter.splitLog();
+-    for (String region : regions) {
+-      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
+-      assertEquals(NUM_WRITERS * ENTRIES, countHLog(logfile, fs, conf));
+-    }
+-
+-
+-  }
+-
+-  @Test
+-  public void testFirstLineCorruptionLogFileSkipErrorsPasses() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, true);
+-    generateHLogs(Integer.MAX_VALUE);
+-    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
+-            Corruptions.INSERT_GARBAGE_ON_FIRST_LINE, true, fs);
+-    fs.initialize(fs.getUri(), conf);
+-
+-    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+-        hbaseDir, hlogDir, oldLogDir, fs);
+-    logSplitter.splitLog();
+-    for (String region : regions) {
+-      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
+-      assertEquals((NUM_WRITERS - 1) * ENTRIES, countHLog(logfile, fs, conf));
+-    }
+-
+-
+-  }
+-
+-
+-  @Test
+-  public void testMiddleGarbageCorruptionSkipErrorsReadsHalfOfFile() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, true);
+-    generateHLogs(Integer.MAX_VALUE);
+-    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
+-            Corruptions.INSERT_GARBAGE_IN_THE_MIDDLE, false, fs);
+-    fs.initialize(fs.getUri(), conf);
+-    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+-        hbaseDir, hlogDir, oldLogDir, fs);
+-    logSplitter.splitLog();
+-
+-    for (String region : regions) {
+-      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
+-      // the entries in the original logs are alternating regions
+-      // considering the sequence file header, the middle corruption should
+-      // affect at least half of the entries
+-      int goodEntries = (NUM_WRITERS - 1) * ENTRIES;
+-      int firstHalfEntries = (int) Math.ceil(ENTRIES / 2) - 1;
+-      assertTrue("The file up to the corrupted area hasn't been parsed",
+-              goodEntries + firstHalfEntries <= countHLog(logfile, fs, conf));
+-    }
+-  }
+-
+-  @Test
+-  public void testCorruptedFileGetsArchivedIfSkipErrors() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, true);
+-    Class<?> backupClass = conf.getClass("hbase.regionserver.hlog.reader.impl",
+-        Reader.class);
+-    InstrumentedSequenceFileLogWriter.activateFailure = false;
+-    HLog.resetLogReaderClass();
+-
+-    try {
+-    Path c1 = new Path(hlogDir, HLOG_FILE_PREFIX + "0");
+-      conf.setClass("hbase.regionserver.hlog.reader.impl",
+-          FaultySequenceFileLogReader.class, HLog.Reader.class);
+-      for (FaultySequenceFileLogReader.FailureType  failureType : FaultySequenceFileLogReader.FailureType.values()) {
+-        conf.set("faultysequencefilelogreader.failuretype", failureType.name());
+-        generateHLogs(1, ENTRIES, -1);
+-        fs.initialize(fs.getUri(), conf);
+-        HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+-            hbaseDir, hlogDir, oldLogDir, fs);
+-        logSplitter.splitLog();
+-        FileStatus[] archivedLogs = fs.listStatus(corruptDir);
+-        assertEquals("expected a different file", c1.getName(), archivedLogs[0]
+-            .getPath().getName());
+-        assertEquals(archivedLogs.length, 1);
+-        fs.delete(new Path(oldLogDir, HLOG_FILE_PREFIX + "0"), false);
+-      }
+-    } finally {
+-      conf.setClass("hbase.regionserver.hlog.reader.impl", backupClass,
+-          Reader.class);
+-      HLog.resetLogReaderClass();
+-    }
+-  }
+-
+   @Test(expected = IOException.class)
+   public void testTrailingGarbageCorruptionLogFileSkipErrorsFalseThrows()
+       throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, false);
+     Class<?> backupClass = conf.getClass("hbase.regionserver.hlog.reader.impl",
+         Reader.class);
+     InstrumentedSequenceFileLogWriter.activateFailure = false;
+     HLog.resetLogReaderClass();
+ 
+     try {
+-      conf.setClass("hbase.regionserver.hlog.reader.impl",
+-          FaultySequenceFileLogReader.class, HLog.Reader.class);
+-      conf.set("faultysequencefilelogreader.failuretype", FaultySequenceFileLogReader.FailureType.BEGINNING.name());
++      TEST_UTIL.getConfiguration().setClass("hbase.regionserver.hlog.reader.impl",
++          FaultySequenceFileLogReader.class,
++          HLog.Reader.class);
++      TEST_UTIL.getConfiguration().set("faultysequencefilelogreader.failuretype",
++          FaultySequenceFileLogReader.FailureType.BEGINNING.name());
++      if (conf.getClass(LOG_SPLITTER_IMPL, HLogSplitter.class)
++          == DistributedHLogSplitter.class) {
++        LogSplitterThread.resetConf(conf);
++      }
++      HLog.resetLogReaderClass();
+       generateHLogs(Integer.MAX_VALUE);
+-    fs.initialize(fs.getUri(), conf);
+-    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+-        hbaseDir, hlogDir, oldLogDir, fs);
+-    logSplitter.splitLog();
++      fs.initialize(fs.getUri(), conf);
++      HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
++          hbaseDir, hlogDir, oldLogDir, fs);
++      logSplitter.splitLog();
+     } finally {
+-      conf.setClass("hbase.regionserver.hlog.reader.impl", backupClass,
+-          Reader.class);
++       conf.setClass("hbase.regionserver.hlog.reader.impl", backupClass,
++           Reader.class);
+       HLog.resetLogReaderClass();
+     }
+ 
+@@ -396,7 +221,6 @@ public class TestHLogSplit {
+   @Test
+   public void testCorruptedLogFilesSkipErrorsFalseDoesNotTouchLogs()
+       throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, false);
+     Class<?> backupClass = conf.getClass("hbase.regionserver.hlog.reader.impl",
+         Reader.class);
+     InstrumentedSequenceFileLogWriter.activateFailure = false;
+@@ -405,7 +229,8 @@ public class TestHLogSplit {
+     try {
+       conf.setClass("hbase.regionserver.hlog.reader.impl",
+           FaultySequenceFileLogReader.class, HLog.Reader.class);
+-      conf.set("faultysequencefilelogreader.failuretype", FaultySequenceFileLogReader.FailureType.BEGINNING.name());
++      conf.set("faultysequencefilelogreader.failuretype",
++          FaultySequenceFileLogReader.FailureType.BEGINNING.name());
+       generateHLogs(-1);
+       fs.initialize(fs.getUri(), conf);
+       HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
+@@ -427,7 +252,6 @@ public class TestHLogSplit {
+ 
+   @Test
+   public void testEOFisIgnored() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, false);
+ 
+     final String REGION = "region__1";
+     regions.removeAll(regions);
+@@ -459,8 +283,6 @@ public class TestHLogSplit {
+   
+   @Test
+   public void testLogsGetArchivedAfterSplit() throws IOException {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, false);
+-
+     generateHLogs(-1);
+ 
+     fs.initialize(fs.getUri(), conf);
+@@ -588,7 +410,15 @@ public class TestHLogSplit {
+       logSplitter.splitLog();
+ 
+     } catch (IOException e) {
+-      assertEquals("This exception is instrumented and should only be thrown for testing", e.getMessage());
++      if (conf.getClass(LOG_SPLITTER_IMPL, HLogSplitter.class)
++          == DistributedHLogSplitter.class) {
++       assertEquals("IOException for: /splitresult/",
++            e.getMessage().substring(0, 30));
++      } else {
++        String exMsg = "This exception is instrumented and should only be " +
++            "thrown for testing";
++        assertEquals(exMsg, e.getMessage());
++      }
+       throw e;
+     } finally {
+       InstrumentedSequenceFileLogWriter.activateFailure = false;
+@@ -650,7 +480,6 @@ public class TestHLogSplit {
+   
+   @Test
+   public void testIOEOnOutputThread() throws Exception {
+-    conf.setBoolean(HBASE_SKIP_ERRORS, false);
+ 
+     generateHLogs(-1);
+ 
+@@ -718,409 +547,5 @@ public class TestHLogSplit {
+   public void testThreadingSlowWriterSmallBuffer() throws Exception {
+     doTestThreading(200, 1024, 50);
+   }
+-  
+-  /**
+-   * Sets up a log splitter with a mock reader and writer. The mock reader generates
+-   * a specified number of edits spread across 5 regions. The mock writer optionally
+-   * sleeps for each edit it is fed.
+-   * *
+-   * After the split is complete, verifies that the statistics show the correct number
+-   * of edits output into each region.
+-   * 
+-   * @param numFakeEdits number of fake edits to push through pipeline
+-   * @param bufferSize size of in-memory buffer
+-   * @param writerSlowness writer threads will sleep this many ms per edit
+-   */
+-  private void doTestThreading(final int numFakeEdits,
+-      final int bufferSize,
+-      final int writerSlowness) throws Exception {
+-
+-    Configuration localConf = new Configuration(conf);
+-    localConf.setInt("hbase.regionserver.hlog.splitlog.buffersize", bufferSize);
+-
+-    // Create a fake log file (we'll override the reader to produce a stream of edits)
+-    FSDataOutputStream out = fs.create(new Path(hlogDir, HLOG_FILE_PREFIX + ".fake"));
+-    out.close();
+ 
+-    // Make region dirs for our destination regions so the output doesn't get skipped
+-    final List<String> regions = ImmutableList.of("r0", "r1", "r2", "r3", "r4"); 
+-    makeRegionDirs(fs, regions);
+-
+-    // Create a splitter that reads and writes the data without touching disk
+-    HLogSplitter logSplitter = new HLogSplitter(
+-        localConf, hbaseDir, hlogDir, oldLogDir, fs) {
+-      
+-      /* Produce a mock writer that doesn't write anywhere */
+-      protected HLog.Writer createWriter(FileSystem fs, Path logfile, Configuration conf)
+-      throws IOException {
+-        HLog.Writer mockWriter = Mockito.mock(HLog.Writer.class);
+-        Mockito.doAnswer(new Answer<Void>() {
+-          int expectedIndex = 0;
+-          
+-          @Override
+-          public Void answer(InvocationOnMock invocation) {
+-            if (writerSlowness > 0) {
+-              try {
+-                Thread.sleep(writerSlowness);
+-              } catch (InterruptedException ie) {
+-                Thread.currentThread().interrupt();
+-              }
+-            }
+-            HLog.Entry entry = (Entry) invocation.getArguments()[0];
+-            WALEdit edit = entry.getEdit();
+-            List<KeyValue> keyValues = edit.getKeyValues();
+-            assertEquals(1, keyValues.size());
+-            KeyValue kv = keyValues.get(0);
+-            
+-            // Check that the edits come in the right order.
+-            assertEquals(expectedIndex, Bytes.toInt(kv.getRow()));
+-            expectedIndex++;
+-            return null;
+-          }
+-        }).when(mockWriter).append(Mockito.<HLog.Entry>any());
+-        return mockWriter;        
+-      }
+-      
+-      
+-      /* Produce a mock reader that generates fake entries */
+-      protected Reader getReader(FileSystem fs, Path curLogFile, Configuration conf)
+-      throws IOException {
+-        Reader mockReader = Mockito.mock(Reader.class);
+-        Mockito.doAnswer(new Answer<HLog.Entry>() {
+-          int index = 0;
+-
+-          @Override
+-          public HLog.Entry answer(InvocationOnMock invocation) throws Throwable {
+-            if (index >= numFakeEdits) return null;
+-           
+-            // Generate r0 through r4 in round robin fashion
+-            int regionIdx = index % regions.size();
+-            byte region[] = new byte[] {(byte)'r', (byte) (0x30 + regionIdx)};
+-            
+-            HLog.Entry ret = createTestEntry(TABLE_NAME, region,
+-                Bytes.toBytes((int)(index / regions.size())),
+-                FAMILY, QUALIFIER, VALUE, index);
+-            index++;
+-            return ret;
+-          }
+-        }).when(mockReader).next();
+-        return mockReader;
+-      }
+-    };
+-    
+-    logSplitter.splitLog();
+-    
+-    // Verify number of written edits per region
+-
+-    Map<byte[], Long> outputCounts = logSplitter.getOutputCounts();
+-    for (Map.Entry<byte[], Long> entry : outputCounts.entrySet()) {
+-      LOG.info("Got " + entry.getValue() + " output edits for region " + 
+-          Bytes.toString(entry.getKey()));
+-      
+-      assertEquals((long)entry.getValue(), numFakeEdits / regions.size());
+-    }
+-    assertEquals(regions.size(), outputCounts.size());
+-  }
+-  
+-  
+-
+-  /**
+-   * This thread will keep writing to the file after the split process has started
+-   * It simulates a region server that was considered dead but woke up and wrote
+-   * some more to he last log entry
+-   */
+-  class ZombieLastLogWriterRegionServer extends Thread {
+-    AtomicLong editsCount;
+-    AtomicBoolean stop;
+-    Path log;
+-    HLog.Writer lastLogWriter;
+-    public ZombieLastLogWriterRegionServer(HLog.Writer writer, AtomicLong counter, AtomicBoolean stop) {
+-      this.stop = stop;
+-      this.editsCount = counter;
+-      this.lastLogWriter = writer;
+-    }
+-
+-    @Override
+-    public void run() {
+-      if (stop.get()){
+-        return;
+-      }
+-      flushToConsole("starting");
+-      while (true) {
+-        try {
+-          String region = "juliet";
+-          
+-          fs.mkdirs(new Path(new Path(hbaseDir, region), region));
+-          appendEntry(lastLogWriter, TABLE_NAME, region.getBytes(),
+-                  ("r" + editsCount).getBytes(), FAMILY, QUALIFIER, VALUE, 0);
+-          lastLogWriter.sync();
+-          editsCount.incrementAndGet();
+-          try {
+-            Thread.sleep(1);
+-          } catch (InterruptedException e) {
+-            //
+-          }
+-
+-
+-        } catch (IOException ex) {
+-          if (ex instanceof RemoteException) {
+-            flushToConsole("Juliet: got RemoteException " +
+-                    ex.getMessage() + " while writing " + (editsCount.get() + 1));
+-            break;
+-          } else {
+-            assertTrue("Failed to write " + editsCount.get(), false);
+-          }
+-
+-        }
+-      }
+-
+-
+-    }
+-  }
+-
+-  /**
+-   * This thread will keep adding new log files
+-   * It simulates a region server that was considered dead but woke up and wrote
+-   * some more to a new hlog
+-   */
+-  class ZombieNewLogWriterRegionServer extends Thread {
+-    AtomicBoolean stop;
+-    public ZombieNewLogWriterRegionServer(AtomicBoolean stop) {
+-      super("ZombieNewLogWriterRegionServer");
+-      this.stop = stop;
+-    }
+-
+-    @Override
+-    public void run() {
+-      if (stop.get()) {
+-        return;
+-      }
+-      Path tableDir = new Path(hbaseDir, new String(TABLE_NAME));
+-      Path regionDir = new Path(tableDir, regions.get(0));      
+-      Path recoveredEdits = new Path(regionDir, HLogSplitter.RECOVERED_EDITS);
+-      String region = "juliet";
+-      Path julietLog = new Path(hlogDir, HLOG_FILE_PREFIX + ".juliet");
+-      try {
+-
+-        while (!fs.exists(recoveredEdits) && !stop.get()) {
+-          flushToConsole("Juliet: split not started, sleeping a bit...");
+-          Threads.sleep(10);
+-        }
+-
+-        fs.mkdirs(new Path(tableDir, region));
+-        HLog.Writer writer = HLog.createWriter(fs,
+-                julietLog, conf);
+-        appendEntry(writer, "juliet".getBytes(), ("juliet").getBytes(),
+-                ("r").getBytes(), FAMILY, QUALIFIER, VALUE, 0);
+-        writer.close();
+-        flushToConsole("Juliet file creator: created file " + julietLog);
+-      } catch (IOException e1) {
+-        assertTrue("Failed to create file " + julietLog, false);
+-      }
+-    }
+-  }
+-
+-  private void flushToConsole(String s) {
+-    System.out.println(s);
+-    System.out.flush();
+-  }
+-
+-
+-  private void generateHLogs(int leaveOpen) throws IOException {
+-    generateHLogs(NUM_WRITERS, ENTRIES, leaveOpen);
+-  }
+-
+-  private void makeRegionDirs(FileSystem fs, List<String> regions) throws IOException {
+-    for (String region : regions) {
+-      flushToConsole("Creating dir for region " + region);
+-      fs.mkdirs(new Path(tabledir, region));
+-    }
+-  }
+-  
+-  private void generateHLogs(int writers, int entries, int leaveOpen) throws IOException {
+-    makeRegionDirs(fs, regions);
+-    for (int i = 0; i < writers; i++) {
+-      writer[i] = HLog.createWriter(fs, new Path(hlogDir, HLOG_FILE_PREFIX + i), conf);
+-      for (int j = 0; j < entries; j++) {
+-        int prefix = 0;
+-        for (String region : regions) {
+-          String row_key = region + prefix++ + i + j;
+-          appendEntry(writer[i], TABLE_NAME, region.getBytes(),
+-                  row_key.getBytes(), FAMILY, QUALIFIER, VALUE, seq);
+-        }
+-      }
+-      if (i != leaveOpen) {
+-        writer[i].close();
+-        flushToConsole("Closing writer " + i);
+-      }
+-    }
+-  }
+-
+-  private Path getLogForRegion(Path rootdir, byte[] table, String region)
+-  throws IOException {
+-    Path tdir = HTableDescriptor.getTableDir(rootdir, table);
+-    Path editsdir = HLog.getRegionDirRecoveredEditsDir(HRegion.getRegionDir(tdir,
+-      Bytes.toString(region.getBytes())));
+-    FileStatus [] files = this.fs.listStatus(editsdir);
+-    assertEquals(1, files.length);
+-    return files[0].getPath();
+-  }
+-
+-  private void corruptHLog(Path path, Corruptions corruption, boolean close,
+-                           FileSystem fs) throws IOException {
+-
+-    FSDataOutputStream out;
+-    int fileSize = (int) fs.listStatus(path)[0].getLen();
+-
+-    FSDataInputStream in = fs.open(path);
+-    byte[] corrupted_bytes = new byte[fileSize];
+-    in.readFully(0, corrupted_bytes, 0, fileSize);
+-    in.close();
+-
+-    switch (corruption) {
+-      case APPEND_GARBAGE:
+-        out = fs.append(path);
+-        out.write("-----".getBytes());
+-        closeOrFlush(close, out);
+-        break;
+-
+-      case INSERT_GARBAGE_ON_FIRST_LINE:
+-        fs.delete(path, false);
+-        out = fs.create(path);
+-        out.write(0);
+-        out.write(corrupted_bytes);
+-        closeOrFlush(close, out);
+-        break;
+-
+-      case INSERT_GARBAGE_IN_THE_MIDDLE:
+-        fs.delete(path, false);
+-        out = fs.create(path);
+-        int middle = (int) Math.floor(corrupted_bytes.length / 2);
+-        out.write(corrupted_bytes, 0, middle);
+-        out.write(0);
+-        out.write(corrupted_bytes, middle, corrupted_bytes.length - middle);
+-        closeOrFlush(close, out);
+-        break;
+-        
+-      case TRUNCATE:
+-        fs.delete(path, false);
+-        out = fs.create(path);
+-        out.write(corrupted_bytes, 0, fileSize-32);
+-        closeOrFlush(close, out);
+-        
+-        break;
+-    }
+-
+-
+-  }
+-
+-  private void closeOrFlush(boolean close, FSDataOutputStream out)
+-  throws IOException {
+-    if (close) {
+-      out.close();
+-    } else {
+-      out.sync();
+-      // Not in 0out.hflush();
+-    }
+-  }
+-
+-  @SuppressWarnings("unused")
+-  private void dumpHLog(Path log, FileSystem fs, Configuration conf) throws IOException {
+-    HLog.Entry entry;
+-    HLog.Reader in = HLog.getReader(fs, log, conf);
+-    while ((entry = in.next()) != null) {
+-      System.out.println(entry);
+-    }
+-  }
+-
+-  private int countHLog(Path log, FileSystem fs, Configuration conf) throws IOException {
+-    int count = 0;
+-    HLog.Reader in = HLog.getReader(fs, log, conf);
+-    while (in.next() != null) {
+-      count++;
+-    }
+-    return count;
+-  }
+-
+-
+-  public long appendEntry(HLog.Writer writer, byte[] table, byte[] region,
+-                          byte[] row, byte[] family, byte[] qualifier,
+-                          byte[] value, long seq)
+-          throws IOException {
+-
+-    writer.append(createTestEntry(table, region, row, family, qualifier, value, seq));
+-    writer.sync();
+-    return seq;
+-  }
+-  
+-  private HLog.Entry createTestEntry(
+-      byte[] table, byte[] region,
+-      byte[] row, byte[] family, byte[] qualifier,
+-      byte[] value, long seq) {
+-    long time = System.nanoTime();
+-    WALEdit edit = new WALEdit();
+-    seq++;
+-    edit.add(new KeyValue(row, family, qualifier, time, KeyValue.Type.Put, value));
+-    return new HLog.Entry(new HLogKey(region, table, seq, time), edit);
+-  }
+-
+-
+-  private void injectEmptyFile(String suffix, boolean closeFile)
+-          throws IOException {
+-    HLog.Writer writer = HLog.createWriter(
+-            fs, new Path(hlogDir, HLOG_FILE_PREFIX + suffix), conf);
+-    if (closeFile) writer.close();
+-  }
+-
+-  @SuppressWarnings("unused")
+-  private void listLogs(FileSystem fs, Path dir) throws IOException {
+-    for (FileStatus file : fs.listStatus(dir)) {
+-      System.out.println(file.getPath());
+-    }
+-
+-  }
+-
+-  private int compareHLogSplitDirs(Path p1, Path p2) throws IOException {
+-    FileStatus[] f1 = fs.listStatus(p1);
+-    FileStatus[] f2 = fs.listStatus(p2);
+-    assertNotNull("Path " + p1 + " doesn't exist", f1);
+-    assertNotNull("Path " + p2 + " doesn't exist", f2);
+-    
+-    System.out.println("Files in " + p1 + ": " +
+-        Joiner.on(",").join(FileUtil.stat2Paths(f1)));
+-    System.out.println("Files in " + p2 + ": " +
+-        Joiner.on(",").join(FileUtil.stat2Paths(f2)));
+-    assertEquals(f1.length, f2.length);
+-
+-    for (int i = 0; i < f1.length; i++) {
+-      // Regions now have a directory named RECOVERED_EDITS_DIR and in here
+-      // are split edit files. In below presume only 1.
+-      Path rd1 = HLog.getRegionDirRecoveredEditsDir(f1[i].getPath());
+-      FileStatus[] rd1fs = fs.listStatus(rd1);
+-      assertEquals(1, rd1fs.length);
+-      Path rd2 = HLog.getRegionDirRecoveredEditsDir(f2[i].getPath());
+-      FileStatus[] rd2fs = fs.listStatus(rd2);
+-      assertEquals(1, rd2fs.length);
+-      if (!logsAreEqual(rd1fs[0].getPath(), rd2fs[0].getPath())) {
+-        return -1;
+-      }
+-    }
+-    return 0;
+-  }
+-
+-  private boolean logsAreEqual(Path p1, Path p2) throws IOException {
+-    HLog.Reader in1, in2;
+-    in1 = HLog.getReader(fs, p1, conf);
+-    in2 = HLog.getReader(fs, p2, conf);
+-    HLog.Entry entry1;
+-    HLog.Entry entry2;
+-    while ((entry1 = in1.next()) != null) {
+-      entry2 = in2.next();
+-      if ((entry1.getKey().compareTo(entry2.getKey()) != 0) ||
+-              (!entry1.getEdit().toString().equals(entry2.getEdit().toString()))) {
+-        return false;
+-      }
+-    }
+-    return true;
+-  }
+ }
+diff --git a/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplitIgnoreErrors.java b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplitIgnoreErrors.java
+new file mode 100644
+index 0000000..7984ac7
+--- /dev/null
++++ b/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestHLogSplitIgnoreErrors.java
+@@ -0,0 +1,143 @@
++/**
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver.wal;
++
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.regionserver.LogSplitterThread;
++import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.IOException;
++
++import static org.apache.hadoop.hbase.HConstants.LOG_SPLITTER_IMPL;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * Testing {@link org.apache.hadoop.hbase.regionserver.wal.HLog} splitting code.
++ */
++public class TestHLogSplitIgnoreErrors extends BaseTestHLogSplit {
++
++  @BeforeClass
++  public static void setupBeforeClass() throws Exception {
++    TEST_UTIL.getConfiguration().setBoolean(HBASE_SKIP_ERRORS, true);
++    TEST_UTIL.startMiniDFSCluster(2);
++  }
++
++  @AfterClass
++  public static void tearDownAfterClass() throws Exception {
++    TEST_UTIL.shutdownMiniDFSCluster();
++  }
++
++  @Test
++  public void testTralingGarbageCorruptionFileSkipErrorsPasses() throws IOException {
++    generateHLogs(Integer.MAX_VALUE);
++    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
++        Corruptions.APPEND_GARBAGE, true, fs);
++    fs.initialize(fs.getUri(), conf);
++
++    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
++        hbaseDir, hlogDir, oldLogDir, fs);
++    logSplitter.splitLog();
++    for (String region : regions) {
++      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
++      assertEquals(NUM_WRITERS * ENTRIES, countHLog(logfile, fs, conf));
++    }
++  }
++
++  @Test
++  public void testFirstLineCorruptionLogFileSkipErrorsPasses() throws IOException {
++    generateHLogs(Integer.MAX_VALUE);
++    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
++        Corruptions.INSERT_GARBAGE_ON_FIRST_LINE, true, fs);
++    fs.initialize(fs.getUri(), conf);
++
++    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
++        hbaseDir, hlogDir, oldLogDir, fs);
++    logSplitter.splitLog();
++    for (String region : regions) {
++      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
++      assertEquals((NUM_WRITERS - 1) * ENTRIES, countHLog(logfile, fs, conf));
++    }
++
++
++  }
++
++
++  @Test
++  public void testMiddleGarbageCorruptionSkipErrorsReadsHalfOfFile() throws IOException {
++    generateHLogs(Integer.MAX_VALUE);
++    corruptHLog(new Path(hlogDir, HLOG_FILE_PREFIX + "5"),
++        Corruptions.INSERT_GARBAGE_IN_THE_MIDDLE, false, fs);
++    fs.initialize(fs.getUri(), conf);
++    HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
++        hbaseDir, hlogDir, oldLogDir, fs);
++    logSplitter.splitLog();
++
++    for (String region : regions) {
++      Path logfile = getLogForRegion(hbaseDir, TABLE_NAME, region);
++      // the entries in the original logs are alternating regions
++      // considering the sequence file header, the middle corruption should
++      // affect at least half of the entries
++      int goodEntries = (NUM_WRITERS - 1) * ENTRIES;
++      int firstHalfEntries = (int) Math.ceil(ENTRIES / 2) - 1;
++      assertTrue("The file up to the corrupted area hasn't been parsed",
++          goodEntries + firstHalfEntries <= countHLog(logfile, fs, conf));
++    }
++  }
++
++  @Test
++  public void testCorruptedFileGetsArchivedIfSkipErrors() throws IOException {
++    Class<?> backupClass = conf.getClass("hbase.regionserver.hlog.reader.impl",
++        Reader.class);
++    InstrumentedSequenceFileLogWriter.activateFailure = false;
++    HLog.resetLogReaderClass();
++
++    try {
++      Path c1 = new Path(hlogDir, HLOG_FILE_PREFIX + "0");
++      conf.setClass("hbase.regionserver.hlog.reader.impl",
++          FaultySequenceFileLogReader.class, Reader.class);
++      for (FaultySequenceFileLogReader.FailureType failureType : FaultySequenceFileLogReader.FailureType.values()) {
++        conf.set("faultysequencefilelogreader.failuretype", failureType.name());
++        if (conf.getClass(LOG_SPLITTER_IMPL, HLogSplitter.class)
++          == DistributedHLogSplitter.class) {
++          LogSplitterThread.resetConf(conf);
++        }
++        generateHLogs(1, ENTRIES, -1);
++        fs.initialize(fs.getUri(), conf);
++        HLogSplitter logSplitter = HLogSplitter.createLogSplitter(conf,
++            hbaseDir, hlogDir, oldLogDir, fs);
++        logSplitter.splitLog();
++        FileStatus[] archivedLogs = fs.listStatus(corruptDir);
++        assertEquals("expected a different file", c1.getName(), archivedLogs[0]
++            .getPath().getName());
++        assertEquals(archivedLogs.length, 1);
++        fs.delete(new Path(oldLogDir, HLOG_FILE_PREFIX + "0"), false);
++      }
++    } finally {
++      conf.setClass("hbase.regionserver.hlog.reader.impl", backupClass,
++          Reader.class);
++      HLog.resetLogReaderClass();
++    }
++  }
++}

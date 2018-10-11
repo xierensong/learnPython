@@ -1,0 +1,1594 @@
+From d88291132a176531b2ef9e3179686014c69ff1ef Mon Sep 17 00:00:00 2001
+From: stack <stack@apache.org>
+Date: Wed, 22 Oct 2014 18:15:24 -0700
+Subject: [PATCH] HBASE-12313 Redo the hfile index length optimization so
+ cell-based rather than serialized KV key plus fixes
+
+---
+ .../org/apache/hadoop/hbase/client/Increment.java  |   4 +-
+ .../hadoop/hbase/client/ScannerCallable.java       |   2 +-
+ .../org/apache/hadoop/hbase/ipc/TestIPCUtil.java   |   2 +-
+ .../main/java/org/apache/hadoop/hbase/Cell.java    |   2 +-
+ .../org/apache/hadoop/hbase/CellComparator.java    | 139 ++++++++++++++++++++-
+ .../main/java/org/apache/hadoop/hbase/CellKey.java |  68 ----------
+ .../java/org/apache/hadoop/hbase/CellUtil.java     | 118 ++++++++++++-----
+ .../java/org/apache/hadoop/hbase/KeyValue.java     |   8 +-
+ .../apache/hadoop/hbase/TestCellComparator.java    |  64 +++++++++-
+ .../prefixtree/decode/PrefixTreeArrayScanner.java  |   6 +-
+ .../codec/prefixtree/decode/PrefixTreeCell.java    |   2 +-
+ .../hbase/client/ClientSideRegionScanner.java      |   2 +-
+ .../hadoop/hbase/io/hfile/AbstractHFileWriter.java |  16 +--
+ .../org/apache/hadoop/hbase/io/hfile/HFile.java    |  28 ++---
+ .../apache/hadoop/hbase/io/hfile/HFileBlock.java   |  39 +++---
+ .../hadoop/hbase/io/hfile/HFileBlockIndex.java     |   3 +-
+ .../hadoop/hbase/io/hfile/HFilePrettyPrinter.java  |  10 +-
+ .../hadoop/hbase/io/hfile/HFileReaderV2.java       |  41 ++----
+ .../hadoop/hbase/io/hfile/HFileReaderV3.java       |   2 +-
+ .../hadoop/hbase/io/hfile/HFileWriterV2.java       |  40 +++---
+ .../hbase/protobuf/ReplicationProtbufUtil.java     |   2 +-
+ .../apache/hadoop/hbase/regionserver/HRegion.java  |   2 +-
+ .../apache/hadoop/hbase/regionserver/HStore.java   |   7 +-
+ .../hadoop/hbase/regionserver/RSRpcServices.java   |   4 +-
+ .../hadoop/hbase/regionserver/StoreScanner.java    |   4 +-
+ .../hadoop/hbase/regionserver/wal/FSHLog.java      |   2 +-
+ .../apache/hadoop/hbase/io/hfile/TestChecksum.java |  14 +--
+ .../hadoop/hbase/io/hfile/TestHFileBlock.java      |  10 +-
+ .../io/hfile/TestHFileBlockCompatibility.java      |   6 +-
+ .../hadoop/hbase/io/hfile/TestHFileBlockIndex.java |   2 +-
+ .../hadoop/hbase/io/hfile/TestHFileEncryption.java |   4 +-
+ .../hadoop/hbase/io/hfile/TestHFileWriterV2.java   |   2 +-
+ .../hadoop/hbase/io/hfile/TestHFileWriterV3.java   |   2 +-
+ .../apache/hadoop/hbase/io/hfile/TestSeekTo.java   |  14 ++-
+ .../org/apache/hadoop/hbase/mapred/TestDriver.java |   1 -
+ 35 files changed, 413 insertions(+), 259 deletions(-)
+ delete mode 100644 hbase-common/src/main/java/org/apache/hadoop/hbase/CellKey.java
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Increment.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Increment.java
+index 8a040f1..b12ee02 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Increment.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/Increment.java
+@@ -95,7 +95,6 @@ public class Increment extends Mutation implements Comparable<Row> {
+    * @return this
+    * @throws java.io.IOException e
+    */
+-  @SuppressWarnings("unchecked")
+   public Increment add(Cell cell) throws IOException{
+     byte [] family = CellUtil.cloneFamily(cell);
+     List<Cell> list = getCellList(family);
+@@ -121,7 +120,6 @@ public class Increment extends Mutation implements Comparable<Row> {
+    * @param amount amount to increment by
+    * @return the Increment object
+    */
+-  @SuppressWarnings("unchecked")
+   public Increment addColumn(byte [] family, byte [] qualifier, long amount) {
+     if (family == null) {
+       throw new IllegalArgumentException("family cannot be null");
+@@ -239,7 +237,7 @@ public class Increment extends Mutation implements Comparable<Row> {
+           } else {
+             moreThanOneB = true;
+           }
+-          sb.append(CellUtil.getCellKey(cell) + "+=" +
++          sb.append(CellUtil.getCellKeyAsString(cell) + "+=" +
+               Bytes.toLong(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength()));
+         }
+         sb.append("}");
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+index 31148f7..48dea4e 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+@@ -293,7 +293,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
+     long resultSize = 0;
+     for (Result rr : rrs) {
+       for (Cell cell : rr.rawCells()) {
+-        resultSize += CellUtil.estimatedLengthOf(cell);
++        resultSize += CellUtil.estimatedSerializedSizeOf(cell);
+       }
+     }
+     this.scanMetrics.countOfBytesInResults.addAndGet(resultSize);
+diff --git a/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestIPCUtil.java b/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestIPCUtil.java
+index d0c2223..3eab225 100644
+--- a/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestIPCUtil.java
++++ b/hbase-client/src/test/java/org/apache/hadoop/hbase/ipc/TestIPCUtil.java
+@@ -90,7 +90,7 @@ public class TestIPCUtil {
+   static CellScanner getSizedCellScanner(final Cell [] cells) {
+     int size = -1;
+     for (Cell cell: cells) {
+-      size += CellUtil.estimatedSizeOf(cell);
++      size += CellUtil.estimatedSerializedSizeOf(cell);
+     }
+     final int totalSize = ClassSize.align(size);
+     final CellScanner cellScanner = CellUtil.createCellScanner(cells);
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/Cell.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/Cell.java
+index 32b4789..8f299cc 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/Cell.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/Cell.java
+@@ -235,4 +235,4 @@ public interface Cell {
+    */
+   @Deprecated
+   byte[] getRow();
+-}
++}
+\ No newline at end of file
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellComparator.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellComparator.java
+index 2f635a4..7bd2c28 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellComparator.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellComparator.java
+@@ -40,15 +40,25 @@ import com.google.common.primitives.Longs;
+     justification="Findbugs doesn't like the way we are negating the result of a compare in below")
+ @InterfaceAudience.Private
+ @InterfaceStability.Evolving
+-public class CellComparator implements Comparator<Cell>, Serializable{
++public class CellComparator implements Comparator<Cell>, Serializable {
+   private static final long serialVersionUID = -8760041766259623329L;
+ 
+   @Override
+   public int compare(Cell a, Cell b) {
+-    return compareStatic(a, b, false);
++    return compare(a, b, false);
+   }
+ 
+-  public static int compareStatic(Cell a, Cell b, boolean onlyKey) {
++  /**
++   * Compare cells.
++   * TODO: Replace with dynamic rather than static comparator so can change comparator
++   * implementation.
++   * @param a
++   * @param b
++   * @param ignoreSequenceid True if we are to compare the key portion only and ignore
++   * the sequenceid. Set to false to compare key and consider sequenceid.
++   * @return 0 if equal, -1 if a < b, and +1 if a > b.
++   */
++  public static int compare(final Cell a, final Cell b, boolean ignoreSequenceid) {
+     // row
+     int c = compareRows(a, b);
+     if (c != 0) return c;
+@@ -56,7 +66,7 @@ public class CellComparator implements Comparator<Cell>, Serializable{
+     c = compareWithoutRow(a, b);
+     if(c != 0) return c;
+ 
+-    if (!onlyKey) {
++    if (!ignoreSequenceid) {
+       // Negate following comparisons so later edits show up first
+ 
+       // compare log replay tag value if there is any
+@@ -208,8 +218,15 @@ public class CellComparator implements Comparator<Cell>, Serializable{
+   }
+ 
+   public static int compareWithoutRow(final Cell leftCell, final Cell rightCell) {
++    // If the column is not specified, the "minimum" key type appears the
++    // latest in the sorted order, regardless of the timestamp. This is used
++    // for specifying the last key/value in a given row, because there is no
++    // "lexicographically last column" (it would be infinitely long). The
++    // "maximum" key type does not need this behavior.
++    // Copied from KeyValue. This is bad in that we can't do memcmp w/ special rules like this.
++    // TODO
+     if (leftCell.getFamilyLength() + leftCell.getQualifierLength() == 0
+-        && leftCell.getTypeByte() == Type.Minimum.getCode()) {
++          && leftCell.getTypeByte() == Type.Minimum.getCode()) {
+       // left is "bigger", i.e. it appears later in the sorted order
+       return 1;
+     }
+@@ -385,4 +402,114 @@ public class CellComparator implements Comparator<Cell>, Serializable{
+     }
+   }
+ 
+-}
++  /**
++   * Try to return a Cell that falls between <code>left</code> and <code>right</code> but that is
++   * shorter; i.e. takes up less space. This is trick is used building HFile block index.
++   * Its an optimization. It does not always work.  In this case we'll just return the
++   * <code>right</code> cell.
++   * @param left
++   * @param right
++   * @return A cell that sorts between <code>left</code> and <code>right</code>.
++   */
++  public static Cell getMidpoint(final Cell left, final Cell right) {
++    // TODO: Redo so only a single pass over the arrays rather than one to compare and then a
++    // second composing midpoint.
++    if (right == null) {
++      throw new IllegalArgumentException("right cell can not be null");
++    }
++    if (left == null) {
++      return right;
++    }
++    int diff = compareRows(left, right);
++    if (diff > 0) {
++      throw new IllegalArgumentException("Left row sorts after right row; left=" +
++        CellUtil.getCellKeyAsString(left) + ", right=" + CellUtil.getCellKeyAsString(right));
++    }
++    if (diff < 0) {
++      // Left row is < right row.
++      byte [] midRow = getMinimumMidpointArray(left.getRowArray(), left.getRowOffset(),
++          left.getRowLength(),
++        right.getRowArray(), right.getRowOffset(), right.getRowLength());
++      // If midRow is null, just return 'right'.  Can't do optimization.
++      if (midRow == null) return right;
++      return CellUtil.createCell(midRow);
++    }
++    // Rows are same. Compare on families.
++    diff = compareFamilies(left, right);
++    if (diff > 0) {
++      throw new IllegalArgumentException("Left family sorts after right family; left=" +
++          CellUtil.getCellKeyAsString(left) + ", right=" + CellUtil.getCellKeyAsString(right));
++    }
++    if (diff < 0) {
++      byte [] midRow = getMinimumMidpointArray(left.getFamilyArray(), left.getFamilyOffset(),
++          left.getFamilyLength(),
++        right.getFamilyArray(), right.getFamilyOffset(), right.getFamilyLength());
++      // If midRow is null, just return 'right'.  Can't do optimization.
++      if (midRow == null) return right;
++      // Return new Cell where we use right row and then a mid sort family.
++      return CellUtil.createCell(right.getRowArray(), right.getRowOffset(), right.getRowLength(),
++        midRow, 0, midRow.length, HConstants.EMPTY_BYTE_ARRAY, 0,
++        HConstants.EMPTY_BYTE_ARRAY.length);
++    }
++    // Families are same. Compare on qualifiers.
++    diff = compareQualifiers(left, right);
++    if (diff > 0) {
++      throw new IllegalArgumentException("Left qualifier sorts after right qualifier; left=" +
++          CellUtil.getCellKeyAsString(left) + ", right=" + CellUtil.getCellKeyAsString(right));
++    }
++    if (diff < 0) {
++      byte [] midRow = getMinimumMidpointArray(left.getQualifierArray(), left.getQualifierOffset(),
++          left.getQualifierLength(),
++        right.getQualifierArray(), right.getQualifierOffset(), right.getQualifierLength());
++      // If midRow is null, just return 'right'.  Can't do optimization.
++      if (midRow == null) return right;
++      // Return new Cell where we use right row and family and then a mid sort qualifier.
++      return CellUtil.createCell(right.getRowArray(), right.getRowOffset(), right.getRowLength(),
++        right.getFamilyArray(), right.getFamilyOffset(), right.getFamilyLength(),
++        midRow, 0, midRow.length);
++    }
++    // No opportunity for optimization. Just return right key.
++    return right;
++  }
++
++  /**
++   * @param leftArray
++   * @param leftOffset
++   * @param leftLength
++   * @param rightArray
++   * @param rightOffset
++   * @param rightLength
++   * @return Return a new array that is between left and right and minimally sized else just return
++   * null as indicator that we could not create a mid point.
++   */
++  private static byte [] getMinimumMidpointArray(final byte [] leftArray, final int leftOffset,
++        final int leftLength,
++      final byte [] rightArray, final int rightOffset, final int rightLength) {
++    // rows are different
++    int minLength = leftLength < rightLength ? leftLength : rightLength;
++    short diffIdx = 0;
++    while (diffIdx < minLength &&
++        leftArray[leftOffset + diffIdx] == rightArray[rightOffset + diffIdx]) {
++      diffIdx++;
++    }
++    // If immediately different and same length, return null to indicate no shorter in-between.
++    if (diffIdx == 0 && leftLength == rightLength) return null;
++    byte [] minimumMidpointArray = null;
++    if (diffIdx >= minLength) {
++      // leftKey's row is prefix of rightKey's.
++      minimumMidpointArray = new byte[diffIdx + 1];
++      System.arraycopy(rightArray, rightOffset, minimumMidpointArray, 0, diffIdx + 1);
++    } else {
++      int diffByte = leftArray[leftOffset + diffIdx];
++      if ((0xff & diffByte) < 0xff && (diffByte + 1) < (rightArray[rightOffset + diffIdx] & 0xff)) {
++        minimumMidpointArray = new byte[diffIdx + 1];
++        System.arraycopy(leftArray, leftOffset, minimumMidpointArray, 0, diffIdx);
++        minimumMidpointArray[diffIdx] = (byte) (diffByte + 1);
++      } else {
++        minimumMidpointArray = new byte[diffIdx + 1];
++        System.arraycopy(rightArray, rightOffset, minimumMidpointArray, 0, diffIdx + 1);
++      }
++    }
++    return minimumMidpointArray;
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellKey.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellKey.java
+deleted file mode 100644
+index 41a13fb..0000000
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellKey.java
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hbase;
+-
+-import org.apache.hadoop.hbase.KeyValue.Type;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+-import org.apache.hadoop.hbase.util.Bytes;
+-
+-/**
+- * This wraps the key portion of a Cell. Key includes rowkey, family, qualifier, timestamp and type
+- */
+-@InterfaceAudience.Private
+-public class CellKey {
+-
+-  private byte[] rowArray;
+-  private int rowOffset;
+-  private int rowLength;
+-  private byte[] familyArray;
+-  private int familyOffset;
+-  private int familyLength;
+-  private byte[] qualifierArray;
+-  private int qualifierOffset;
+-  private int qualifierLength;
+-  private long ts;
+-  private byte type;
+-
+-  public CellKey(byte[] rowArray, int rowOffset, int rowLength, byte[] familyArray,
+-      int familyOffset, int familyLength, byte[] qualifierArray, int qualifierOffset,
+-      int qualifierLength, long ts, byte type) {
+-    this.rowArray = rowArray;
+-    this.rowOffset = rowOffset;
+-    this.rowLength = rowLength;
+-    this.familyArray = familyArray;
+-    this.familyOffset = familyOffset;
+-    this.familyLength = familyLength;
+-    this.qualifierArray = qualifierArray;
+-    this.qualifierOffset = qualifierOffset;
+-    this.qualifierLength = qualifierLength;
+-    this.ts = ts;
+-    this.type = type;
+-  }
+-
+-  @Override
+-  public String toString() {
+-    String row = Bytes.toStringBinary(rowArray, rowOffset, rowLength);
+-    String family = (familyLength == 0) ? "" : Bytes.toStringBinary(familyArray, familyOffset,
+-        familyLength);
+-    String qualifier = (qualifierLength == 0) ? "" : Bytes.toStringBinary(qualifierArray,
+-        qualifierOffset, qualifierLength);
+-    return row + "/" + family + (family != null && family.length() > 0 ? ":" : "") + qualifier
+-        + "/" + KeyValue.humanReadableTimestamp(ts) + "/" + Type.codeToType(type);
+-  }
+-}
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+index a858f59..a111337 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+@@ -167,8 +167,20 @@ public final class CellUtil {
+     // I need a Cell Factory here.  Using KeyValue for now. TODO.
+     // TODO: Make a new Cell implementation that just carries these
+     // byte arrays.
+-    return new KeyValue(row, family, qualifier, timestamp,
+-      KeyValue.Type.codeToType(type), value);
++    // TODO: Call factory to create Cell
++    return new KeyValue(row, family, qualifier, timestamp, KeyValue.Type.codeToType(type), value);
++  }
++
++  public static Cell createCell (final byte [] rowArray, final int rowOffset, final int rowLength,
++      final byte [] familyArray, final int familyOffset, final int familyLength,
++      final byte [] qualifierArray, final int qualifierOffset, final int qualifierLength) {
++    // See createCell(final byte [] row, final byte [] value) for why we default Maximum type.
++    return new KeyValue(rowArray, rowOffset, rowLength,
++        familyArray, familyOffset, familyLength,
++        qualifierArray, qualifierOffset, qualifierLength,
++        HConstants.LATEST_TIMESTAMP,
++        KeyValue.Type.Maximum,
++        HConstants.EMPTY_BYTE_ARRAY, 0, HConstants.EMPTY_BYTE_ARRAY.length);
+   }
+ 
+   public static Cell createCell(final byte[] row, final byte[] family, final byte[] qualifier,
+@@ -195,7 +207,7 @@ public final class CellUtil {
+   }
+ 
+   /**
+-   * Create a Cell with specific row.  Other fields are arbitrary choices.
++   * Create a Cell with specific row.  Other fields defaulted.
+    * @param row
+    * @return Cell with passed row but all other fields are arbitrary
+    */
+@@ -204,14 +216,31 @@ public final class CellUtil {
+   }
+ 
+   /**
+-   * Create a Cell with specific row and value.  Other fields are arbitrary choices.
++   * Create a Cell with specific row and value.  Other fields are defaulted.
+    * @param row
+    * @param value
+    * @return Cell with passed row and value but all other fields are arbitrary
+    */
+   public static Cell createCell(final byte [] row, final byte [] value) {
+-    return createCell(row, HConstants.CATALOG_FAMILY, HConstants.SERVERNAME_QUALIFIER,
+-      HConstants.LATEST_TIMESTAMP, (byte)0, value);
++    // An empty family + empty qualifier + Type.Minimum is used as flag to indicate last on row.
++    // See the CellComparator and KeyValue comparator.  Search for compareWithoutRow.
++    // Lets not make a last-on-row key as default but at same time, if you are making a key
++    // without specifying type, etc., flag it as weird by setting type to be Maximum.
++    return createCell(row, HConstants.EMPTY_BYTE_ARRAY, HConstants.EMPTY_BYTE_ARRAY,
++      HConstants.LATEST_TIMESTAMP, KeyValue.Type.Maximum.getCode(), value);
++  }
++
++  /**
++   * Create a Cell with specific row.  Other fields defaulted.
++   * @param row
++   * @param family
++   * @param qualifier
++   * @return Cell with passed row but all other fields are arbitrary
++   */
++  public static Cell createCell(final byte [] row, final byte [] family, final byte [] qualifier) {
++    // See above in createCell(final byte [] row, final byte [] value) why we set type to Maximum.
++    return createCell(row, family, qualifier,
++        HConstants.LATEST_TIMESTAMP, KeyValue.Type.Maximum.getCode(), HConstants.EMPTY_BYTE_ARRAY);
+   }
+ 
+   /**
+@@ -479,16 +508,14 @@ public final class CellUtil {
+    * @param cell
+    * @return Estimate of the <code>cell</code> size in bytes.
+    */
+-  public static int estimatedSizeOf(final Cell cell) {
++  public static int estimatedSerializedSizeOf(final Cell cell) {
+     // If a KeyValue, we can give a good estimate of size.
+     if (cell instanceof KeyValue) {
+       return ((KeyValue)cell).getLength() + Bytes.SIZEOF_INT;
+     }
+     // TODO: Should we add to Cell a sizeOf?  Would it help? Does it make sense if Cell is
+     // prefix encoded or compressed?
+-    return cell.getRowLength() + cell.getFamilyLength() +
+-      cell.getQualifierLength() +
+-      cell.getValueLength() +
++    return getSumOfKeyElementLengths(cell) +
+       // Use the KeyValue's infrastructure size presuming that another implementation would have
+       // same basic cost.
+       KeyValue.KEY_INFRASTRUCTURE_SIZE +
+@@ -497,6 +524,24 @@ public final class CellUtil {
+   }
+ 
+   /**
++   * @param cell
++   * @return Sum of the lengths of all the elements in a key.
++   */
++  private static int getSumOfKeyElementLengths(final Cell cell) {
++    return cell.getRowLength() + cell.getFamilyLength() +
++    cell.getQualifierLength() +
++    cell.getValueLength() +
++    cell.getTagsLength() +
++    KeyValue.TIMESTAMP_TYPE_SIZE;
++  }
++
++  public static int estimatedSerializedSizeOfKey(final Cell cell) {
++    if (cell instanceof KeyValue) return ((KeyValue)cell).getKeyLength();
++    // This will be a low estimate.  Will do for now.
++    return getSumOfKeyElementLengths(cell);
++  }
++
++  /**
+    * This is an estimate of the heap space occupied by a cell. When the cell is of type
+    * {@link HeapSize} we call {@link HeapSize#heapSize()} so cell can give a correct value. In other
+    * cases we just consider the bytes occupied by the cell components ie. row, CF, qualifier,
+@@ -508,8 +553,8 @@ public final class CellUtil {
+     if (cell instanceof HeapSize) {
+       return ((HeapSize) cell).heapSize();
+     }
+-    return cell.getRowLength() + cell.getFamilyLength() + cell.getQualifierLength()
+-        + cell.getValueLength() + cell.getTagsLength() + KeyValue.TIMESTAMP_TYPE_SIZE;
++    // TODO: Add sizing of references that hold the row, family, etc., arrays.
++    return estimatedSerializedSizeOf(cell);
+   }
+ 
+   /********************* tags *************************************/
+@@ -641,20 +686,6 @@ public final class CellUtil {
+   }
+ 
+   /**
+-   * Estimation of total number of bytes used by the cell to store its key, value and tags. When the
+-   * cell is a {@link KeyValue} we include the extra infrastructure size used by it.
+-   * @param cell
+-   * @return estimated length
+-   */
+-  public static int estimatedLengthOf(final Cell cell) {
+-    if (cell instanceof KeyValue) {
+-      return ((KeyValue)cell).getLength();
+-    }
+-    return cell.getRowLength() + cell.getFamilyLength() + cell.getQualifierLength()
+-        + cell.getValueLength() + cell.getTagsLength() + KeyValue.TIMESTAMP_TYPE_SIZE;
+-  }
+-
+-  /**
+    * Writes the Cell's key part as it would have serialized in a KeyValue. The format is &lt;2 bytes
+    * rk len&gt;&lt;rk&gt;&lt;1 byte cf len&gt;&lt;cf&gt;&lt;qualifier&gt;&lt;8 bytes
+    * timestamp&gt;&lt;1 byte type&gt;
+@@ -676,13 +707,36 @@ public final class CellUtil {
+ 
+   /**
+    * @param cell
+-   * @return Key portion of the Cell including rk, cf, qualifier, ts and type.
++   * @return The Key portion of the passed <code>cell</code> as a String.
++   */
++  public static String getCellKeyAsString(Cell cell) {
++    StringBuilder sb = new StringBuilder(Bytes.toStringBinary(
++      cell.getRowArray(), cell.getRowOffset(), cell.getRowLength()));
++    sb.append(cell.getFamilyLength() == 0? "":
++      Bytes.toStringBinary(cell.getFamilyArray(), cell.getFamilyOffset(), cell.getFamilyLength()));
++    sb.append(cell.getQualifierLength() == 0? "":
++      Bytes.toStringBinary(cell.getQualifierArray(), cell.getQualifierOffset(),
++        cell.getQualifierLength()));
++    sb.append("/");
++    sb.append(KeyValue.humanReadableTimestamp(cell.getTimestamp()));
++    sb.append("/");
++    sb.append(Type.codeToType(cell.getTypeByte()));
++    return sb.toString();
++  }
++
++  /**
++   * This method exists just to encapsulate how we serialize keys.  To be replaced by a factory
++   * that we query to figure what the Cell implementation is and then, what serialization engine
++   * to use and further, how to serialize the key for inclusion in hfile index. TODO.
++   * @param cell
++   * @return The key portion of the Cell serialized in the old-school KeyValue way or null if
++   * passed a null <code>cell</code>
+    */
+-  public static CellKey getCellKey(Cell cell){
+-    return new CellKey(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength(),
+-        cell.getFamilyArray(), cell.getFamilyOffset(), cell.getFamilyLength(),
+-        cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength(),
+-        cell.getTimestamp(), cell.getTypeByte());
++  public static byte [] getCellKeySerializedAsKeyValueKey(final Cell cell) {
++    if (cell == null) return null;
++    byte [] b = new byte[KeyValueUtil.keyLength(cell)];
++    KeyValueUtil.appendKeyTo(cell, b, 0);
++    return b;
+   }
+ 
+   /**
+diff --git a/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java b/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+index 695f1f5..cc1167b 100644
+--- a/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
++++ b/hbase-common/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+@@ -1890,7 +1890,7 @@ public class KeyValue implements Cell, HeapSize, Cloneable, SettableSequenceId,
+     }
+ 
+     public int compareOnlyKeyPortion(Cell left, Cell right) {
+-      return CellComparator.compareStatic(left, right, true);
++      return CellComparator.compare(left, right, true);
+     }
+ 
+     /**
+@@ -1899,7 +1899,7 @@ public class KeyValue implements Cell, HeapSize, Cloneable, SettableSequenceId,
+      */
+     @Override
+     public int compare(final Cell left, final Cell right) {
+-      int compare = CellComparator.compareStatic(left, right, false);
++      int compare = CellComparator.compare(left, right, false);
+       return compare;
+     }
+ 
+@@ -2213,6 +2213,7 @@ public class KeyValue implements Cell, HeapSize, Cloneable, SettableSequenceId,
+      * @param leftKey
+      * @param rightKey
+      * @return 0 if equal, <0 if left smaller, >0 if right smaller
++     * @deprecated Since 0.99.2; Use {@link CellComparator#getMidpoint(Cell, Cell)} instead.
+      */
+     public byte[] getShortMidpointKey(final byte[] leftKey, final byte[] rightKey) {
+       if (rightKey == null) {
+@@ -2509,6 +2510,9 @@ public class KeyValue implements Cell, HeapSize, Cloneable, SettableSequenceId,
+       return "org.apache.hadoop.hbase.util.Bytes$ByteArrayComparator";
+     }
+ 
++    /**
++     * @deprecated Since 0.99.2.
++     */
+     public int compareFlatKey(byte[] left, int loffset, int llength, byte[] right,
+         int roffset, int rlength) {
+       return Bytes.BYTES_RAWCOMPARATOR.compare(left,  loffset, llength, right, roffset, rlength);
+diff --git a/hbase-common/src/test/java/org/apache/hadoop/hbase/TestCellComparator.java b/hbase-common/src/test/java/org/apache/hadoop/hbase/TestCellComparator.java
+index 2b80a54..d6a2f72 100644
+--- a/hbase-common/src/test/java/org/apache/hadoop/hbase/TestCellComparator.java
++++ b/hbase-common/src/test/java/org/apache/hadoop/hbase/TestCellComparator.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.hadoop.hbase;
+ 
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+ 
+ import org.apache.hadoop.hbase.KeyValue.Type;
+@@ -45,7 +46,7 @@ public class TestCellComparator {
+   public void testCompareCells() {
+     KeyValue kv1 = new KeyValue(row1, fam1, qual1, val);
+     KeyValue kv2 = new KeyValue(row2, fam1, qual1, val);
+-    assertTrue((CellComparator.compareStatic(kv1, kv2, false)) < 0);
++    assertTrue((CellComparator.compare(kv1, kv2, false)) < 0);
+ 
+     kv1 = new KeyValue(row1, fam2, qual1, val);
+     kv2 = new KeyValue(row1, fam1, qual1, val);
+@@ -53,11 +54,11 @@ public class TestCellComparator {
+ 
+     kv1 = new KeyValue(row1, fam1, qual1, 1l, val);
+     kv2 = new KeyValue(row1, fam1, qual1, 2l, val);
+-    assertTrue((CellComparator.compareStatic(kv1, kv2, false) > 0));
++    assertTrue((CellComparator.compare(kv1, kv2, false) > 0));
+ 
+     kv1 = new KeyValue(row1, fam1, qual1, 1l, Type.Put);
+     kv2 = new KeyValue(row1, fam1, qual1, 1l, Type.Maximum);
+-    assertTrue((CellComparator.compareStatic(kv1, kv2, false) > 0));
++    assertTrue((CellComparator.compare(kv1, kv2, false) > 0));
+ 
+     kv1 = new KeyValue(row1, fam1, qual1, 1l, Type.Put);
+     kv2 = new KeyValue(row1, fam_1_2, qual1, 1l, Type.Maximum);
+@@ -75,4 +76,59 @@ public class TestCellComparator {
+     kv2 = new KeyValue(row1, fam1, qual1, 1l, Type.Put);
+     assertTrue((CellComparator.equals(kv1, kv2)));
+   }
+-}
++
++  @Test
++  public void testGetShortMidpoint() {
++    Cell left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    Cell right = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    Cell mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) <= 0);
++    assertTrue(CellComparator.compare(mid, right, true) <= 0);
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("b"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) <= 0);
++
++    left = CellUtil.createCell(Bytes.toBytes("g"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("i"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) <= 0);
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("bbbbbbb"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) < 0);
++    assertEquals(1, (int)mid.getRowLength());
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("b"), Bytes.toBytes("a"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) <= 0);
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("aaaaaaaa"), Bytes.toBytes("b"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) < 0);
++    assertEquals(2, (int)mid.getFamilyLength());
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("aaaaaaaaa"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) < 0);
++    assertEquals(2, (int)mid.getQualifierLength());
++
++    left = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("a"));
++    right = CellUtil.createCell(Bytes.toBytes("a"), Bytes.toBytes("a"), Bytes.toBytes("b"));
++    mid = CellComparator.getMidpoint(left, right);
++    assertTrue(CellComparator.compare(left, mid, true) < 0);
++    assertTrue(CellComparator.compare(mid, right, true) <= 0);
++    assertEquals(1, (int)mid.getQualifierLength());
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeArrayScanner.java b/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeArrayScanner.java
+index c413aeb..a68f8f8 100644
+--- a/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeArrayScanner.java
++++ b/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeArrayScanner.java
+@@ -169,7 +169,7 @@ public class PrefixTreeArrayScanner extends PrefixTreeCell implements CellScanne
+     //trivial override to confirm intent (findbugs)
+     return super.equals(obj);
+   }
+-  
++
+   @Override
+   public int hashCode() {
+     return super.hashCode();
+@@ -370,7 +370,7 @@ public class PrefixTreeArrayScanner extends PrefixTreeCell implements CellScanne
+   /***************** helper methods **************************/
+ 
+   protected void appendCurrentTokenToRowBuffer() {
+-    System.arraycopy(block, currentRowNode.getTokenArrayOffset(), rowBuffer, rowLength, 
++    System.arraycopy(block, currentRowNode.getTokenArrayOffset(), rowBuffer, rowLength,
+       currentRowNode.getTokenLength());
+     rowLength += currentRowNode.getTokenLength();
+   }
+@@ -430,7 +430,7 @@ public class PrefixTreeArrayScanner extends PrefixTreeCell implements CellScanne
+ 
+   protected int populateNonRowFieldsAndCompareTo(int cellNum, Cell key) {
+     populateNonRowFields(cellNum);
+-    return CellComparator.compareStatic(this, key, true);
++    return CellComparator.compare(this, key, true);
+   }
+ 
+   protected void populateFirstNonRowFields() {
+diff --git a/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeCell.java b/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeCell.java
+index c29a704..97eed62 100644
+--- a/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeCell.java
++++ b/hbase-prefix-tree/src/main/java/org/apache/hadoop/hbase/codec/prefixtree/decode/PrefixTreeCell.java
+@@ -103,7 +103,7 @@ public class PrefixTreeCell implements Cell, SettableSequenceId, Comparable<Cell
+ 
+   @Override
+   public int compareTo(Cell other) {
+-    return CellComparator.compareStatic(this, other, false);
++    return CellComparator.compare(this, other, false);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/ClientSideRegionScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/ClientSideRegionScanner.java
+index 46ee83c..a1dcd2f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/client/ClientSideRegionScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/client/ClientSideRegionScanner.java
+@@ -86,7 +86,7 @@ public class ClientSideRegionScanner extends AbstractClientScanner {
+     if (this.scanMetrics != null) {
+       long resultSize = 0;
+       for (Cell cell : values) {
+-        resultSize += CellUtil.estimatedLengthOf(cell);
++        resultSize += CellUtil.estimatedSerializedSizeOf(cell);
+       }
+       this.scanMetrics.countOfBytesInResults.addAndGet(resultSize);
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
+index 1efcd47..2bef680 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
+@@ -24,17 +24,17 @@ import java.net.InetSocketAddress;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.permission.FsPermission;
+ import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.KeyValue.KVComparator;
+-import org.apache.hadoop.hbase.KeyValueUtil;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+ import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
+ import org.apache.hadoop.hbase.io.hfile.HFile.FileInfo;
+@@ -51,8 +51,6 @@ public abstract class AbstractHFileWriter implements HFile.Writer {
+   /** The Cell previously appended. Becomes the last cell in the file.*/
+   protected Cell lastCell = null;
+ 
+-  protected int lastKeyLength = -1;
+-
+   /** FileSystem stream to write into. */
+   protected FSDataOutputStream outputStream;
+ 
+@@ -83,8 +81,11 @@ public abstract class AbstractHFileWriter implements HFile.Writer {
+   /** {@link Writable}s representing meta block data. */
+   protected List<Writable> metaData = new ArrayList<Writable>();
+ 
+-  /** First key in a block. */
+-  protected byte[] firstKeyInBlock = null;
++  /**
++   * First cell in a block.
++   * This reference should be short-lived since we write hfiles in a burst.
++   */
++  protected Cell firstCellInBlock = null;
+ 
+   /** May be null if we were passed a stream. */
+   protected final Path path;
+@@ -134,8 +135,7 @@ public abstract class AbstractHFileWriter implements HFile.Writer {
+     if (lastCell != null) {
+       // Make a copy. The copy is stuffed into our fileinfo map. Needs a clean
+       // byte buffer. Won't take a tuple.
+-      byte[] lastKey = new byte[lastKeyLength];
+-      KeyValueUtil.appendKeyTo(lastCell, lastKey, 0);
++      byte [] lastKey = CellUtil.getCellKeySerializedAsKeyValueKey(this.lastCell);
+       fileInfo.append(FileInfo.LASTKEY, lastKey, false);
+     }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+index 2b88f81..f938020 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+@@ -341,7 +341,11 @@ public class HFile {
+     }
+   }
+ 
+-  /** An abstraction used by the block index */
++  /**
++   * An abstraction used by the block index.
++   * Implementations will check cache for any asked-for block and return cached block if found.
++   * Otherwise, after reading from fs, will try and put block into cache before returning.
++   */
+   public interface CachingBlockReader {
+     /**
+      * Read in a file block.
+@@ -350,15 +354,13 @@ public class HFile {
+      * @param cacheBlock
+      * @param pread
+      * @param isCompaction is this block being read as part of a compaction
+-     * @param expectedBlockType the block type we are expecting to read with this read operation, or
+-     *          null to read whatever block type is available and avoid checking (that might reduce
+-     *          caching efficiency of encoded data blocks)
+-     * @param expectedDataBlockEncoding the data block encoding the caller is
+-     *          expecting data blocks to be in, or null to not perform this
+-     *          check and return the block irrespective of the encoding. This
+-     *          check only applies to data blocks and can be set to null when
+-     *          the caller is expecting to read a non-data block and has set
+-     *          expectedBlockType accordingly.
++     * @param expectedBlockType the block type we are expecting to read with this read operation,
++     *  or null to read whatever block type is available and avoid checking (that might reduce
++     *  caching efficiency of encoded data blocks)
++     * @param expectedDataBlockEncoding the data block encoding the caller is expecting data blocks
++     *  to be in, or null to not perform this check and return the block irrespective of the
++     *  encoding. This check only applies to data blocks and can be set to null when the caller is
++     *  expecting to read a non-data block and has set expectedBlockType accordingly.
+      * @return Block wrapped in a ByteBuffer.
+      * @throws IOException
+      */
+@@ -380,11 +382,9 @@ public class HFile {
+ 
+     KVComparator getComparator();
+ 
+-    HFileScanner getScanner(boolean cacheBlocks,
+-       final boolean pread, final boolean isCompaction);
++    HFileScanner getScanner(boolean cacheBlocks, final boolean pread, final boolean isCompaction);
+ 
+-    ByteBuffer getMetaBlock(String metaBlockName,
+-       boolean cacheBlock) throws IOException;
++    ByteBuffer getMetaBlock(String metaBlockName, boolean cacheBlock) throws IOException;
+ 
+     Map<byte[], byte[]> loadFileInfo() throws IOException;
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlock.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlock.java
+index 7f3d80f..689538a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlock.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlock.java
+@@ -479,8 +479,8 @@ public class HFileBlock implements Cacheable {
+   /**
+    * Called after reading a block with provided onDiskSizeWithHeader.
+    */
+-  private void validateOnDiskSizeWithoutHeader(
+-      int expectedOnDiskSizeWithoutHeader) throws IOException {
++  private void validateOnDiskSizeWithoutHeader(int expectedOnDiskSizeWithoutHeader)
++  throws IOException {
+     if (onDiskSizeWithoutHeader != expectedOnDiskSizeWithoutHeader) {
+       String dataBegin = null;
+       if (buf.hasArray()) {
+@@ -1399,7 +1399,7 @@ public class HFileBlock implements Cacheable {
+   }
+ 
+   /** Reads version 2 blocks from the filesystem. */
+-  static class FSReaderV2 extends AbstractFSReader {
++  static class FSReaderImpl extends AbstractFSReader {
+     /** The file system stream of the underlying {@link HFile} that 
+      * does or doesn't do checksum validations in the filesystem */
+     protected FSDataInputStreamWrapper streamWrapper;
+@@ -1417,7 +1417,7 @@ public class HFileBlock implements Cacheable {
+           }
+         };
+ 
+-    public FSReaderV2(FSDataInputStreamWrapper stream, long fileSize, HFileSystem hfs, Path path,
++    public FSReaderImpl(FSDataInputStreamWrapper stream, long fileSize, HFileSystem hfs, Path path,
+         HFileContext fileContext) throws IOException {
+       super(fileSize, hfs, path, fileContext);
+       this.streamWrapper = stream;
+@@ -1431,13 +1431,13 @@ public class HFileBlock implements Cacheable {
+      * A constructor that reads files with the latest minor version.
+      * This is used by unit tests only.
+      */
+-    FSReaderV2(FSDataInputStream istream, long fileSize, HFileContext fileContext) throws IOException {
++    FSReaderImpl(FSDataInputStream istream, long fileSize, HFileContext fileContext) throws IOException {
+       this(new FSDataInputStreamWrapper(istream), fileSize, null, null, fileContext);
+     }
+ 
+     /**
+-     * Reads a version 2 block. Tries to do as little memory allocation as
+-     * possible, using the provided on-disk size.
++     * Reads a version 2 block (version 1 blocks not supported and not expected). Tries to do as
++     * little memory allocation as possible, using the provided on-disk size.
+      *
+      * @param offset the offset in the stream to read at
+      * @param onDiskSizeWithHeaderL the on-disk size of the block, including
+@@ -1448,7 +1448,8 @@ public class HFileBlock implements Cacheable {
+      */
+     @Override
+     public HFileBlock readBlockData(long offset, long onDiskSizeWithHeaderL,
+-        int uncompressedSize, boolean pread) throws IOException {
++        int uncompressedSize, boolean pread)
++    throws IOException {
+ 
+       // get a copy of the current state of whether to validate
+       // hbase checksums or not for this read call. This is not 
+@@ -1530,12 +1531,14 @@ public class HFileBlock implements Cacheable {
+      */
+     private HFileBlock readBlockDataInternal(FSDataInputStream is, long offset, 
+         long onDiskSizeWithHeaderL, int uncompressedSize, boolean pread,
+-        boolean verifyChecksum) throws IOException {
++        boolean verifyChecksum)
++    throws IOException {
+       if (offset < 0) {
+         throw new IOException("Invalid offset=" + offset + " trying to read "
+             + "block (onDiskSize=" + onDiskSizeWithHeaderL
+             + ", uncompressedSize=" + uncompressedSize + ")");
+       }
++
+       if (uncompressedSize != -1) {
+         throw new IOException("Version 2 block reader API does not need " +
+             "the uncompressed size parameter");
+@@ -1555,12 +1558,13 @@ public class HFileBlock implements Cacheable {
+       // read this block's header as part of the previous read's look-ahead.
+       // And we also want to skip reading the header again if it has already
+       // been read.
++      // TODO: How often does this optimization fire? Has to be same thread so the thread local
++      // is pertinent and we have to be reading next block as in a big scan.
+       PrefetchedHeader prefetchedHeader = prefetchedHeaderForThread.get();
+-      ByteBuffer headerBuf = prefetchedHeader.offset == offset ?
+-          prefetchedHeader.buf : null;
++      ByteBuffer headerBuf = prefetchedHeader.offset == offset? prefetchedHeader.buf: null;
+ 
+-      int nextBlockOnDiskSize = 0;
+       // Allocate enough space to fit the next block's header too.
++      int nextBlockOnDiskSize = 0;
+       byte[] onDiskBlock = null;
+ 
+       HFileBlock b = null;
+@@ -1588,10 +1592,9 @@ public class HFileBlock implements Cacheable {
+         } else {
+           headerBuf = ByteBuffer.wrap(onDiskBlock, 0, hdrSize);
+         }
+-        // We know the total on-disk size but not the uncompressed size. Read
+-        // the entire block into memory, then parse the header. Here we have
+-        // already read the block's header
++        // We know the total on-disk size but not the uncompressed size. Parse the header.
+         try {
++          // TODO: FIX!!! Expensive parse just to get a length
+           b = new HFileBlock(headerBuf, fileContext.isUseHBaseChecksum());
+         } catch (IOException ex) {
+           // Seen in load testing. Provide comprehensive debug info.
+@@ -1631,6 +1634,7 @@ public class HFileBlock implements Cacheable {
+           readAtOffset(is, headerBuf.array(), headerBuf.arrayOffset(),
+               hdrSize, false, offset, pread);
+         }
++        // TODO: FIX!!! Expensive parse just to get a length
+         b = new HFileBlock(headerBuf, fileContext.isUseHBaseChecksum());
+         onDiskBlock = new byte[b.getOnDiskSizeWithHeader() + hdrSize];
+         // headerBuf is HBB
+@@ -1661,8 +1665,7 @@ public class HFileBlock implements Cacheable {
+       // Set prefetched header
+       if (b.hasNextBlockHeader()) {
+         prefetchedHeader.offset = offset + b.getOnDiskSizeWithHeader();
+-        System.arraycopy(onDiskBlock, onDiskSizeWithHeader,
+-            prefetchedHeader.header, 0, hdrSize);
++        System.arraycopy(onDiskBlock, onDiskSizeWithHeader, prefetchedHeader.header, 0, hdrSize);
+       }
+ 
+       b.offset = offset;
+@@ -1707,7 +1710,7 @@ public class HFileBlock implements Cacheable {
+ 
+     @Override
+     public String toString() {
+-      return "FSReaderV2 [ hfs=" + hfs + " path=" + path + " fileContext=" + fileContext + " ]";
++      return "hfs=" + hfs + ", path=" + path + ", fileContext=" + fileContext;
+     }
+   }
+ 
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlockIndex.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlockIndex.java
+index 5140181..bea2122 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlockIndex.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlockIndex.java
+@@ -1130,8 +1130,7 @@ public class HFileBlockIndex {
+      *          format version 2), or the uncompressed size of the data block (
+      *          {@link HFile} format version 1).
+      */
+-    public void addEntry(byte[] firstKey, long blockOffset, int blockDataSize)
+-    {
++    public void addEntry(byte[] firstKey, long blockOffset, int blockDataSize) {
+       curInlineChunk.add(firstKey, blockOffset, blockDataSize);
+       ++totalNumEntries;
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFilePrettyPrinter.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFilePrettyPrinter.java
+index 0021cf4..752f28b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFilePrettyPrinter.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFilePrettyPrinter.java
+@@ -347,8 +347,8 @@ public class HFilePrettyPrinter extends Configured implements Tool {
+         if (CellComparator.compareRows(pCell, cell) > 0) {
+           System.err.println("WARNING, previous row is greater then"
+               + " current row\n\tfilename -> " + file + "\n\tprevious -> "
+-              + CellUtil.getCellKey(pCell) + "\n\tcurrent  -> "
+-              + CellUtil.getCellKey(cell));
++              + CellUtil.getCellKeyAsString(pCell) + "\n\tcurrent  -> "
++              + CellUtil.getCellKeyAsString(cell));
+         }
+       }
+       // check if families are consistent
+@@ -358,13 +358,13 @@ public class HFilePrettyPrinter extends Configured implements Tool {
+         if (!file.toString().contains(fam)) {
+           System.err.println("WARNING, filename does not match kv family,"
+               + "\n\tfilename -> " + file + "\n\tkeyvalue -> "
+-              + CellUtil.getCellKey(cell));
++              + CellUtil.getCellKeyAsString(cell));
+         }
+         if (pCell != null && CellComparator.compareFamilies(pCell, cell) != 0) {
+           System.err.println("WARNING, previous kv has different family"
+               + " compared to current key\n\tfilename -> " + file
+-              + "\n\tprevious -> " + CellUtil.getCellKey(pCell)
+-              + "\n\tcurrent  -> " + CellUtil.getCellKey(cell));
++              + "\n\tprevious -> " + CellUtil.getCellKeyAsString(pCell)
++              + "\n\tcurrent  -> " + CellUtil.getCellKeyAsString(cell));
+         }
+       }
+       pCell = cell;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
+index f2249ae..5ef6336 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV2.java
+@@ -126,7 +126,7 @@ public class HFileReaderV2 extends AbstractHFileReader {
+     trailer.expectMajorVersion(getMajorVersion());
+     validateMinorVersion(path, trailer.getMinorVersion());
+     this.hfileContext = createHFileContext(fsdis, fileSize, hfs, path, trailer);
+-    HFileBlock.FSReaderV2 fsBlockReaderV2 = new HFileBlock.FSReaderV2(fsdis, fileSize, hfs, path,
++    HFileBlock.FSReaderImpl fsBlockReaderV2 = new HFileBlock.FSReaderImpl(fsdis, fileSize, hfs, path,
+         hfileContext);
+     this.fsBlockReader = fsBlockReaderV2; // upcast
+ 
+@@ -365,28 +365,6 @@ public class HFileReaderV2 extends AbstractHFileReader {
+     }
+   }
+ 
+-  /**
+-   * Read in a file block of the given {@link BlockType} and
+-   * {@link DataBlockEncoding}. Unpacks the block as necessary.
+-   * @param dataBlockOffset offset to read.
+-   * @param onDiskBlockSize size of the block
+-   * @param cacheBlock
+-   * @param pread Use positional read instead of seek+read (positional is
+-   *          better doing random reads whereas seek+read is better scanning).
+-   * @param isCompaction is this block being read as part of a compaction
+-   * @param expectedBlockType the block type we are expecting to read with this
+-   *          read operation, or null to read whatever block type is available
+-   *          and avoid checking (that might reduce caching efficiency of
+-   *          encoded data blocks)
+-   * @param expectedDataBlockEncoding the data block encoding the caller is
+-   *          expecting data blocks to be in, or null to not perform this
+-   *          check and return the block irrespective of the encoding. This
+-   *          check only applies to data blocks and can be set to null when
+-   *          the caller is expecting to read a non-data block and has set
+-   *          expectedBlockType accordingly.
+-   * @return Block wrapped in a ByteBuffer.
+-   * @throws IOException
+-   */
+   @Override
+   public HFileBlock readBlock(long dataBlockOffset, long onDiskBlockSize,
+       final boolean cacheBlock, boolean pread, final boolean isCompaction,
+@@ -396,20 +374,16 @@ public class HFileReaderV2 extends AbstractHFileReader {
+     if (dataBlockIndexReader == null) {
+       throw new IOException("Block index not loaded");
+     }
+-    if (dataBlockOffset < 0
+-        || dataBlockOffset >= trailer.getLoadOnOpenDataOffset()) {
+-      throw new IOException("Requested block is out of range: "
+-          + dataBlockOffset + ", lastDataBlockOffset: "
+-          + trailer.getLastDataBlockOffset());
++    if (dataBlockOffset < 0 || dataBlockOffset >= trailer.getLoadOnOpenDataOffset()) {
++      throw new IOException("Requested block is out of range: " + dataBlockOffset +
++        ", lastDataBlockOffset: " + trailer.getLastDataBlockOffset());
+     }
+-    // For any given block from any given file, synchronize reads for said
+-    // block.
++
++    // For any given block from any given file, synchronize reads for said block.
+     // Without a cache, this synchronizing is needless overhead, but really
+     // the other choice is to duplicate work (which the cache would prevent you
+     // from doing).
+-
+     BlockCacheKey cacheKey = new BlockCacheKey(name, dataBlockOffset);
+-
+     boolean useLock = false;
+     IdLock.Entry lockEntry = null;
+     TraceScope traceScope = Trace.startSpan("HFileReaderV2.readBlock");
+@@ -439,6 +413,7 @@ public class HFileReaderV2 extends AbstractHFileReader {
+                   + dataBlockEncoder.getDataBlockEncoding() + ")");
+               }
+             }
++            // Cache-hit. Return!
+             return cachedBlock;
+           }
+           // Carry on, please load.
+@@ -1023,7 +998,7 @@ public class HFileReaderV2 extends AbstractHFileReader {
+             if (lastKeyValueSize < 0) {
+               throw new IllegalStateException("blockSeek with seekBefore "
+                   + "at the first key of the block: key="
+-                  + CellUtil.getCellKey(key)
++                  + CellUtil.getCellKeyAsString(key)
+                   + ", blockOffset=" + block.getOffset() + ", onDiskSize="
+                   + block.getOnDiskSizeWithHeader());
+             }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV3.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV3.java
+index e3c92cf..b28d8c1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV3.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileReaderV3.java
+@@ -297,7 +297,7 @@ public class HFileReaderV3 extends HFileReaderV2 {
+             if (lastKeyValueSize < 0) {
+               throw new IllegalStateException("blockSeek with seekBefore "
+                   + "at the first key of the block: key="
+-                  + CellUtil.getCellKey(key)
++                  + CellUtil.getCellKeyAsString(key)
+                   + ", blockOffset=" + block.getOffset() + ", onDiskSize="
+                   + block.getOnDiskSizeWithHeader());
+             }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileWriterV2.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileWriterV2.java
+index f784340..1df8bc2 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileWriterV2.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileWriterV2.java
+@@ -27,14 +27,15 @@ import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataOutputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
++import org.apache.hadoop.hbase.CellComparator;
++import org.apache.hadoop.hbase.CellUtil;
+ import org.apache.hadoop.hbase.KeyValue.KVComparator;
+-import org.apache.hadoop.hbase.KeyValueUtil;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.io.hfile.HFile.Writer;
+ import org.apache.hadoop.hbase.io.hfile.HFileBlock.BlockWritable;
+ import org.apache.hadoop.hbase.util.BloomFilterWriter;
+@@ -75,8 +76,11 @@ public class HFileWriterV2 extends AbstractHFileWriter {
+   /** The offset of the last data block or 0 if the file is empty. */
+   protected long lastDataBlockOffset;
+ 
+-  /** The last(stop) Key of the previous data block. */
+-  private byte[] lastKeyOfPreviousBlock = null;
++  /**
++   * The last(stop) Cell of the previous data block.
++   * This reference should be short-lived since we write hfiles in a burst.
++   */
++  private Cell lastCellOfPreviousBlock = null;
+ 
+   /** Additional data items to be written to the "load-on-open" section. */
+   private List<BlockWritable> additionalLoadOnOpenData =
+@@ -158,8 +162,11 @@ public class HFileWriterV2 extends AbstractHFileWriter {
+     fsBlockWriter.writeHeaderAndData(outputStream);
+     int onDiskSize = fsBlockWriter.getOnDiskSizeWithHeader();
+ 
+-    byte[] indexKey = comparator.calcIndexKey(lastKeyOfPreviousBlock, firstKeyInBlock);
+-    dataBlockIndexWriter.addEntry(indexKey, lastDataBlockOffset, onDiskSize);
++    // Rather than CellComparator, we should be making use of an Interface here with the
++    // implementation class serialized out to the HFile metadata. TODO.
++    Cell indexEntry = CellComparator.getMidpoint(lastCellOfPreviousBlock, firstCellInBlock);
++    dataBlockIndexWriter.addEntry(CellUtil.getCellKeySerializedAsKeyValueKey(indexEntry),
++      lastDataBlockOffset, onDiskSize);
+     totalUncompressedBytes += fsBlockWriter.getUncompressedSizeWithHeader();
+     if (cacheConf.shouldCacheDataOnWrite()) {
+       doCacheOnWrite(lastDataBlockOffset);
+@@ -205,10 +212,9 @@ public class HFileWriterV2 extends AbstractHFileWriter {
+   protected void newBlock() throws IOException {
+     // This is where the next block begins.
+     fsBlockWriter.startWriting(BlockType.DATA);
+-    firstKeyInBlock = null;
+-    if (lastKeyLength > 0) {
+-      lastKeyOfPreviousBlock = new byte[lastKeyLength];
+-      KeyValueUtil.appendKeyTo(lastCell, lastKeyOfPreviousBlock, 0);
++    firstCellInBlock = null;
++    if (lastCell != null) {
++      lastCellOfPreviousBlock = lastCell;
+     }
+   }
+ 
+@@ -248,7 +254,6 @@ public class HFileWriterV2 extends AbstractHFileWriter {
+    */
+   @Override
+   public void append(final Cell cell) throws IOException {
+-    int klength = KeyValueUtil.keyLength(cell);
+     byte[] value = cell.getValueArray();
+     int voffset = cell.getValueOffset();
+     int vlength = cell.getValueLength();
+@@ -264,18 +269,19 @@ public class HFileWriterV2 extends AbstractHFileWriter {
+ 
+     fsBlockWriter.write(cell);
+ 
+-    totalKeyLength += klength;
++    totalKeyLength += CellUtil.estimatedSerializedSizeOfKey(cell);
+     totalValueLength += vlength;
+ 
+     // Are we the first key in this block?
+-    if (firstKeyInBlock == null) {
+-      // Copy the key for use as first key in block. It is put into file index.
+-      firstKeyInBlock = new byte[klength];
+-      KeyValueUtil.appendKeyTo(cell, firstKeyInBlock, 0);
++    if (firstCellInBlock == null) {
++      // If cell is big, block will be closed and this firstCellInBlock reference will only last
++      // a short while.
++      firstCellInBlock = cell;
+     }
+ 
++    // TODO: What if cell is 10MB and we write infrequently?  We'll hold on to the cell here
++    // indefinetly?
+     lastCell = cell;
+-    lastKeyLength = klength;
+     entryCount++;
+     this.maxMemstoreTS = Math.max(this.maxMemstoreTS, cell.getSequenceId());
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
+index d980c7c..2e5fc41 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/protobuf/ReplicationProtbufUtil.java
+@@ -138,7 +138,7 @@ public class ReplicationProtbufUtil {
+       List<Cell> cells = edit.getCells();
+       // Add up the size.  It is used later serializing out the kvs.
+       for (Cell cell: cells) {
+-        size += CellUtil.estimatedLengthOf(cell);
++        size += CellUtil.estimatedSerializedSizeOf(cell);
+       }
+       // Collect up the cells
+       allCells.add(cells);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+index 67ff2cb..fbf151a 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+@@ -5038,7 +5038,7 @@ public class HRegion implements HeapSize, PropagatingConfigurationObserver { //
+     if (this.metricsRegion != null) {
+       long totalSize = 0l;
+       for (Cell cell : results) {
+-        totalSize += CellUtil.estimatedLengthOf(cell);
++        totalSize += CellUtil.estimatedSerializedSizeOf(cell);
+       }
+       this.metricsRegion.updateGet(totalSize);
+     }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+index 8e7f576..faf2eb1 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+@@ -44,7 +44,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+@@ -57,6 +56,7 @@ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.conf.ConfigurationManager;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+@@ -91,7 +91,6 @@ import org.apache.hadoop.ipc.RemoteException;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.base.Optional;
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableCollection;
+ import com.google.common.collect.ImmutableList;
+@@ -720,8 +719,8 @@ public class HStore implements Store {
+             if (CellComparator.compareRows(prevCell, cell) > 0) {
+               throw new InvalidHFileException("Previous row is greater than"
+                   + " current row: path=" + srcPath + " previous="
+-                  + CellUtil.getCellKey(prevCell) + " current="
+-                  + CellUtil.getCellKey(cell));
++                  + CellUtil.getCellKeyAsString(prevCell) + " current="
++                  + CellUtil.getCellKeyAsString(cell));
+             }
+             if (CellComparator.compareFamilies(prevCell, cell) != 0) {
+               throw new InvalidHFileException("Previous key had different"
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+index 21e4099..9eb2c0f 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+@@ -2071,7 +2071,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+               for (Result r : results) {
+                 for (Cell cell : r.rawCells()) {
+                   currentScanResultSize += CellUtil.estimatedHeapSizeOf(cell);
+-                  totalCellSize += CellUtil.estimatedLengthOf(cell);
++                  totalCellSize += CellUtil.estimatedSerializedSizeOf(cell);
+                 }
+               }
+             }
+@@ -2102,7 +2102,7 @@ public class RSRpcServices implements HBaseRPCErrorHandler,
+                   if (!values.isEmpty()) {
+                     for (Cell cell : values) {
+                       currentScanResultSize += CellUtil.estimatedHeapSizeOf(cell);
+-                      totalCellSize += CellUtil.estimatedLengthOf(cell);
++                      totalCellSize += CellUtil.estimatedSerializedSizeOf(cell);
+                     }
+                     results.add(Result.create(values, null, stale));
+                     i++;
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index 0a4e1ed..6d0098b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -332,7 +332,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+           scanner.seek(seekKey);
+           Cell c = scanner.peek();
+           if (c != null ) {
+-            totalScannersSoughtBytes += CellUtil.estimatedSizeOf(c);
++            totalScannersSoughtBytes += CellUtil.estimatedSerializedSizeOf(c);
+           }
+         }
+       } else {
+@@ -515,7 +515,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
+           if (this.countPerRow > storeOffset) {
+             outResult.add(cell);
+             count++;
+-            totalBytesRead += CellUtil.estimatedSizeOf(cell);
++            totalBytesRead += CellUtil.estimatedSerializedSizeOf(cell);
+             if (totalBytesRead > maxRowSize) {
+               throw new RowTooBigException("Max row size allowed: " + maxRowSize
+               + ", but the row is bigger than that.");
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index 42e4751..2f82086 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -1475,7 +1475,7 @@ class FSHLog implements HLog, Syncable {
+   public long postAppend(final Entry e, final long elapsedTime) {
+     long len = 0;
+     if (this.metrics == null) return len;
+-    for (Cell cell : e.getEdit().getCells()) len += CellUtil.estimatedLengthOf(cell);
++    for (Cell cell : e.getEdit().getCells()) len += CellUtil.estimatedSerializedSizeOf(cell);
+     metrics.finishAppend(elapsedTime, len);
+     return len;
+   }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestChecksum.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestChecksum.java
+index 00c6aa5..80266af 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestChecksum.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestChecksum.java
+@@ -49,10 +49,6 @@ import org.junit.experimental.categories.Category;
+ 
+ @Category({IOTests.class, SmallTests.class})
+ public class TestChecksum {
+-  // change this value to activate more logs
+-  private static final boolean detailedLogging = true;
+-  private static final boolean[] BOOLEAN_VALUES = new boolean[] { false, true };
+-
+   private static final Log LOG = LogFactory.getLog(TestHFileBlock.class);
+ 
+   static final Compression.Algorithm[] COMPRESSION_ALGORITHMS = {
+@@ -118,7 +114,7 @@ public class TestChecksum {
+               .withIncludesTags(useTags)
+               .withHBaseCheckSum(true)
+               .build();
+-        HFileBlock.FSReader hbr = new FSReaderV2Test(is, totalSize, fs, path, meta);
++        HFileBlock.FSReader hbr = new FSReaderImplTest(is, totalSize, fs, path, meta);
+         HFileBlock b = hbr.readBlockData(0, -1, -1, pread);
+         b.sanityCheck();
+         assertEquals(4936, b.getUncompressedSizeWithoutHeader());
+@@ -160,7 +156,7 @@ public class TestChecksum {
+         HFileSystem newfs = new HFileSystem(TEST_UTIL.getConfiguration(), false);
+         assertEquals(false, newfs.useHBaseChecksum());
+         is = new FSDataInputStreamWrapper(newfs, path);
+-        hbr = new FSReaderV2Test(is, totalSize, newfs, path, meta);
++        hbr = new FSReaderImplTest(is, totalSize, newfs, path, meta);
+         b = hbr.readBlockData(0, -1, -1, pread);
+         is.close();
+         b.sanityCheck();
+@@ -243,7 +239,7 @@ public class TestChecksum {
+                .withHBaseCheckSum(true)
+                .withBytesPerCheckSum(bytesPerChecksum)
+                .build();
+-        HFileBlock.FSReader hbr = new HFileBlock.FSReaderV2(new FSDataInputStreamWrapper(
++        HFileBlock.FSReader hbr = new HFileBlock.FSReaderImpl(new FSDataInputStreamWrapper(
+             is, nochecksum), totalSize, hfs, path, meta);
+         HFileBlock b = hbr.readBlockData(0, -1, -1, pread);
+         is.close();
+@@ -283,8 +279,8 @@ public class TestChecksum {
+    * reading  data from hfiles. This should trigger the hdfs level
+    * checksum validations.
+    */
+-  static private class FSReaderV2Test extends HFileBlock.FSReaderV2 {
+-    public FSReaderV2Test(FSDataInputStreamWrapper istream, long fileSize, FileSystem fs,
++  static private class FSReaderImplTest extends HFileBlock.FSReaderImpl {
++    public FSReaderImplTest(FSDataInputStreamWrapper istream, long fileSize, FileSystem fs,
+         Path path, HFileContext meta) throws IOException {
+       super(istream, fileSize, (HFileSystem) fs, path, meta);
+     }
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlock.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlock.java
+index 254af72..eb1f1bb 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlock.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlock.java
+@@ -313,7 +313,7 @@ public class TestHFileBlock {
+         .withIncludesMvcc(includesMemstoreTS)
+         .withIncludesTags(includesTag)
+         .withCompression(algo).build();
+-        HFileBlock.FSReader hbr = new HFileBlock.FSReaderV2(is, totalSize, meta);
++        HFileBlock.FSReader hbr = new HFileBlock.FSReaderImpl(is, totalSize, meta);
+         HFileBlock b = hbr.readBlockData(0, -1, -1, pread);
+         is.close();
+         assertEquals(0, HFile.getChecksumFailuresCount());
+@@ -326,7 +326,7 @@ public class TestHFileBlock {
+ 
+         if (algo == GZ) {
+           is = fs.open(path);
+-          hbr = new HFileBlock.FSReaderV2(is, totalSize, meta);
++          hbr = new HFileBlock.FSReaderImpl(is, totalSize, meta);
+           b = hbr.readBlockData(0, 2173 + HConstants.HFILEBLOCK_HEADER_SIZE +
+                                 b.totalChecksumBytes(), -1, pread);
+           assertEquals(expected, b);
+@@ -412,7 +412,7 @@ public class TestHFileBlock {
+                 .withIncludesMvcc(includesMemstoreTS)
+                 .withIncludesTags(includesTag)
+                 .build();
+-          HFileBlock.FSReaderV2 hbr = new HFileBlock.FSReaderV2(is, totalSize, meta);
++          HFileBlock.FSReaderImpl hbr = new HFileBlock.FSReaderImpl(is, totalSize, meta);
+           hbr.setDataBlockEncoder(dataBlockEncoder);
+           hbr.setIncludesMemstoreTS(includesMemstoreTS);
+           HFileBlock blockFromHFile, blockUnpacked;
+@@ -540,7 +540,7 @@ public class TestHFileBlock {
+                               .withIncludesMvcc(includesMemstoreTS)
+                               .withIncludesTags(includesTag)
+                               .withCompression(algo).build();
+-          HFileBlock.FSReader hbr = new HFileBlock.FSReaderV2(is, totalSize, meta);
++          HFileBlock.FSReader hbr = new HFileBlock.FSReaderImpl(is, totalSize, meta);
+           long curOffset = 0;
+           for (int i = 0; i < NUM_TEST_BLOCKS; ++i) {
+             if (!pread) {
+@@ -725,7 +725,7 @@ public class TestHFileBlock {
+                           .withIncludesTags(includesTag)
+                           .withCompression(compressAlgo)
+                           .build();
+-      HFileBlock.FSReader hbr = new HFileBlock.FSReaderV2(is, fileSize, meta);
++      HFileBlock.FSReader hbr = new HFileBlock.FSReaderImpl(is, fileSize, meta);
+ 
+       Executor exec = Executors.newFixedThreadPool(NUM_READER_THREADS);
+       ExecutorCompletionService<Boolean> ecs =
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockCompatibility.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockCompatibility.java
+index da6761e..cd76ad4 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockCompatibility.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockCompatibility.java
+@@ -197,7 +197,7 @@ public class TestHFileBlockCompatibility {
+                            .withIncludesTags(includesTag)
+                            .withCompression(algo)
+                            .build();
+-        HFileBlock.FSReader hbr = new HFileBlock.FSReaderV2(new FSDataInputStreamWrapper(is),
++        HFileBlock.FSReader hbr = new HFileBlock.FSReaderImpl(new FSDataInputStreamWrapper(is),
+             totalSize, fs, path, meta);
+         HFileBlock b = hbr.readBlockData(0, -1, -1, pread);
+         is.close();
+@@ -210,7 +210,7 @@ public class TestHFileBlockCompatibility {
+ 
+         if (algo == GZ) {
+           is = fs.open(path);
+-          hbr = new HFileBlock.FSReaderV2(new FSDataInputStreamWrapper(is), totalSize, fs, path,
++          hbr = new HFileBlock.FSReaderImpl(new FSDataInputStreamWrapper(is), totalSize, fs, path,
+               meta);
+           b = hbr.readBlockData(0, 2173 + HConstants.HFILEBLOCK_HEADER_SIZE_NO_CHECKSUM +
+                                 b.totalChecksumBytes(), -1, pread);
+@@ -292,7 +292,7 @@ public class TestHFileBlockCompatibility {
+                               .withIncludesTags(includesTag)
+                               .withCompression(algo)
+                               .build();
+-          HFileBlock.FSReaderV2 hbr = new HFileBlock.FSReaderV2(new FSDataInputStreamWrapper(is),
++          HFileBlock.FSReaderImpl hbr = new HFileBlock.FSReaderImpl(new FSDataInputStreamWrapper(is),
+               totalSize, fs, path, meta);
+           hbr.setDataBlockEncoder(dataBlockEncoder);
+           hbr.setIncludesMemstoreTS(includesMemstoreTS);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockIndex.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockIndex.java
+index 831c6d3..c0f2fed 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockIndex.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileBlockIndex.java
+@@ -197,7 +197,7 @@ public class TestHFileBlockIndex {
+                         .withIncludesTags(useTags)
+                         .withCompression(compr)
+                         .build();
+-    HFileBlock.FSReader blockReader = new HFileBlock.FSReaderV2(istream, fs.getFileStatus(path)
++    HFileBlock.FSReader blockReader = new HFileBlock.FSReaderImpl(istream, fs.getFileStatus(path)
+         .getLen(), meta);
+ 
+     BlockReaderWrapper brw = new BlockReaderWrapper(blockReader);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
+index b1a4d57..0cb3c3c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileEncryption.java
+@@ -93,7 +93,7 @@ public class TestHFileEncryption {
+     return hbw.getOnDiskSizeWithHeader();
+   }
+ 
+-  private long readAndVerifyBlock(long pos, HFileContext ctx, HFileBlock.FSReaderV2 hbr, int size)
++  private long readAndVerifyBlock(long pos, HFileContext ctx, HFileBlock.FSReaderImpl hbr, int size)
+       throws IOException {
+     HFileBlock b = hbr.readBlockData(pos, -1, -1, false);
+     assertEquals(0, HFile.getChecksumFailuresCount());
+@@ -139,7 +139,7 @@ public class TestHFileEncryption {
+       }
+       FSDataInputStream is = fs.open(path);
+       try {
+-        HFileBlock.FSReaderV2 hbr = new HFileBlock.FSReaderV2(is, totalSize, fileContext);
++        HFileBlock.FSReaderImpl hbr = new HFileBlock.FSReaderImpl(is, totalSize, fileContext);
+         long pos = 0;
+         for (int i = 0; i < blocks; i++) {
+           pos += readAndVerifyBlock(pos, fileContext, hbr, blockSizes[i]);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV2.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV2.java
+index 12b0639..42e918a 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV2.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV2.java
+@@ -146,7 +146,7 @@ public class TestHFileWriterV2 {
+                         .withCompression(compressAlgo)
+                         .build();
+     
+-    HFileBlock.FSReader blockReader = new HFileBlock.FSReaderV2(fsdis, fileSize, meta);
++    HFileBlock.FSReader blockReader = new HFileBlock.FSReaderImpl(fsdis, fileSize, meta);
+     // Comparator class name is stored in the trailer in version 2.
+     KVComparator comparator = trailer.createComparator();
+     HFileBlockIndex.BlockIndexReader dataBlockIndexReader =
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV3.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV3.java
+index 471a44d..f96e8ef 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV3.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestHFileWriterV3.java
+@@ -176,7 +176,7 @@ public class TestHFileWriterV3 {
+                         .withIncludesTags(useTags)
+                         .withHBaseCheckSum(true).build();
+     HFileBlock.FSReader blockReader =
+-        new HFileBlock.FSReaderV2(fsdis, fileSize, meta);
++        new HFileBlock.FSReaderImpl(fsdis, fileSize, meta);
+  // Comparator class name is stored in the trailer in version 2.
+     KVComparator comparator = trailer.createComparator();
+     HFileBlockIndex.BlockIndexReader dataBlockIndexReader =
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestSeekTo.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestSeekTo.java
+index b7be1bb..b845d16 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestSeekTo.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/io/hfile/TestSeekTo.java
+@@ -246,8 +246,8 @@ public class TestSeekTo extends HBaseTestCase {
+     assertEquals("c", toRowStr(scanner.getKeyValue()));
+ 
+     // Across a block boundary now.
+-    // h goes to the next block
+-    assertEquals(-2, scanner.seekTo(toKV("h", tagUsage)));
++    // 'h' does not exist so we will get a '1' back for not found.
++    assertEquals(0, scanner.seekTo(toKV("i", tagUsage)));
+     assertEquals("i", toRowStr(scanner.getKeyValue()));
+ 
+     assertEquals(1, scanner.seekTo(toKV("l", tagUsage)));
+@@ -280,8 +280,14 @@ public class TestSeekTo extends HBaseTestCase {
+         toKV("e", tagUsage)));
+     assertEquals(0, blockIndexReader.rootBlockContainingKey(
+         toKV("g", tagUsage)));
+-    assertEquals(1, blockIndexReader.rootBlockContainingKey(
+-        toKV("h", tagUsage)));
++    // 'h', being midpoint between 'g' and 'i', used to be the block index key because of the
++    // little optimization done creating block index keys where we try to get a midpoint and then
++    // make this midpoint short as possible so index blocks are kept tight. But now, we won't do
++    // the 'optimization' -- create new key -- if there is no gain to be had by way of making
++    // a shorter key; in this case we just use the start key in the index.  This means the below
++    // test changes.  Looking for 'h', it'll be in the 0 block rather than 1 block now (though 'h'
++    // does not exist in this file).
++    assertEquals(1, blockIndexReader.rootBlockContainingKey(toKV("h", tagUsage)));
+     assertEquals(1, blockIndexReader.rootBlockContainingKey(
+         toKV("i", tagUsage)));
+     assertEquals(1, blockIndexReader.rootBlockContainingKey(
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapred/TestDriver.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapred/TestDriver.java
+index a268b76..ab6a86d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/mapred/TestDriver.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/mapred/TestDriver.java
+@@ -32,7 +32,6 @@ import static org.mockito.Mockito.verify;
+ public class TestDriver {
+ 
+   @Test
+-  @SuppressWarnings("deprecation")
+   public void testDriverMainMethod() throws Throwable {
+     ProgramDriver programDriverMock = mock(ProgramDriver.class);
+     Driver.setProgramDriver(programDriverMock);
+-- 
+1.8.5.2 (Apple Git-48)
+

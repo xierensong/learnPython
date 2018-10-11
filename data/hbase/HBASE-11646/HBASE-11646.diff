@@ -1,0 +1,640 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
+index a1d629a..04d46ab 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/Compactor.java
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Date;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -27,22 +28,29 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.hbase.Cell;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.KeyValueUtil;
++import org.apache.hadoop.hbase.Tag;
++import org.apache.hadoop.hbase.TagType;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.io.compress.Compression;
+ import org.apache.hadoop.hbase.io.hfile.HFile.FileInfo;
+ import org.apache.hadoop.hbase.io.hfile.HFileWriterV2;
++import org.apache.hadoop.hbase.mob.MobUtils;
+ import org.apache.hadoop.hbase.regionserver.HStore;
+ import org.apache.hadoop.hbase.regionserver.InternalScanner;
++import org.apache.hadoop.hbase.regionserver.MobFileStore;
+ import org.apache.hadoop.hbase.regionserver.ScanType;
+ import org.apache.hadoop.hbase.regionserver.Store;
+ import org.apache.hadoop.hbase.regionserver.StoreFile;
+ import org.apache.hadoop.hbase.regionserver.StoreFileScanner;
+ import org.apache.hadoop.hbase.regionserver.StoreScanner;
++import org.apache.hadoop.hbase.regionserver.TimeRangeTracker;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.Writables;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ /**
+@@ -62,6 +70,9 @@
+   /** specify how many days to keep MVCC values during major compaction **/ 
+   protected int keepSeqIdPeriod;
+ 
++  private MobFileStore mobFileStore;
++  private long mobCellValueSizeThreshold;
++
+   //TODO: depending on Store is not good but, realistically, all compactors currently do.
+   Compactor(final Configuration conf, final Store store) {
+     this.conf = conf;
+@@ -72,6 +83,7 @@
+         Compression.Algorithm.NONE : this.store.getFamily().getCompactionCompression();
+     this.keepSeqIdPeriod = Math.max(this.conf.getInt(HConstants.KEEP_SEQID_PERIOD, 
+       HConstants.MIN_KEEP_SEQID_PERIOD), HConstants.MIN_KEEP_SEQID_PERIOD);
++    mobCellValueSizeThreshold = MobUtils.getMobThreshold(store.getFamily());
+   }
+ 
+   /**
+@@ -91,6 +103,8 @@ public CompactionProgress getProgress() {
+     public long maxKeyCount = 0;
+     /** Earliest put timestamp if major compaction */
+     public long earliestPutTs = HConstants.LATEST_TIMESTAMP;
++    /** Latesst put timestamp*/
++    public long latestPutTs = HConstants.LATEST_TIMESTAMP;
+     /** The last key in the files we're compacting. */
+     public long maxSeqId = 0;
+     /** Latest memstore read point found in any of the involved files */
+@@ -157,6 +171,14 @@ protected FileDetails getFileDetails(
+           fd.earliestPutTs = Math.min(fd.earliestPutTs, earliestPutTs);
+         }
+       }
++      tmp = fileInfo.get(StoreFile.TIMERANGE_KEY);
++      TimeRangeTracker trt = new TimeRangeTracker();
++      if (tmp == null) {
++        fd.latestPutTs = HConstants.LATEST_TIMESTAMP;
++      } else {
++        Writables.copyWritable(tmp, trt);
++        fd.latestPutTs = trt.getMaximumTimestamp();
++      }
+       if (LOG.isDebugEnabled()) {
+         LOG.debug("Compacting " + file +
+           ", keycount=" + keyCount +
+@@ -186,6 +208,170 @@ protected long getSmallestReadPoint() {
+   }
+ 
+   /**
++   * Performs the compaction on the column family of the mob.
++   * Compacts the files by the following rules.
++   * 1. If the cell has a reference tag which mean its value is a path of a mob file.
++   * <ol>
++   * <li>
++   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,
++   * directly write this cell into the store file.
++   * </li>
++   * <li>
++   * Otherwise, retrieve the mob cell from the mob file, and write it back to the store file.
++   * </li>
++   * </ol>
++   * 2. If the cell doesn't have a reference tag.
++   * <ol>
++   * <li>
++   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,
++   * write this cell to a mob file, and write the path of this mob file to the store file.
++   * </li>
++   * <li>
++   * Otherwise, directly write this cell into the store file.
++   * </li>
++   * </ol>
++   * @param fd file details
++   * @param scanner Where to read from.
++   * @param writer Where to write to.
++   * @param smallestReadPoint Smallest read point.
++   * @param cleanSeqId When true, remove seqId(used to be mvcc) value which is <= smallestReadPoint
++   * @param isMajor Whether this is a major compaction
++   * @return Whether compaction ended; false if it was interrupted for some reason.
++   */
++  protected boolean performMobStoreCompaction(FileDetails fd, InternalScanner scanner,
++      CellSink writer, long smallestReadPoint, boolean cleanSeqId, boolean isMajor)
++      throws IOException {
++    int bytesWritten = 0;
++    // Since scanner.next() can return 'false' but still be delivering data,
++    // we have to use a do/while loop.
++    List<Cell> kvs = new ArrayList<Cell>();
++    // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME
++    int closeCheckInterval = HStore.getCloseCheckInterval();
++    boolean hasMore;
++    Path path = MobUtils.getMobFamilyPath(conf, store.getTableName(), store.getColumnFamilyName());
++    byte[] referenceValue = null;
++    mobFileStore = currentMobFileStore(path);
++    StoreFile.Writer mobFileWriter = null;
++    long mobCells = 0;
++    try {
++      try {
++        // If the mob file writer could not be created, directly write the cell to the store file.
++        if (mobFileStore != null) {
++          mobFileWriter = mobFileStore.createWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,
++              store.getFamily().getCompression(), store.getRegionInfo().getStartKey());
++          referenceValue = Bytes.toBytes(mobFileWriter.getPath().getName());
++        }
++      } catch (IOException e) {
++        LOG.error("Fail to create mob writer", e);
++      }
++      do {
++        hasMore = scanner.next(kvs, compactionKVMax);
++        // output to writer:
++        for (Cell c : kvs) {
++          KeyValue kv = KeyValueUtil.ensureKeyValue(c);
++          if (cleanSeqId && kv.getSequenceId() <= smallestReadPoint) {
++            kv.setSequenceId(0);
++          }
++          if (mobFileWriter == null || kv.getTypeByte() != KeyValue.Type.Put.getCode()) {
++            // If the mob file writer is null or the kv type is not put, directly write the cell
++            // to the store file.
++            writer.append(kv);
++          } else if (MobUtils.isMobReferenceCell(kv)) {
++            if (kv.getValueLength() > Bytes.SIZEOF_LONG) {
++              long size = Bytes.toLong(kv.getValueArray(), kv.getValueOffset(), Bytes.SIZEOF_LONG);
++              if (size > mobCellValueSizeThreshold) {
++                // If the value size is larger than the threshold, it's regarded as a mob. Since
++                // its value is already in the mob file, directly write this cell to the store file
++                writer.append(kv);
++              } else {
++                // If the value is not larger than the threshold, it's not regarded a mob. Retrieve
++                // the mob cell from the mob file, and write it back to the store file.
++                Cell cell = mobFileStore.resolve(kv, false);
++                byte[] value = cell.getValue();
++                if (!Bytes.equals(HConstants.EMPTY_BYTE_ARRAY, value)) {
++                  // put the mob data back to the store file
++                  writer.append(KeyValueUtil.ensureKeyValue(cell));
++                } else {
++                  // If the value of a file is empty, there might be issues when retrieving, directly
++                  // write the cell to the store file, and leave it to be handled by the next
++                  // compaction.
++                  writer.append(kv);
++                }
++              }
++            } else {
++              LOG.warn("The value format of the KeyValue " + kv + " is wrong, its length than "
++                  + Bytes.SIZEOF_LONG);
++              writer.append(kv);
++            }
++          } else if (kv.getValueLength() <= mobCellValueSizeThreshold) {
++            // If the value size of a cell is not larger than the threshold, directly write it to
++            // the store file.
++            writer.append(kv);
++          } else {
++            // If the value size of a cell is larger than the threshold, it's regarded as a mob,
++            // write this cell to a mob file, and write the path to the store file.
++            mobCells++;
++            // append the original keyValue in the mob file.
++            mobFileWriter.append(kv);
++            List<Tag> existingTags = Tag.asList(kv.getTagsArray(), kv.getTagsOffset(),
++                kv.getTagsLength());
++            if (existingTags.isEmpty()) {
++              existingTags = new ArrayList<Tag>();
++            }
++            Tag mobRefTag = new Tag(TagType.MOB_REFERENCE_TAG_TYPE,
++                HConstants.EMPTY_BYTE_ARRAY);
++            existingTags.add(mobRefTag);
++            long valueLength = kv.getValueLength();
++            byte[] newValue = Bytes.add(Bytes.toBytes(valueLength), referenceValue);
++            KeyValue reference = new KeyValue(kv.getRowArray(), kv.getRowOffset(),
++                kv.getRowLength(), kv.getFamilyArray(), kv.getFamilyOffset(),
++                kv.getFamilyLength(), kv.getQualifierArray(), kv.getQualifierOffset(),
++                kv.getQualifierLength(), kv.getTimestamp(), KeyValue.Type.Put,
++                newValue, 0, newValue.length, existingTags);
++            reference.setSequenceId(c.getSequenceId());
++            // write the cell whose value is the path of a mob file to the store file.
++            writer.append(reference);
++          }
++          ++progress.currentCompactedKVs;
++
++          // check periodically to see if a system stop is requested
++          if (closeCheckInterval > 0) {
++            bytesWritten += kv.getLength();
++            if (bytesWritten > closeCheckInterval) {
++              bytesWritten = 0;
++              if (!store.areWritesEnabled()) {
++                progress.cancel();
++                return false;
++              }
++            }
++          }
++        }
++        kvs.clear();
++      } while (hasMore);
++    } finally {
++      if (mobFileWriter != null) {
++        mobFileWriter.appendMetadata(fd.maxSeqId, isMajor);
++        mobFileWriter.close();
++      }
++    }
++    if(mobFileWriter!=null) {
++      if (mobCells > 0) {
++        // If the mob file is not empty, commit it.
++        mobFileStore.commitFile(mobFileWriter.getPath(), path);
++      } else {
++        try {
++          // If the mob file is empty, delete it instead of committing.
++          store.getFileSystem().delete(mobFileWriter.getPath(), true);
++        } catch (IOException e) {
++          LOG.error("Fail to delete the temp mob file", e);
++        }
++      }
++    }
++    progress.complete();
++    return true;
++  }
++
++  /**
+    * Calls coprocessor, if any, to create compaction scanner - before normal scanner creation.
+    * @param request Compaction request.
+    * @param scanType Scan type.
+@@ -292,4 +478,24 @@ protected InternalScanner createScanner(Store store, List<StoreFileScanner> scan
+     return new StoreScanner(store, store.getScanInfo(), scan, scanners, smallestReadPoint,
+         earliestPutTs, dropDeletesFromRow, dropDeletesToRow);
+   }
++
++  /**
++   * Gets the current instance of the MobFileStore.
++   * @param path The path of a mob file.
++   * @return The current instance of the MobFileStore. Returns null if exceptions occur.
++   */
++  private synchronized MobFileStore currentMobFileStore(Path path) {
++    if (mobFileStore == null) {
++      try {
++        if (!store.getFileSystem().exists(path)) {
++          store.getFileSystem().mkdirs(path);
++        }
++        mobFileStore = MobFileStore.create(conf, this.store.getFileSystem(),
++            this.store.getTableName(), this.store.getFamily());
++      } catch (IOException e) {
++        LOG.error("Fail to create the MobFileStore", e);
++      }
++    }
++    return mobFileStore;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/DefaultCompactor.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/DefaultCompactor.java
+index d5b2b63..6f4c022 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/DefaultCompactor.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/compactions/DefaultCompactor.java
+@@ -26,6 +26,7 @@
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.mob.MobUtils;
+ import org.apache.hadoop.hbase.regionserver.Store;
+ import org.apache.hadoop.hbase.regionserver.InternalScanner;
+ import org.apache.hadoop.hbase.regionserver.ScanType;
+@@ -76,9 +77,19 @@ public DefaultCompactor(final Configuration conf, final Store store) {
+           smallestReadPoint = Math.min(fd.minSeqIdToKeep, smallestReadPoint);
+           cleanSeqId = true;
+         }
+-        writer = store.createWriterInTmp(fd.maxKeyCount, this.compactionCompression, true,
+-            fd.maxMVCCReadpoint >= smallestReadPoint, fd.maxTagsLength > 0);
+-        boolean finished = performCompaction(scanner, writer, smallestReadPoint, cleanSeqId);
++        boolean finished = true;
++        if (MobUtils.isMobFamily(store.getFamily())) {
++          // If the family is a mob one, perform the compaction for mob.
++          // Create the writer always with tags.
++          writer = store.createWriterInTmp(fd.maxKeyCount, this.compactionCompression, true,
++              fd.maxMVCCReadpoint >= smallestReadPoint, true);
++          finished = performMobStoreCompaction(fd, scanner, writer, smallestReadPoint, cleanSeqId,
++              request.isAllFiles());
++        } else {
++          writer = store.createWriterInTmp(fd.maxKeyCount, this.compactionCompression, true,
++              fd.maxMVCCReadpoint >= smallestReadPoint, fd.maxTagsLength > 0);
++          finished = performCompaction(scanner, writer, smallestReadPoint, cleanSeqId);
++        }
+         if (!finished) {
+           writer.close();
+           store.getFileSystem().delete(writer.getPath(), false);
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMobCompaction.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMobCompaction.java
+new file mode 100644
+index 0000000..6ecca36
+--- /dev/null
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestMobCompaction.java
+@@ -0,0 +1,319 @@
++/**
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.*;
++import org.apache.hadoop.hbase.HBaseTestCase.HRegionIncommon;
++import org.apache.hadoop.hbase.client.Durability;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++import org.apache.hadoop.hbase.io.hfile.HFile;
++import org.apache.hadoop.hbase.io.hfile.HFileContext;
++import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
++import org.apache.hadoop.hbase.mob.MobConstants;
++import org.apache.hadoop.hbase.mob.MobUtils;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.FSUtils;
++import org.apache.hadoop.hbase.util.Pair;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++import org.junit.rules.TestName;
++
++import java.io.IOException;
++import java.util.*;
++
++import static org.apache.hadoop.hbase.HBaseTestingUtility.START_KEY;
++import static org.apache.hadoop.hbase.HBaseTestingUtility.fam1;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * Test mob compaction
++ */
++@Category(MediumTests.class)
++public class TestMobCompaction {
++  @Rule
++  public TestName name = new TestName();
++  static final Log LOG = LogFactory.getLog(TestMobCompaction.class.getName());
++  private HBaseTestingUtility UTIL = null;
++  private Configuration conf = null;
++
++  private HRegion region = null;
++  private HTableDescriptor tabDesc = null;
++  private HColumnDescriptor colDesc = null;
++  private int mobCellThreshold = 1000;
++
++  private HRegionIncommon loader;
++
++  private MobFileStore mobFileStore;
++  private Path mobFilePath;
++  private FileSystem fs;
++
++  private static final byte[] COLUMN_FAMILY = fam1;
++  private final byte[] STARTROW = Bytes.toBytes(START_KEY);
++  private int compactionThreshold;
++
++  @Before
++  public void setUp() throws Exception {
++
++  }
++
++  private void init(int mobThreshold, boolean withMobFlusher) throws Exception {
++    this.mobCellThreshold = mobThreshold;
++
++    UTIL = HBaseTestingUtility.createLocalHTU();
++
++    conf = UTIL.getConfiguration();
++    if (withMobFlusher) {
++      conf.setClass(DefaultStoreEngine.DEFAULT_STORE_FLUSHER_CLASS_KEY,
++          DefaultMobStoreFlusher.class, StoreFlusher.class);
++    }
++    conf.setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, 1024 * 1024);
++    conf.setInt("hbase.hregion.memstore.block.multiplier", 100);
++    compactionThreshold = conf.getInt("hbase.hstore.compactionThreshold", 3);
++
++    tabDesc = UTIL.createTableDescriptor(name.getMethodName());
++    colDesc = new HColumnDescriptor(COLUMN_FAMILY);
++    colDesc.setValue(MobConstants.IS_MOB, "true");
++    colDesc.setValue(MobConstants.MOB_THRESHOLD, String.valueOf(mobThreshold));
++    colDesc.setMaxVersions(1);
++    tabDesc.addFamily(colDesc);
++
++    region = UTIL.createLocalHRegion(tabDesc, null, null);
++    loader = new HRegionIncommon(region);
++    fs = FileSystem.get(conf);
++    mobFileStore = MobFileStore.create(conf, fs, tabDesc.getTableName(), colDesc);
++    mobFilePath = mobFileStore.getPath();
++  }
++
++  @After
++  public void tearDown() throws Exception {
++    region.close();
++    fs.delete(UTIL.getDataTestDir(), true);
++  }
++
++  /**
++   * When compaction, smaller cell than the threshold won't be affected
++   */
++  @Test
++  public void testSmallerValueWithoutRefTag() throws Exception {
++    init(500, false);
++
++    byte[] dummyData = makeDummyData(300); // smaller than mob threshold
++    int createCount = compactionThreshold + 1;
++    for (int i = 0; i < createCount; i++) {
++      createStoreFile(i, dummyData);
++    }
++    assertEquals("Before compaction", createCount, countStoreFiles());
++    assertEquals("Before compaction", 0, countMobFiles());
++    assertTrue("Before compaction, check rows:", countRows() > 0);
++
++    region.compactStores();
++
++    assertEquals("After compaction", 1, countStoreFiles());
++    assertEquals("After compaction", 0, countMobFiles());
++    assertEquals("After compaction", 0, countReferencedMobFiles());
++    assertTrue("After compaction, check rows:", countRows() > 0);
++  }
++
++  /**
++   * When compaction, larger cell than the threshold will be put to mob file
++   */
++  @Test
++  public void testLargerValueWithoutRefTag() throws Exception {
++    init(500, false);
++
++    byte[] dummyData = makeDummyData(600); // larger than mob threshold
++    int createCount = compactionThreshold + 1;
++    for (int i = 0; i < createCount; i++) {
++      createStoreFile(i, dummyData);
++    }
++    assertEquals("Before compaction", createCount, countStoreFiles());
++    assertEquals("Before compaction", 0, countMobFiles());
++    assertTrue("Before compaction, check rows:", countRows() > 0);
++
++    region.compactStores();
++
++    assertEquals("After compaction", 1, countStoreFiles());
++    assertEquals("After compaction", 1, countMobFiles());
++    assertTrue("After compaction, check rows:", countRows() > 0);
++    assertEquals("After compaction", 1, countReferencedMobFiles());
++  }
++
++  /**
++   * This test will first generate store files, then bulk load them and trigger the compaction. When
++   * compaction, the cell value will be larger than the threshold.
++   */
++  @Test
++  public void testMobCompactionWithBulkload() throws Exception {
++
++    /**
++     * The following will produce store files of 600.
++     */
++
++    init(300, false);
++
++    byte[] dummyData = makeDummyData(600);
++    int createCount = compactionThreshold + 1;
++
++    Path hbaseRootDir = FSUtils.getRootDir(conf);
++    Path basedir = new Path(hbaseRootDir, tabDesc.getNameAsString());
++    List<Pair<byte[], String>> hfiles = new ArrayList<Pair<byte[], String>>(1);
++    for (int i = 0; i < createCount; i++) {
++      Path hpath = new Path(basedir, "hfile" + i);
++      hfiles.add(Pair.newPair(COLUMN_FAMILY, hpath.toString()));
++      createHFile(hpath, i, dummyData);
++    }
++
++    /**
++     * The following will bulk load the above generated store files and compact, with 600(fileSize)
++     * > 300(threshold)
++     */
++
++    boolean result = region.bulkLoadHFiles(hfiles, true);
++    assertTrue("Bulkload result:", result);
++    assertEquals("After bulkload, countStoreFiles:", createCount, countStoreFiles());
++    assertEquals("After bulkload, countMobFiles:", 0, countMobFiles());
++    assertTrue("After bulkload, check rows:", countRows() > 0);
++    assertEquals("After bulkload, countReferencedMobFiles:", 0, countReferencedMobFiles());
++
++    region.compactStores();
++
++    assertEquals("After compaction, countStoreFiles:", 1, countStoreFiles());
++    assertEquals("After compaction, countMobFiles:", 1, countMobFiles());
++    assertTrue("After compaction, check rows:", countRows() > 0);
++    assertEquals("After compaction, countReferencedMobFiles:", 1, countReferencedMobFiles());
++  }
++
++  private int countStoreFiles() throws IOException {
++    Store store = region.getStore(COLUMN_FAMILY);
++    return store.getStorefilesCount();
++  }
++
++  private int countMobFiles() throws IOException {
++    Path mobDirPath = new Path(MobUtils.getMobRegionPath(conf, tabDesc.getTableName()),
++        colDesc.getNameAsString());
++    if (fs.exists(mobDirPath)) {
++      FileStatus[] files = UTIL.getTestFileSystem().listStatus(mobDirPath);
++      return files.length;
++    }
++    return 0;
++  }
++
++  private void createStoreFile(int rowIdx, byte[] dummyData) throws IOException {
++    Put p = new Put(Bytes.add(STARTROW, Bytes.toBytes(rowIdx)));
++    p.setDurability(Durability.SKIP_WAL);
++    p.add(COLUMN_FAMILY, Bytes.toBytes("colX"), dummyData);
++    // HBaseTestCase.addContent(loader, Bytes.toString(COLUMN_FAMILY));
++
++    loader.put(p);
++    loader.flushcache();
++  }
++
++  /**
++   * Create an HFile with the given number of bytes
++   */
++  private void createHFile(Path path, int rowIdx, byte[] dummyData) throws IOException {
++    HFileContext meta = new HFileContextBuilder().build();
++    HFile.Writer writer = HFile.getWriterFactory(conf, new CacheConfig(conf)).withPath(fs, path)
++        .withFileContext(meta).create();
++    long now = System.currentTimeMillis();
++    try {
++      KeyValue kv = new KeyValue(Bytes.add(STARTROW, Bytes.toBytes(rowIdx)), COLUMN_FAMILY,
++          Bytes.toBytes("colX"), now, dummyData);
++      writer.append(kv);
++    } finally {
++      writer.appendFileInfo(StoreFile.BULKLOAD_TIME_KEY, Bytes.toBytes(System.currentTimeMillis()));
++      writer.close();
++    }
++  }
++
++  private int countRows() throws IOException {
++    Scan scan = new Scan();
++    // Do not retrieve the mob data when scanning
++    scan.setAttribute(MobConstants.MOB_SCAN_RAW, Bytes.toBytes(Boolean.TRUE));
++    InternalScanner scanner = region.getScanner(scan);
++
++    int scannedCount = 0;
++    List<Cell> results = new ArrayList<Cell>();
++    while (true) {
++      boolean existMore = scanner.next(results);
++      if (!results.isEmpty())
++        scannedCount++;
++      if (!existMore)
++        break;
++      results.clear();
++    }
++    scanner.close();
++
++    return scannedCount;
++  }
++
++  private byte[] makeDummyData(int size) {
++    byte[] dummyData = new byte[size];
++    new Random().nextBytes(dummyData);
++    return dummyData;
++  }
++
++  private int countReferencedMobFiles() throws IOException {
++    Scan scan = new Scan();
++    // Do not retrieve the mob data when scanning
++    scan.setAttribute(MobConstants.MOB_SCAN_RAW, Bytes.toBytes(Boolean.TRUE));
++    InternalScanner scanner = region.getScanner(scan);
++
++    List<Cell> kvs = new ArrayList<Cell>();
++    boolean hasMore = true;
++    String fileName;
++    Set<String> files = new HashSet<String>();
++    do {
++      kvs.clear();
++      hasMore = scanner.next(kvs);
++      for (Cell c : kvs) {
++        KeyValue kv = KeyValueUtil.ensureKeyValue(c);
++        if (MobUtils.isMobReferenceCell(kv)) {
++          if (kv.getValueLength() > Bytes.SIZEOF_LONG) {
++            long size = Bytes.toLong(kv.getValueArray(), kv.getValueOffset(), Bytes.SIZEOF_LONG);
++            if (size > mobCellThreshold) {
++              fileName = Bytes.toString(kv.getValueArray(),
++                  kv.getValueOffset() + Bytes.SIZEOF_LONG, kv.getValueLength() - Bytes.SIZEOF_LONG);
++
++              if (!fileName.isEmpty()) {
++                files.add(fileName);
++              }
++            }
++          }
++        }
++      }
++    } while (hasMore);
++
++    scanner.close();
++
++    return files.size();
++  }
++}

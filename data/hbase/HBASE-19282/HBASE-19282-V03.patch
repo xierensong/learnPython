@@ -1,0 +1,259 @@
+From d1228ae72039042a30780ebeccec7a07bdee2e1b Mon Sep 17 00:00:00 2001
+From: anastas <anastas@yahoo-inc.com>
+Date: Thu, 21 Dec 2017 15:51:35 +0200
+Subject: [PATCH] HBASE-19282: Making CellChunkMap the default index (CellSet
+ delegatee) for ImmutableSegments, when MSLAB is used. In order to avoid
+ additional user settings.
+
+---
+ .../hbase/regionserver/CompactingMemStore.java     | 45 +++++++++++++---------
+ .../hadoop/hbase/regionserver/MemStoreLABImpl.java |  7 ++--
+ .../hbase/regionserver/TestCompactingMemStore.java |  1 +
+ .../TestCompactingToCellFlatMapMemStore.java       | 35 +++++++----------
+ .../TestWalAndCompactingMemStoreFlush.java         |  9 ++++-
+ 5 files changed, 53 insertions(+), 44 deletions(-)
+
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
+index f1232f8..3099611 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
+@@ -58,16 +58,13 @@ public class CompactingMemStore extends AbstractMemStore {
+       "hbase.hregion.compacting.memstore.type";
+   public static final String COMPACTING_MEMSTORE_TYPE_DEFAULT =
+       String.valueOf(MemoryCompactionPolicy.BASIC);
+-  // The external setting of the compacting MemStore behaviour
+-  public static final String COMPACTING_MEMSTORE_INDEX_KEY =
+-      "hbase.hregion.compacting.memstore.index";
+-  // usage of CellArrayMap is default, later it will be decided how to use CellChunkMap
+-  public static final String COMPACTING_MEMSTORE_INDEX_DEFAULT =
+-      String.valueOf(IndexType.ARRAY_MAP);
+   // Default fraction of in-memory-flush size w.r.t. flush-to-disk size
+   public static final String IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY =
+       "hbase.memstore.inmemoryflush.threshold.factor";
+-  private static final double IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT = 0.02;
++  private static final double IN_MEMORY_FLUSH_THRESHOLD_FACTOR_CAM_DEFAULT = 0.02;
++  // working CellChunkMap index requires less frequent in-memory-flushes
++  // so we have more cells to fill into CCM's index chunk
++  private static final double IN_MEMORY_FLUSH_THRESHOLD_FACTOR_CCM_DEFAULT = 0.1;
+ 
+   private static final Log LOG = LogFactory.getLog(CompactingMemStore.class);
+   private HStore store;
+@@ -114,9 +111,16 @@ public class CompactingMemStore extends AbstractMemStore {
+     this.regionServices = regionServices;
+     this.pipeline = new CompactionPipeline(getRegionServices());
+     this.compactor = createMemStoreCompactor(compactionPolicy);
++    if (conf.getBoolean(MemStoreLAB.USEMSLAB_KEY, MemStoreLAB.USEMSLAB_DEFAULT)) {
++      // if user requested to work with MSLABs (whether on- or off-heap), then the
++      // immutable segments are going to use CellChunkMap as their index
++      indexType = IndexType.CHUNK_MAP;
++    } else {
++      indexType = IndexType.ARRAY_MAP;
++    }
++    // initialization of the flush size should happen after initialization of the index type
++    // so do not transfer the following method
+     initInmemoryFlushSize(conf);
+-    indexType = IndexType.valueOf(conf.get(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_DEFAULT));
+   }
+ 
+   @VisibleForTesting
+@@ -126,6 +130,7 @@ public class CompactingMemStore extends AbstractMemStore {
+   }
+ 
+   private void initInmemoryFlushSize(Configuration conf) {
++    double factor = 0;
+     long memstoreFlushSize = getRegionServices().getMemStoreFlushSize();
+     int numStores = getRegionServices().getNumStores();
+     if (numStores <= 1) {
+@@ -133,11 +138,17 @@ public class CompactingMemStore extends AbstractMemStore {
+       numStores = 1;
+     }
+     inmemoryFlushSize = memstoreFlushSize / numStores;
+-    // multiply by a factor
+-    double factor =  conf.getDouble(IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY,
+-        IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT);
++    // multiply by a factor (different factors for different index types)
++    if (indexType == IndexType.ARRAY_MAP) {
++        factor = conf.getDouble(IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY,
++            IN_MEMORY_FLUSH_THRESHOLD_FACTOR_CAM_DEFAULT);
++    } else {
++        factor = conf.getDouble(IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY,
++            IN_MEMORY_FLUSH_THRESHOLD_FACTOR_CCM_DEFAULT);
++    }
+     inmemoryFlushSize *= factor;
+-    LOG.info("Setting in-memory flush size threshold to " + inmemoryFlushSize);
++    LOG.info("Setting in-memory flush size threshold to " + inmemoryFlushSize
++        + " and immutable segments index to be of type " + indexType);
+   }
+ 
+   /**
+@@ -318,10 +329,8 @@ public class CompactingMemStore extends AbstractMemStore {
+ 
+   // setter is used only for testability
+   @VisibleForTesting
+-  public void setIndexType() {
+-    indexType = IndexType.valueOf(getConfiguration().get(
+-        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_DEFAULT));
++  public void setIndexType(IndexType type) {
++    indexType = type;
+   }
+ 
+   public IndexType getIndexType() {
+@@ -576,7 +585,7 @@ public class CompactingMemStore extends AbstractMemStore {
+   // debug method
+   public void debug() {
+     String msg = "active size=" + this.active.keySize();
+-    msg += " threshold="+IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT* inmemoryFlushSize;
++    msg += " in-memory flush size is "+ inmemoryFlushSize;
+     msg += " allow compaction is "+ (allowCompaction.get() ? "true" : "false");
+     msg += " inMemoryFlushInProgress is "+ (inMemoryFlushInProgress.get() ? "true" : "false");
+     LOG.debug(msg);
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+index 08588d2..d0be911 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+@@ -101,9 +101,10 @@ public class MemStoreLABImpl implements MemStoreLAB {
+     // if we don't exclude allocations >CHUNK_SIZE, we'd infiniteloop on one!
+     Preconditions.checkArgument(maxAlloc <= chunkSize,
+         MAX_ALLOC_KEY + " must be less than " + CHUNK_SIZE_KEY);
+-    idxType = CompactingMemStore.IndexType.valueOf(conf.get(
+-        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-        CompactingMemStore.COMPACTING_MEMSTORE_INDEX_DEFAULT));
++
++    // if user requested to work with MSLABs (whether on- or off-heap), then the
++    // immutable segments are going to use CellChunkMap as their index
++    idxType = CompactingMemStore.IndexType.CHUNK_MAP;
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+index 0f18dee..b874d3c 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+@@ -89,6 +89,7 @@ public class TestCompactingMemStore extends TestDefaultMemStore {
+     compactingSetUp();
+     this.memstore = new MyCompactingMemStore(HBaseConfiguration.create(), CellComparator.getInstance(),
+         store, regionServicesForStores, MemoryCompactionPolicy.EAGER);
++    ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.ARRAY_MAP);
+   }
+ 
+   protected void compactingSetUp() throws Exception {
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+index b4cf4ec..94fea1e 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+@@ -92,9 +92,9 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+     String[] keys1 = { "A", "A", "B", "C" }; //A1, A2, B3, C4
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
++    } else {
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.ARRAY_MAP);
+     }
+ 
+     // test 1 bucket
+@@ -137,9 +137,9 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+   public void testCompaction2Buckets() throws IOException {
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
++    } else {
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.ARRAY_MAP);
+     }
+     String[] keys1 = { "A", "A", "B", "C" };
+     String[] keys2 = { "A", "B", "D" };
+@@ -198,9 +198,10 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+   public void testCompaction3Buckets() throws IOException {
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
++    } else {
++      // set to CellArrayMap as CCM is configured by default due to MSLAB usage
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.ARRAY_MAP);
+     }
+     String[] keys1 = { "A", "A", "B", "C" };
+     String[] keys2 = { "A", "B", "D" };
+@@ -286,9 +287,7 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+   public void testMerging() throws IOException {
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
+     }
+     String[] keys1 = { "A", "A", "B", "C", "F", "H"};
+     String[] keys2 = { "A", "B", "D", "G", "I", "J"};
+@@ -358,9 +357,7 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+   public void testTimeRangeAfterCompaction() throws IOException {
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
+     }
+     testTimeRange(true);
+   }
+@@ -369,9 +366,7 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+   public void testTimeRangeAfterMerge() throws IOException {
+     if (toCellChunkMap) {
+       // set memstore to flat into CellChunkMap
+-      conf.set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-          String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-      ((CompactingMemStore)memstore).setIndexType();
++      ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
+     }
+     MemoryCompactionPolicy compactionType = MemoryCompactionPolicy.BASIC;
+     memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+@@ -615,9 +610,7 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore
+     memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+         String.valueOf(compactionType));
+     ((MyCompactingMemStore)memstore).initiateType(compactionType, memstore.getConfiguration());
+-    memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_INDEX_KEY,
+-        String.valueOf(CompactingMemStore.IndexType.CHUNK_MAP));
+-    ((CompactingMemStore)memstore).setIndexType();
++    ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
+     int numOfCells = 8;
+     String[] keys1 = { "A", "A", "B", "C", "D", "D", "E", "F" }; //A1, A2, B3, C4, D5, D6, E7, F8
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
+index 6a64796..f3bd7ee 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
+@@ -768,8 +768,7 @@ public class TestWalAndCompactingMemStoreFlush {
+     conf.setLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, 300 * 1024);
+     conf.set(FlushPolicyFactory.HBASE_FLUSH_POLICY_KEY,
+         FlushNonSloppyStoresFirstPolicy.class.getName());
+-    conf.setLong(FlushLargeStoresPolicy.HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN,
+-        75 * 1024);
++    conf.setLong(FlushLargeStoresPolicy.HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN, 75 * 1024);
+     conf.setDouble(CompactingMemStore.IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY, 0.8);
+     // set memstore to do index compaction with merge
+     conf.set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,
+@@ -797,6 +796,12 @@ public class TestWalAndCompactingMemStoreFlush {
+ 
+     long totalMemstoreSize = region.getMemStoreSize();
+ 
++    // test in-memory flashing into CAM here
++    ((CompactingMemStore) ((HStore)region.getStore(FAMILY1)).memstore).setIndexType(
++        CompactingMemStore.IndexType.ARRAY_MAP);
++    ((CompactingMemStore) ((HStore)region.getStore(FAMILY3)).memstore).setIndexType(
++        CompactingMemStore.IndexType.ARRAY_MAP);
++
+     // Find the sizes of the memstores of each CF.
+     MemStoreSize cf1MemstoreSizePhaseI = region.getStore(FAMILY1).getMemStoreSize();
+     MemStoreSize cf2MemstoreSizePhaseI = region.getStore(FAMILY2).getMemStoreSize();
+-- 
+1.8.5.2 (Apple Git-48)
+

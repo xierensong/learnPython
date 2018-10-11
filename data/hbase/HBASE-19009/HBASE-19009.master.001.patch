@@ -1,0 +1,559 @@
+From f91fd4c1f7f6ebeafd5fff504e14842c2a291ed0 Mon Sep 17 00:00:00 2001
+From: Guanghao Zhang <zghao@apache.org>
+Date: Sun, 15 Oct 2017 23:13:12 +0800
+Subject: [PATCH] HBASE-19009 implement enable/disableTableReplication for
+ AsyncAdmin
+
+---
+ .../org/apache/hadoop/hbase/client/AsyncAdmin.java |  18 ++
+ .../hadoop/hbase/client/AsyncHBaseAdmin.java       |  15 ++
+ .../org/apache/hadoop/hbase/client/HBaseAdmin.java |   2 +-
+ .../hadoop/hbase/client/RawAsyncHBaseAdmin.java    | 273 ++++++++++++++++++++-
+ .../client/replication/ReplicationSerDeHelper.java | 126 +++++++++-
+ 5 files changed, 431 insertions(+), 3 deletions(-)
+
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncAdmin.java
+index e539c6a..029c48c 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncAdmin.java
+@@ -136,6 +136,12 @@ public interface AsyncAdmin {
+    */
+   CompletableFuture<Void> createTable(TableDescriptor desc, Optional<byte[][]> splitKeys);
+ 
++  /*
++   * Modify an existing table, more IRB friendly version.
++   * @param desc modified description of the table
++   */
++  CompletableFuture<Void> modifyTable(TableDescriptor desc);
++
+   /**
+    * Deletes a table.
+    * @param tableName name of table to delete
+@@ -611,6 +617,18 @@ public interface AsyncAdmin {
+   CompletableFuture<List<TableCFs>> listReplicatedTableCFs();
+ 
+   /**
++   * Enable a table's replication switch.
++   * @param tableName name of the table
++   */
++  CompletableFuture<Void> enableTableReplication(TableName tableName);
++
++  /**
++   * Disable a table's replication switch.
++   * @param tableName name of the table
++   */
++  CompletableFuture<Void> disableTableReplication(TableName tableName);
++
++  /**
+    * Take a snapshot for the given table. If the table is enabled, a FLUSH-type snapshot will be
+    * taken. If the table is disabled, an offline snapshot is taken. Snapshots are considered unique
+    * based on <b>the name of the snapshot</b>. Attempts to take a snapshot with the same name (even
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
+index 3cb8360..bfe0b08 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncHBaseAdmin.java
+@@ -112,6 +112,11 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+   }
+ 
+   @Override
++  public CompletableFuture<Void> modifyTable(TableDescriptor desc) {
++    return wrap(rawAdmin.modifyTable(desc));
++  }
++
++  @Override
+   public CompletableFuture<Void> deleteTable(TableName tableName) {
+     return wrap(rawAdmin.deleteTable(tableName));
+   }
+@@ -391,6 +396,16 @@ public class AsyncHBaseAdmin implements AsyncAdmin {
+   }
+ 
+   @Override
++  public CompletableFuture<Void> enableTableReplication(TableName tableName) {
++    return wrap(rawAdmin.enableTableReplication(tableName));
++  }
++
++  @Override
++  public CompletableFuture<Void> disableTableReplication(TableName tableName) {
++    return wrap(rawAdmin.disableTableReplication(tableName));
++  }
++
++  @Override
+   public CompletableFuture<Void> snapshot(SnapshotDescription snapshot) {
+     return wrap(rawAdmin.snapshot(snapshot));
+   }
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+index 8665e84..455a1a9 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+@@ -4108,7 +4108,7 @@ public class HBaseAdmin implements Admin {
+       throw new IllegalArgumentException("Table name is null");
+     }
+     if (!tableExists(tableName)) {
+-      throw new TableNotFoundException("Table '" + tableName.getNamespaceAsString()
++      throw new TableNotFoundException("Table '" + tableName.getNameAsString()
+           + "' does not exists.");
+     }
+     setTableRep(tableName, false);
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RawAsyncHBaseAdmin.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RawAsyncHBaseAdmin.java
+index 589796a..8e40bb6 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RawAsyncHBaseAdmin.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/RawAsyncHBaseAdmin.java
+@@ -43,8 +43,11 @@ import java.util.stream.Stream;
+ import org.apache.commons.io.IOUtils;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.AsyncMetaTableAccessor;
+ import org.apache.hadoop.hbase.ClusterStatus;
++import org.apache.hadoop.hbase.CompoundConfiguration;
++import org.apache.hadoop.hbase.HBaseConfiguration;
+ import org.apache.hadoop.hbase.ClusterStatus.Option;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.HRegionLocation;
+@@ -194,6 +197,8 @@ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyColu
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyColumnResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyNamespaceRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyNamespaceResponse;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyTableRequest;
++import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.ModifyTableResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.MoveRegionRequest;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.MoveRegionResponse;
+ import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProtos.NormalizeRequest;
+@@ -488,6 +493,17 @@ public class RawAsyncHBaseAdmin implements AsyncAdmin {
+   }
+ 
+   @Override
++  public CompletableFuture<Void> modifyTable(TableDescriptor desc) {
++    return this.<Void> newMasterCaller()
++        .action((controller, stub) -> this.<ModifyTableRequest, ModifyTableResponse, Void> call(
++          controller, stub,
++          RequestConverter.buildModifyTableRequest(desc.getTableName(), desc, ng.getNonceGroup(),
++            ng.newNonce()),
++          (s, c, req, done) -> s.modifyTable(c, req, done), (resp) -> null))
++        .call();
++  }
++
++  @Override
+   public CompletableFuture<Void> deleteTable(TableName tableName) {
+     return this.<DeleteTableRequest, DeleteTableResponse> procedureCall(RequestConverter
+         .buildDeleteTableRequest(tableName, ng.getNonceGroup(), ng.newNonce()),
+@@ -2935,4 +2951,259 @@ public class RawAsyncHBaseAdmin implements AsyncAdmin {
+         .pause(pauseNs, TimeUnit.NANOSECONDS).maxAttempts(maxAttempts)
+         .startLogErrorsCnt(startLogErrorsCnt);
+   }
+-}
++
++  @Override
++  public CompletableFuture<Void> enableTableReplication(TableName tableName) {
++    if (tableName == null) {
++      return failedFuture(new IllegalArgumentException("Table name is null"));
++    }
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    tableExists(tableName).whenComplete((exist, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      if (!exist) {
++        future.completeExceptionally(new TableNotFoundException(
++            "Table '" + tableName.getNameAsString() + "' does not exists."));
++        return;
++      }
++      getTableSplits(tableName).whenComplete((splits, err1) -> {
++        if (err1 != null) {
++          future.completeExceptionally(err1);
++        } else {
++          checkAndSyncTableToPeers(tableName, splits).whenComplete((result, err2) -> {
++            if (err2 != null) {
++              future.completeExceptionally(err2);
++            } else {
++              setTableReplication(tableName, true).whenComplete((result3, err3) -> {
++                if (err3 != null) {
++                  future.completeExceptionally(err3);
++                } else {
++                  future.complete(result3);
++                }
++              });
++            }
++          });
++        }
++      });
++    });
++    return future;
++  }
++
++  @Override
++  public CompletableFuture<Void> disableTableReplication(TableName tableName) {
++    if (tableName == null) {
++      return failedFuture(new IllegalArgumentException("Table name is null"));
++    }
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    tableExists(tableName).whenComplete((exist, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      if (!exist) {
++        future.completeExceptionally(new TableNotFoundException(
++            "Table '" + tableName.getNameAsString() + "' does not exists."));
++        return;
++      }
++      setTableReplication(tableName, false).whenComplete((result, err2) -> {
++        if (err2 != null) {
++          future.completeExceptionally(err2);
++        } else {
++          future.complete(result);
++        }
++      });
++    });
++    return future;
++  }
++
++  private CompletableFuture<byte[][]> getTableSplits(TableName tableName) {
++    CompletableFuture<byte[][]> future = new CompletableFuture<>();
++    getTableRegions(tableName).whenComplete((regions, err2) -> {
++      if (err2 != null) {
++        future.completeExceptionally(err2);
++        return;
++      }
++      if (regions.size() == 1) {
++        future.complete(null);
++      } else {
++        byte[][] splits = new byte[regions.size() - 1][];
++        for (int i = 1; i < regions.size(); i++) {
++          splits[i - 1] = regions.get(i).getStartKey();
++        }
++        future.complete(splits);
++      }
++    });
++    return future;
++  }
++
++  /**
++   * Connect to peer and check the table descriptor on peer:
++   * <ol>
++   * <li>Create the same table on peer when not exist.</li>
++   * <li>Throw an exception if the table already has replication enabled on any of the column
++   * families.</li>
++   * <li>Throw an exception if the table exists on peer cluster but descriptors are not same.</li>
++   * </ol>
++   * @param tableName name of the table to sync to the peer
++   * @param splits table split keys
++   * @throws IOException
++   */
++  private CompletableFuture<Void> checkAndSyncTableToPeers(TableName tableName, byte[][] splits) {
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    listReplicationPeers().whenComplete((peers, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      if (peers == null || peers.size() <= 0) {
++        future.completeExceptionally(
++          new IllegalArgumentException("Found no peer cluster for replication."));
++        return;
++      }
++      List<CompletableFuture<Void>> futures = new ArrayList<>();
++      peers.stream().filter(peer -> ReplicationSerDeHelper.needToReplicate(tableName, peer))
++          .forEach(peer -> {
++            futures.add(trySyncTableToPeerCluster(tableName, splits, peer));
++          });
++      CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[futures.size()]))
++          .whenComplete((result, err2) -> {
++            if (err2 != null) {
++              future.completeExceptionally(err2);
++            } else {
++              future.complete(result);
++            }
++          });
++    });
++    return future;
++  }
++
++  private CompletableFuture<Void> trySyncTableToPeerCluster(TableName tableName,
++      byte[][] splits, ReplicationPeerDescription peer) {
++    Configuration peerConf = null;
++    try {
++      peerConf = getPeerClusterConfiguration(peer);
++    } catch (IOException e) {
++      return failedFuture(e);
++    }
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    ConnectionFactory.createAsyncConnection(peerConf).whenComplete((conn, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      getTableDescriptor(tableName).whenComplete((tableDesc, err1) -> {
++        if (err1 != null) {
++          future.completeExceptionally(err1);
++          return;
++        }
++        AsyncAdmin peerAdmin = conn.getAdmin();
++        peerAdmin.tableExists(tableName).whenComplete((exist, err2) -> {
++          if (err2 != null) {
++            future.completeExceptionally(err2);
++            return;
++          }
++          if (!exist) {
++            peerAdmin.createTable(tableDesc, Optional.ofNullable(splits)).whenComplete((result, err3) -> {
++              if (err3 != null) {
++                future.completeExceptionally(err3);
++              } else {
++                future.complete(result);
++              }
++            });
++          } else {
++            compareTableWithPeerCluster(tableName, tableDesc, peer, peerAdmin, future);
++          }
++        });
++      });
++    });
++    return future;
++  }
++
++  private void compareTableWithPeerCluster(TableName tableName, TableDescriptor tableDesc,
++      ReplicationPeerDescription peer, AsyncAdmin peerAdmin, CompletableFuture<Void> future) {
++    peerAdmin.getTableDescriptor(tableName).whenComplete((peerTableDesc, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      if (peerTableDesc == null) {
++        future.completeExceptionally(
++          new IllegalArgumentException("Failed to get table descriptor for table "
++              + tableName.getNameAsString() + " from peer cluster " + peer.getPeerId()));
++        return;
++      }
++      if (!ReplicationSerDeHelper.compareIgnoreReplication(peerTableDesc, tableDesc)) {
++        future.completeExceptionally(new IllegalArgumentException(
++            "Table " + tableName.getNameAsString() + " exists in peer cluster " + peer.getPeerId()
++                + ", but the table descriptors are not same when compared with source cluster."
++                + " Thus can not enable the table's replication switch."));
++        return;
++      }
++      future.complete(null);
++    });
++  }
++
++  /**
++   * Returns the configuration needed to talk to the remote slave cluster.
++   * @param peer the description of replication peer
++   * @return the configuration for the peer cluster, null if it was unable to get the configuration
++   * @throws IOException
++   */
++  private Configuration getPeerClusterConfiguration(ReplicationPeerDescription peer)
++      throws IOException {
++    ReplicationPeerConfig peerConfig = peer.getPeerConfig();
++    Configuration otherConf;
++    try {
++      otherConf = HBaseConfiguration.createClusterConf(connection.getConfiguration(), peerConfig.getClusterKey());
++    } catch (IOException e) {
++      throw new IOException("Can't get peer configuration for peerId=" + peer.getPeerId(), e);
++    }
++
++    if (!peerConfig.getConfiguration().isEmpty()) {
++      CompoundConfiguration compound = new CompoundConfiguration();
++      compound.add(otherConf);
++      compound.addStringMap(peerConfig.getConfiguration());
++      return compound;
++    }
++
++    return otherConf;
++  }
++
++  /**
++   * Set the table's replication switch if the table's replication switch is already not set.
++   * @param tableName name of the table
++   * @param enableRep is replication switch enable or disable
++   */
++  private CompletableFuture<Void> setTableReplication(TableName tableName, boolean enableRep) {
++    CompletableFuture<Void> future = new CompletableFuture<>();
++    getTableDescriptor(tableName).whenComplete((tableDesc, err) -> {
++      if (err != null) {
++        future.completeExceptionally(err);
++        return;
++      }
++      ReplicationSerDeHelper.ReplicationState currentReplicationState =
++          ReplicationSerDeHelper.getTableReplicationState(tableDesc);
++      if (enableRep && currentReplicationState != ReplicationSerDeHelper.ReplicationState.ENABLED
++          || !enableRep
++              && currentReplicationState != ReplicationSerDeHelper.ReplicationState.DISABLED) {
++        TableDescriptorBuilder builder = TableDescriptorBuilder.newBuilder(tableDesc);
++        tableDesc.getColumnFamilyNames().forEach(builder::removeColumnFamily);
++        for (ColumnFamilyDescriptor cf : tableDesc.getColumnFamilies()) {
++          builder.addColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(cf).setScope(
++            enableRep ? HConstants.REPLICATION_SCOPE_GLOBAL : HConstants.REPLICATION_SCOPE_LOCAL)
++              .build());
++        }
++        modifyTable(builder.build()).whenComplete((result, err2) -> {
++          if (err2 != null) {
++            future.completeExceptionally(err2);
++          } else {
++            future.complete(result);
++          }
++        });
++      }
++    });
++    return future;
++  }
++}
+\ No newline at end of file
+diff --git a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/replication/ReplicationSerDeHelper.java b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/replication/ReplicationSerDeHelper.java
+index 986a09f..c11fb84 100644
+--- a/hbase-client/src/main/java/org/apache/hadoop/hbase/client/replication/ReplicationSerDeHelper.java
++++ b/hbase-client/src/main/java/org/apache/hadoop/hbase/client/replication/ReplicationSerDeHelper.java
+@@ -23,7 +23,11 @@ import org.apache.hadoop.hbase.shaded.com.google.protobuf.ByteString;
+ import org.apache.hadoop.hbase.shaded.com.google.protobuf.UnsafeByteOperations;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.TableName;
++import org.apache.hadoop.hbase.client.ColumnFamilyDescriptor;
++import org.apache.hadoop.hbase.client.ColumnFamilyDescriptorBuilder;
++import org.apache.hadoop.hbase.client.TableDescriptor;
+ import org.apache.yetus.audience.InterfaceAudience;
+ import org.apache.yetus.audience.InterfaceStability;
+ import org.apache.hadoop.hbase.exceptions.DeserializationException;
+@@ -40,11 +44,14 @@ import org.apache.hadoop.hbase.shaded.com.google.common.collect.Lists;
+ 
+ import java.io.IOException;
+ import java.util.Collection;
++import java.util.Comparator;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.HashMap;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Set;
+ 
+ /**
+@@ -434,4 +441,121 @@ public final class ReplicationSerDeHelper {
+       }
+     }
+   }
+-}
++
++  /**
++   * Compare the contents of the descriptor with another one passed as a parameter for replication
++   * purpose. The REPLICATION_SCOPE field is ignored during comparison.
++   * @param peerDesc descriptor on peer cluster
++   * @param localDesc descriptor on source cluster which needs to be replicated.
++   * @return true if the contents of the two descriptors match (ignoring just REPLICATION_SCOPE).
++   */
++  public static boolean compareIgnoreReplication(TableDescriptor peerDesc,
++      TableDescriptor localDesc) {
++    if (peerDesc == localDesc) {
++      return true;
++    }
++    if (peerDesc == null || localDesc == null) {
++      return false;
++    }
++
++    int result = peerDesc.getTableName().compareTo(localDesc.getTableName());
++    if (result != 0) {
++      return false;
++    }
++    Collection<ColumnFamilyDescriptor> peerFamilies = Arrays.asList(peerDesc.getColumnFamilies());
++    Collection<ColumnFamilyDescriptor> localFamilies = Arrays.asList(localDesc.getColumnFamilies());
++    result = Integer.compare(peerFamilies.size(), localFamilies.size());
++    if (result != 0) {
++      return false;
++    }
++
++    for (Iterator<ColumnFamilyDescriptor> it = peerFamilies.iterator(), it2 =
++        localFamilies.iterator(); it.hasNext();) {
++      result = CF_COMPARATOR_IGNORE_REPLICATION.compare(it.next(), it2.next());
++      if (result != 0) {
++        return false;
++      }
++    }
++    // punt on comparison for ordering, just calculate difference
++    return Integer.compare(peerDesc.getValues().hashCode(), localDesc.getValues().hashCode()) == 0;
++  }
++
++  private static final Bytes REPLICATION_SCOPE_BYTES =
++      new Bytes(Bytes.toBytes(ColumnFamilyDescriptorBuilder.REPLICATION_SCOPE));
++
++  private static final Comparator<ColumnFamilyDescriptor> CF_COMPARATOR_IGNORE_REPLICATION =
++      (ColumnFamilyDescriptor lcf, ColumnFamilyDescriptor rcf) -> {
++        int result = Bytes.compareTo(lcf.getName(), rcf.getName());
++        if (result != 0) {
++          return result;
++        }
++        Map<Bytes, Bytes> lValues = lcf.getValues();
++        Map<Bytes, Bytes> rValues = rcf.getValues();
++        lValues.remove(REPLICATION_SCOPE_BYTES);
++        rValues.remove(REPLICATION_SCOPE_BYTES);
++        // punt on comparison for ordering, just calculate difference.
++        result = lValues.hashCode() - rValues.hashCode();
++        if (result != 0) {
++          return result;
++        }
++        return lcf.getConfiguration().hashCode() - rcf.getConfiguration().hashCode();
++      };
++
++  /**
++   * Decide whether the table need replicate to the peer cluster according to the peer config
++   * @param table name of the table
++   * @param peer config for the peer
++   * @return true if the table need replicate to the peer cluster
++   */
++  public static boolean needToReplicate(TableName table, ReplicationPeerDescription peer) {
++    ReplicationPeerConfig peerConfig = peer.getPeerConfig();
++    Set<String> namespaces = peerConfig.getNamespaces();
++    Map<TableName, List<String>> tableCFsMap = peerConfig.getTableCFsMap();
++    // If null means user has explicitly not configured any namespaces and table CFs
++    // so all the tables data are applicable for replication
++    if (namespaces == null && tableCFsMap == null) {
++      return true;
++    }
++    if (namespaces != null && namespaces.contains(table.getNamespaceAsString())) {
++      return true;
++    }
++    if (tableCFsMap != null && tableCFsMap.containsKey(table)) {
++      return true;
++    }
++    LOG.debug(
++      "Table " + table.getNameAsString() + " doesn't need replicate to peer cluster, peerId="
++          + peer.getPeerId() + ", clusterKey=" + peerConfig.getClusterKey());
++    return false;
++  }
++
++  /**
++   * This enum indicates the current state of the replication for a given table.
++   */
++  public enum ReplicationState {
++    ENABLED, // all column families enabled
++    MIXED, // some column families enabled, some disabled
++    DISABLED // all column families disabled
++  }
++
++  /**
++   * @param htd table descriptor details for the table to check
++   * @return ReplicationState the current state of the table.
++   */
++  public static ReplicationState getTableReplicationState(TableDescriptor desc) {
++    boolean hasEnabled = false;
++    boolean hasDisabled = false;
++
++    for (ColumnFamilyDescriptor cf : desc.getColumnFamilies()) {
++      if (cf.getScope() != HConstants.REPLICATION_SCOPE_GLOBAL
++          && cf.getScope() != HConstants.REPLICATION_SCOPE_SERIAL) {
++        hasDisabled = true;
++      } else {
++        hasEnabled = true;
++      }
++    }
++
++    if (hasEnabled && hasDisabled) return ReplicationState.MIXED;
++    if (hasEnabled) return ReplicationState.ENABLED;
++    return ReplicationState.DISABLED;
++  }
++}
+\ No newline at end of file
+-- 
+2.7.4
+

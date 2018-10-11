@@ -1,0 +1,390 @@
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 02a5084..dc03c59 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -366,6 +366,10 @@ public class  HRegionServer implements ClientProtocol,
+   // HLog and HLog roller. log is protected rather than private to avoid
+   // eclipse warning when accessed by inner classes
+   protected volatile HLog hlog;
++  // Optionally, the meta updates are written to a different hlog. If this
++  // regionserver holds meta, then this field will be non-null.
++  protected volatile HLog hlogForMeta;
++  
+   LogRoller hlogRoller;
+ 
+   // flag set after we're done setting up server threads (used for testing)
+@@ -1397,23 +1401,45 @@ public class  HRegionServer implements ClientProtocol,
+     // log directories.
+     createNewReplicationInstance(conf, this, this.fs, logdir, oldLogDir);
+     
+-    return instantiateHLog(rootDir, logName);
++    return instantiateHLog(rootDir, logName, false);
++  }
++
++  /**
++   * Setup WAL log and replication if enabled.
++   * Replication setup is done in here because it wants to be hooked up to WAL.
++   * @return A WAL instance.
++   * @throws IOException
++   */
++  @Override
++  public HLog setupMetaWAL() throws IOException {
++    if (this.hlogForMeta == null) {
++      final Path oldLogDir = new Path(rootDir, HConstants.HREGION_OLDLOGDIR_NAME);
++      final String logName
++      = HLogUtil.getHLogDirectoryName(this.serverNameFromMasterPOV.toString());
++
++      Path logdir = new Path(rootDir, logName);
++      if (LOG.isDebugEnabled()) LOG.debug("logdir=" + logdir);
++
++      return instantiateHLog(rootDir, logName, true);
++    }
++    return this.hlogForMeta;
+   }
+ 
+   /**
+    * Called by {@link #setupWALAndReplication()} creating WAL instance.
++   * @param forMeta TODO
+    * @param logdir
+    * @param oldLogDir
+    * @return WAL instance.
+    * @throws IOException
+    */
+-  protected HLog instantiateHLog(Path rootdir, String logName) throws IOException {
++  protected HLog instantiateHLog(Path rootdir, String logName, boolean forMeta) throws IOException {
+     return HLogFactory.createHLog(this.fs.getBackingFs(), rootdir, logName, this.conf,
+-      getWALActionListeners(), this.serverNameFromMasterPOV.toString());
++      getWALActionListeners(), this.serverNameFromMasterPOV.toString(), forMeta);
+   }
+ 
+   /**
+-   * Called by {@link #instantiateHLog(Path, Path)} setting up WAL instance.
++   * Called by {@link #instantiateHLog(Path, Path, boolean)} setting up WAL instance.
+    * Add any {@link WALActionsListener}s you want inserted before WAL startup.
+    * @return List of WALActionsListener that will be passed in to
+    * {@link FSHLog} on construction.
+@@ -3971,4 +3997,9 @@ public class  HRegionServer implements ClientProtocol,
+       this.s = s;
+     }
+   }
++
++  @Override
++  public HLog getMetaWAL() {
++    return this.hlogForMeta;
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java
+new file mode 100644
+index 0000000..bb5348d
+--- /dev/null
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetaServices.java
+@@ -0,0 +1,15 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
++
++/**
++ * This class has methods that others invoke to do meta specific stuff. For
++ * example, .meta. file could be created with a higher replication, etc. 
++ *
++ */
++interface MetaServices {
++  public HLog getMetaWAL();
++  public HLog setupMetaWAL() throws IOException;
++}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+index 8583113..a1d897c 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+@@ -32,7 +32,7 @@ import org.apache.zookeeper.KeeperException;
+  * Services provided by {@link HRegionServer}
+  */
+ @InterfaceAudience.Private
+-public interface RegionServerServices extends OnlineRegions {
++public interface RegionServerServices extends OnlineRegions, MetaServices {
+   /**
+    * @return True if this regionserver is stopping.
+    */
+@@ -40,7 +40,7 @@ public interface RegionServerServices extends OnlineRegions {
+ 
+   /** @return the HLog */
+   public HLog getWAL();
+-
++  
+   /**
+    * @return Implementation of {@link CompactionRequestor} or null.
+    */
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
+index 0c1929c..9b8d828 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenMetaHandler.java
+@@ -18,11 +18,15 @@
+  */
+ package org.apache.hadoop.hbase.regionserver.handler;
+ 
++
++import java.io.IOException;
++
+ import org.apache.hadoop.classification.InterfaceAudience;
+ import org.apache.hadoop.hbase.HRegionInfo;
+ import org.apache.hadoop.hbase.HTableDescriptor;
+ import org.apache.hadoop.hbase.Server;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
+ 
+ /**
+  * Handles opening of a meta region on a region server.
+@@ -42,4 +46,13 @@ public class OpenMetaHandler extends OpenRegionHandler {
+     super(server, rsServices, regionInfo, htd, EventType.M_RS_OPEN_META,
+         versionOfOfflineNode);
+   }
++  @Override
++  public void process() throws IOException {
++    rsServices.setupMetaWAL();
++    super.process();
++  }
++  @Override
++  protected HLog getWAL() {
++    return rsServices.getMetaWAL();
++  }
+ }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+index 074ef8f..b60d7fc 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+@@ -31,6 +31,7 @@ import org.apache.hadoop.hbase.executor.EventHandler;
+ import org.apache.hadoop.hbase.regionserver.HRegion;
+ import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
+ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
++import org.apache.hadoop.hbase.regionserver.wal.HLog;
+ import org.apache.hadoop.hbase.util.CancelableProgressable;
+ import org.apache.hadoop.hbase.zookeeper.ZKAssign;
+ import org.apache.zookeeper.KeeperException;
+@@ -44,7 +45,7 @@ import org.apache.zookeeper.KeeperException;
+ public class OpenRegionHandler extends EventHandler {
+   private static final Log LOG = LogFactory.getLog(OpenRegionHandler.class);
+ 
+-  private final RegionServerServices rsServices;
++  protected final RegionServerServices rsServices;
+ 
+   private final HRegionInfo regionInfo;
+   private final HTableDescriptor htd;
+@@ -343,7 +344,7 @@ public class OpenRegionHandler extends EventHandler {
+       // Instantiate the region.  This also periodically tickles our zk OPENING
+       // state so master doesn't timeout this region in transition.
+       region = HRegion.openHRegion(this.regionInfo, this.htd,
+-          this.rsServices.getWAL(), this.server.getConfiguration(),
++          getWAL(), this.server.getConfiguration(),
+           this.rsServices,
+         new CancelableProgressable() {
+           public boolean progress() {
+@@ -372,6 +373,10 @@ public class OpenRegionHandler extends EventHandler {
+     return region;
+   }
+ 
++  protected HLog getWAL() {
++    return this.rsServices.getWAL();
++  }
++
+   private void cleanupFailedOpen(final HRegion region) throws IOException {
+     if (region != null) region.close();
+   }
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+index 103ec59..0139266 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+@@ -61,6 +61,8 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.FSUtils;
+ import org.apache.hadoop.hbase.util.HasThread;
+ import org.apache.hadoop.hbase.util.Threads;
++import org.apache.hadoop.hdfs.protocol.FSConstants;
++import org.apache.hadoop.hdfs.server.common.HdfsConstants;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ /**
+@@ -154,6 +156,8 @@ class FSHLog implements HLog, Syncable {
+ 
+   private final AtomicLong logSeqNum = new AtomicLong(0);
+ 
++  private boolean forMeta = false;
++
+   // The timestamp (in ms) when the log file was created.
+   private volatile long filenum = -1;
+ 
+@@ -219,7 +223,7 @@ class FSHLog implements HLog, Syncable {
+                 final Configuration conf)
+   throws IOException {
+     this(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
+-        conf, null, true, null);
++        conf, null, true, null, false);
+   }
+   
+   /**
+@@ -236,7 +240,7 @@ class FSHLog implements HLog, Syncable {
+                 final String oldLogName, final Configuration conf)
+   throws IOException {
+     this(fs, root, logName, oldLogName, 
+-        conf, null, true, null);
++        conf, null, true, null, false);
+   }
+ 
+   /**
+@@ -249,7 +253,6 @@ class FSHLog implements HLog, Syncable {
+    * @param fs filesystem handle
+    * @param root path for stored and archived hlogs
+    * @param logName dir where hlogs are stored
+-   * @param oldLogName dir where hlogs are archived
+    * @param conf configuration to use
+    * @param listeners Listeners on WAL events. Listeners passed here will
+    * be registered before we do anything else; e.g. the
+@@ -257,13 +260,14 @@ class FSHLog implements HLog, Syncable {
+    * @param prefix should always be hostname and port in distributed env and
+    *        it will be URL encoded before being used.
+    *        If prefix is null, "hlog" will be used
++   * @param oldLogName dir where hlogs are archived
+    * @throws IOException
+    */
+   public FSHLog(final FileSystem fs, final Path root, final String logName,
+       final Configuration conf, final List<WALActionsListener> listeners,
+       final String prefix) throws IOException {
+     this(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
+-        conf, listeners, true, prefix);
++        conf, listeners, true, prefix, false);
+   }
+ 
+   /**
+@@ -275,7 +279,6 @@ class FSHLog implements HLog, Syncable {
+    *
+    * @param fs filesystem handle
+    * @param root path to where logs and oldlogs
+-   * @param oldLogDir path to where hlogs are archived
+    * @param conf configuration to use
+    * @param listeners Listeners on WAL events. Listeners passed here will
+    * be registered before we do anything else; e.g. the
+@@ -284,18 +287,21 @@ class FSHLog implements HLog, Syncable {
+    * @param prefix should always be hostname and port in distributed env and
+    *        it will be URL encoded before being used.
+    *        If prefix is null, "hlog" will be used
++   * @param forMeta if this hlog is meant for meta updates
++   * @param oldLogDir path to where hlogs are archived
+    * @throws IOException
+    */
+-  private FSHLog(final FileSystem fs, final Path root, final String logName,
++  public FSHLog(final FileSystem fs, final Path root, final String logName,
+       final String oldLogName, final Configuration conf, 
+       final List<WALActionsListener> listeners,
+-      final boolean failIfLogDirExists, final String prefix)
++      final boolean failIfLogDirExists, final String prefix, boolean forMeta)
+   throws IOException {
+     super();
+     this.fs = fs;
+     this.rootDir = root;
+     this.dir = new Path(this.rootDir, logName);
+     this.oldLogDir = new Path(this.rootDir, oldLogName);
++    this.forMeta = forMeta;
+     this.conf = conf;
+    
+     if (listeners != null) {
+@@ -334,11 +340,12 @@ class FSHLog implements HLog, Syncable {
+     // If prefix is null||empty then just name it hlog
+     this.prefix = prefix == null || prefix.isEmpty() ?
+         "hlog" : URLEncoder.encode(prefix, "UTF8");
+-   
+-    if (failIfLogDirExists && this.fs.exists(dir)) {
++
++    boolean dirExists = false;
++    if (failIfLogDirExists && (dirExists = this.fs.exists(dir))) {
+       throw new IOException("Target HLog directory already exists: " + dir);
+     }
+-    if (!fs.mkdirs(dir)) {
++    if (!dirExists && !fs.mkdirs(dir)) {
+       throw new IOException("Unable to mkdir " + dir);
+     }
+ 
+@@ -484,6 +491,7 @@ class FSHLog implements HLog, Syncable {
+       long currentFilenum = this.filenum;
+       Path oldPath = null;
+       if (currentFilenum > 0) {
++        //computeFilename  will take care of meta hlog filename
+         oldPath = computeFilename(currentFilenum);
+       }
+       this.filenum = System.currentTimeMillis();
+@@ -562,6 +570,9 @@ class FSHLog implements HLog, Syncable {
+    */
+   protected Writer createWriterInstance(final FileSystem fs, final Path path,
+       final Configuration conf) throws IOException {
++    if (forMeta) {
++      //set a higher replication for the hlog files (HBASE-6773)
++    }
+     return HLogFactory.createWriter(fs, path, conf);
+   }
+ 
+@@ -730,7 +741,11 @@ class FSHLog implements HLog, Syncable {
+     if (filenum < 0) {
+       throw new RuntimeException("hlog file number can't be < 0");
+     }
+-    return new Path(dir, prefix + "." + filenum);
++    String child = prefix + "." + filenum;
++    if (forMeta) {
++      child += ".META";
++    }
++    return new Path(dir, child);
+   }
+ 
+   @Override
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
+index ea83c87..c419824 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLogFactory.java
+@@ -26,9 +26,9 @@ import java.util.List;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
+ import org.apache.hadoop.hbase.regionserver.wal.HLog.Writer;
+ 
+@@ -47,7 +47,11 @@ public class HLogFactory {
+     
+     public static HLog createHLog(final FileSystem fs, final Path root, final String logName,
+         final Configuration conf, final List<WALActionsListener> listeners,
+-        final String prefix) throws IOException {
++        final String prefix, boolean forMeta) throws IOException {
++      if (forMeta) {
++        return new FSHLog(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
++            conf, listeners, false, prefix, true);
++      }
+       return new FSHLog(fs, root, logName, conf, listeners, prefix);
+     }
+     
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
+index fb72e0f..fcd57ed 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestWALActionsListener.java
+@@ -88,7 +88,7 @@ public class TestWALActionsListener {
+     list.add(observer);
+     DummyWALActionsListener laterobserver = new DummyWALActionsListener();
+     HLog hlog = HLogFactory.createHLog(fs, TEST_UTIL.getDataTestDir(), logName,
+-                                       conf, list, null);
++                                       conf, list, null, false);
+     HRegionInfo hri = new HRegionInfo(SOME_BYTES,
+              SOME_BYTES, SOME_BYTES, false);
+ 
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+index a167445..65cccb0 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+@@ -169,7 +169,7 @@ public class TestReplicationSourceManager {
+     List<WALActionsListener> listeners = new ArrayList<WALActionsListener>();
+     listeners.add(replication);
+     HLog hlog = HLogFactory.createHLog(fs, utility.getDataTestDir(), logName,
+-        conf, listeners, URLEncoder.encode("regionserver:60020", "UTF8"));
++        conf, listeners, URLEncoder.encode("regionserver:60020", "UTF8"), false);
+ 
+     manager.init();
+     HTableDescriptor htd = new HTableDescriptor();

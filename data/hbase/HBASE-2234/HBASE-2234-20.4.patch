@@ -1,0 +1,396 @@
+Index: src/test/org/apache/hadoop/hbase/regionserver/TestLogRolling.java
+===================================================================
+--- src/test/org/apache/hadoop/hbase/regionserver/TestLogRolling.java	(revision 5108)
++++ src/test/org/apache/hadoop/hbase/regionserver/TestLogRolling.java	(working copy)
+@@ -19,11 +19,14 @@
+  */
+ package org.apache.hadoop.hbase.regionserver;
+ 
++import java.io.OutputStream;
++import java.lang.reflect.Method;
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.commons.logging.impl.Log4JLogger;
+ import org.apache.hadoop.hbase.HBaseClusterTestCase;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HConstants;
+@@ -32,6 +35,13 @@
+ import org.apache.hadoop.hbase.client.HTable;
+ import org.apache.hadoop.hbase.client.Put;
+ import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hdfs.DFSClient;
++import org.apache.hadoop.hdfs.MiniDFSCluster.DataNodeProperties;
++import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
++import org.apache.hadoop.hdfs.server.datanode.DataNode;
++import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
++import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
++import org.apache.log4j.Level;
+ 
+ /**
+  * Test log deletion as logs are rolled.
+@@ -42,6 +52,17 @@
+   private HLog log;
+   private String tableName;
+   private byte[] value;
++
++  // verbose logging on classes that are touched in these tests
++  {
++    ((Log4JLogger)DataNode.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)LeaseManager.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)FSNamesystem.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)DFSClient.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)HRegionServer.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)HRegion.LOG).getLogger().setLevel(Level.ALL);
++    ((Log4JLogger)HLog.LOG).getLogger().setLevel(Level.ALL);
++  }
+   
+   /**
+    * constructor
+@@ -70,9 +91,10 @@
+   }
+ 
+   // Need to override this setup so we can edit the config before it gets sent
+-  // to the cluster startup.
++  // to the HDFS & HBase cluster startup.
+   @Override
+-  protected void preHBaseClusterSetup() {
++  protected void setUp() throws Exception {
++    /**** configuration for testLogRolling ****/
+     // Force a region split after every 768KB
+     conf.setLong("hbase.hregion.max.filesize", 768L * 1024L);
+ 
+@@ -90,10 +112,23 @@
+ 
+     // Increase the amount of time between client retries
+     conf.setLong("hbase.client.pause", 15 * 1000);
+-
++    
+     // Reduce thread wake frequency so that other threads can get
+     // a chance to run.
+     conf.setInt(HConstants.THREAD_WAKE_FREQUENCY, 2 * 1000);
++
++    /**** configuration for testLogRollOnDatanodeDeath ****/
++    // make sure log.hflush() calls syncFs() to open a pipeline
++    conf.setBoolean("dfs.support.append", true);
++    // lower the namenode & datanode heartbeat so the namenode 
++    // quickly detects datanode failures
++    conf.setInt("heartbeat.recheck.interval", 5000);
++    conf.setInt("dfs.heartbeat.interval", 1);
++    // the namenode might still try to choose the recently-dead datanode 
++    // for a pipeline, so try to a new pipeline multiple times
++    conf.setInt("dfs.client.block.write.retries", 30);
++    
++    super.setUp();
+   }
+   
+   private void startAndWriteData() throws Exception {
+@@ -158,5 +193,89 @@
+       throw e;
+     }
+   }
++  
++  void writeData(HTable table, int rownum) throws Exception {
++    Put put = new Put(Bytes.toBytes("row" + String.format("%1$04d", rownum)));
++    put.add(HConstants.CATALOG_FAMILY, null, value);
++    table.put(put);
+ 
++    // sleep to let the log roller run (if it needs to)
++    try {
++      Thread.sleep(2000);
++    } catch (InterruptedException e) {
++      // continue
++    }
++  }
++  
++  /**
++   * Tests that logs are rolled upon detecting datanode death
++   * 
++   * @throws Exception
++   */
++  public void testLogRollOnDatanodeDeath() throws Exception {
++    assertTrue("This test requires HLog file replication.", 
++        fs.getDefaultReplication() > 1);
++    
++    // When the META table can be opened, the region servers are running
++    new HTable(conf, HConstants.META_TABLE_NAME);
++    this.server = cluster.getRegionThreads().get(0).getRegionServer();
++    this.log = server.getLog();
++
++    // add up the datanode count, to ensure proper replication when we kill 1
++    dfsCluster.startDataNodes(conf, 1, true, null, null);
++    dfsCluster.waitActive();
++    assertTrue(dfsCluster.getDataNodes().size() >= 
++               fs.getDefaultReplication() + 1);
++
++    // Create the test table and open it
++    String tableName = getName();
++    HTableDescriptor desc = new HTableDescriptor(tableName);
++    desc.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
++    HBaseAdmin admin = new HBaseAdmin(conf);
++    admin.createTable(desc);
++    HTable table = new HTable(conf, tableName);
++    table.setAutoFlush(true);
++
++    long curTime = System.currentTimeMillis();
++    long oldFilenum = log.getFilenum();
++    assertTrue("Log should have a timestamp older than now", 
++             curTime > oldFilenum && oldFilenum != -1);
++
++    // normal write
++    writeData(table, 1);
++    assertTrue("The log shouldn't have rolled yet", 
++              oldFilenum == log.getFilenum());
++
++    // kill a datanode in the pipeline to force a log roll on the next sync()
++    OutputStream stm = log.getOutputStream();
++    Method getPipeline = null;
++    for (Method m : stm.getClass().getDeclaredMethods()) {
++      if(m.getName().endsWith("getPipeline")) {
++        getPipeline = m;
++        getPipeline.setAccessible(true);
++        break;
++      }
++    }
++    assertTrue("Need DFSOutputStream.getPipeline() for this test", 
++                getPipeline != null);
++    Object repl = getPipeline.invoke(stm, new Object []{} /*NO_ARGS*/);
++    DatanodeInfo[] pipeline = (DatanodeInfo[]) repl;
++    assertTrue(pipeline.length == fs.getDefaultReplication());
++    DataNodeProperties dnprop = dfsCluster.stopDataNode(pipeline[0].getName());
++    assertTrue(dnprop != null);
++
++    // this write should succeed, but trigger a log roll
++    writeData(table, 2);
++    long newFilenum = log.getFilenum();
++    assertTrue("Missing datanode should've triggered a log roll", 
++              newFilenum > oldFilenum && newFilenum > curTime);
++    
++    // write some more log data (this should use a new hdfs_out)
++    writeData(table, 3);
++    assertTrue("The log should not roll again.", 
++              log.getFilenum() == newFilenum);
++    assertTrue("New log file should have the default replication",
++              log.getLogReplication() == fs.getDefaultReplication());
++  }
++
+ }
+Index: src/java/org/apache/hadoop/hbase/regionserver/HLog.java
+===================================================================
+--- src/java/org/apache/hadoop/hbase/regionserver/HLog.java	(revision 5108)
++++ src/java/org/apache/hadoop/hbase/regionserver/HLog.java	(working copy)
+@@ -22,7 +22,9 @@
+ import java.io.EOFException;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.io.OutputStream;
+ import java.io.UnsupportedEncodingException;
++import java.lang.reflect.Field;
+ import java.lang.reflect.Method;
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -118,8 +120,9 @@
+   private final long blocksize;
+   private final int flushlogentries;
+   private final AtomicInteger unflushedEntries = new AtomicInteger(0);
+-  private final boolean append;
+-  private final Method syncfs;
++  private final Method syncfs;       // refers to SequenceFileWriter.syncFs()
++  private OutputStream hdfs_out;     // OutputStream associated with the current SequenceFile.writer
++  private Method getNumCurrentReplicas; // refers to DFSOutputStream.getNumCurrentReplicas
+   private final static Object [] NO_ARGS = new Object []{};
+ 
+   // used to indirectly tell syncFs to force the sync
+@@ -138,6 +141,7 @@
+ 
+   /*
+    * Map of regions to first sequence/edit id in their memstore.
++   * The sequenceid is the id of the last write into the current HLog.
+    */
+   private final ConcurrentSkipListMap<byte [], Long> lastSeqWritten =
+     new ConcurrentSkipListMap<byte [], Long>(Bytes.BYTES_COMPARATOR);
+@@ -146,14 +150,18 @@
+ 
+   private final AtomicLong logSeqNum = new AtomicLong(0);
+ 
++  // hlog.data files start from index 0. The filenum is the timestamp (in ms)
++  // when the log file was created.
+   private volatile long filenum = -1;
+ 
++  //number of transactions in the current Hlog.
+   private final AtomicInteger numEntries = new AtomicInteger(0);
+ 
+-  // Size of edits written so far. Used figuring when to rotate logs.
++  // Size of edits written current log so far. Used figuring when to rotate logs.
+   private final AtomicLong editsSize = new AtomicLong(0);
+ 
+-  // If > than this size, roll the log.
++  // If > than this size, roll the log. This is typically 0.95 times the size 
++  // of the default Hdfs block size.
+   private final long logrollsize;
+ 
+   // This lock prevents starting a log roll during a cache flush.
+@@ -259,14 +267,23 @@
+       ", enabled=" + this.enabled +
+       ", flushlogentries=" + this.flushlogentries +
+       ", optionallogflushinternal=" + this.optionalFlushInterval + "ms");
++
+     rollWriter();
++
++    rebindWriterFunc(this.writer);
++    if(this.getNumCurrentReplicas != null) {
++      LOG.info("Using getNumCurrentReplicas--HDFS-826");
++    } else {
++      LOG.info("getNumCurrentReplicas--HDFS-826 not available" );
++    }
++
+     // Test if syncfs is available.
+-    this.append = isAppend(conf);
+     Method m = null;
+-    if (this.append) {
++    if (isAppend(conf)) {
+       try {
++        // function pointer to writer.syncFs()
+         m = this.writer.getClass().getMethod("syncFs", new Class<?> []{});
+-        LOG.debug("Using syncFs--hadoop-4379");
++        LOG.info("Using syncFs--hadoop-4379");
+       } catch (SecurityException e) {
+         throw new IOException("Failed test for syncfs", e);
+       } catch (NoSuchMethodException e) {
+@@ -275,7 +292,7 @@
+       }
+     }
+     this.syncfs = m;
+-
++        
+     logSyncerThread = new LogSyncer(this.optionalFlushInterval);
+     Threads.setDaemonThreadRunning(logSyncerThread,
+         Thread.currentThread().getName() + ".logSyncer");
+@@ -358,6 +375,9 @@
+         this.filenum = System.currentTimeMillis();
+         Path newPath = computeFilename(this.filenum);
+         this.writer = createWriter(newPath);
++        if(this.getNumCurrentReplicas != null) {
++          rebindWriterFunc(this.writer);
++        }
+         LOG.info((oldFile != null?
+             "Roll " + FSUtils.getPath(oldFile) + ", entries=" +
+             this.numEntries.get() +
+@@ -401,6 +421,46 @@
+         SequenceFile.CompressionType.NONE, new DefaultCodec(), null,
+         new Metadata());
+   }
++  
++  // Get at the private FSDataOutputStream inside in SequenceFile.
++  // Make it accessible.  Our goal is to get at the underlying
++  // DFSOutputStream so that we can find out HDFS pipeline errors proactively.
++  private void rebindWriterFunc(SequenceFile.Writer writer) throws IOException {
++    try {
++      final Field fields[] = writer.getClass().getDeclaredFields();
++      final String fieldName = "out";
++      for (int i = 0; i < fields.length; ++i) {
++        if (fieldName.equals(fields[i].getName())) {
++          try {
++            fields[i].setAccessible(true);
++            // get variable: writer.out
++            FSDataOutputStream writer_out = 
++              (FSDataOutputStream)fields[i].get(writer);
++            // writer's OutputStream: writer.out.getWrappedStream()
++            // important: only valid for the lifetime of this.writer
++            this.hdfs_out = writer_out.getWrappedStream();
++            // function pointer: OutputStream.getNumCurrentReplicas
++            if (this.getNumCurrentReplicas == null) {
++              this.getNumCurrentReplicas = 
++                this.hdfs_out.getClass().getMethod("getNumCurrentReplicas", 
++                                                   new Class<?> []{});
++              this.getNumCurrentReplicas.setAccessible(true);
++            }
++            break;
++          } catch (IllegalAccessException ex) {
++            throw new IOException("Accessing " + fieldName, ex);
++          }
++        }
++      }
++    } catch (NoSuchMethodException e) {
++      // Thrown if getNumCurrentReplicas() function isn't available
++    }
++  }
++  
++  // usage: see TestLogRolling.java
++  OutputStream getOutputStream() {
++    return this.hdfs_out;
++  }
+ 
+   /*
+    * Clean up old commit logs.
+@@ -800,7 +860,7 @@
+         try {
+           long now = System.currentTimeMillis();
+           this.writer.sync();
+-          if (this.append && syncfs != null) {
++          if (syncfs != null) {
+             try {
+               this.syncfs.invoke(this.writer, NO_ARGS);
+             } catch (Exception e) {
+@@ -810,7 +870,24 @@
+           syncTime += System.currentTimeMillis() - now;
+           syncOps++;
+           this.forceSync = false;
+           this.unflushedEntries.set(0);
++            
++          // if the number of replicas in HDFS has fallen below the initial   
++          // value, then roll logs.   
++          try {
++            int numCurrentReplicas = getLogReplication();
++            if (numCurrentReplicas != 0 &&  
++                numCurrentReplicas < fs.getDefaultReplication()) {  
++              LOG.warn("HDFS pipeline error detected. " +   
++                  "Found " + numCurrentReplicas + " replicas but expecting " +
++                  fs.getDefaultReplication() + " replicas. " +  
++                  " Requesting close of hlog.");  
++              requestLogRoll();   
++            } 
++          } catch (Exception e) {   
++              LOG.warn("Unable to invoke DFSOutputStream.getNumCurrentReplicas" + e +   
++                       " still proceeding ahead...");  
++          }
+         } catch (IOException e) {
+           LOG.fatal("Could not append. Requesting close of hlog", e);
+           requestLogRoll();
+@@ -819,6 +896,25 @@
+       }
+     }
+   }
++  
++  /**
++   * This method gets the datanode replication count for the current HLog.
++   *
++   * If this function returns 0, it means one of 2 things
++   * 1. You are not running a version of HDFS with HDFS-826 patch
++   * 2. The SequenceFile.Writer has finished writing on a HDFS block boundary
++   * 
++   * @throws Exception
++   */
++  int getLogReplication() throws Exception {
++    if(getNumCurrentReplicas != null) {
++      Object repl = this.getNumCurrentReplicas.invoke(this.hdfs_out, NO_ARGS);
++      if (repl instanceof Integer) {  
++        return ((Integer)repl).intValue();  
++      }
++    }
++    return 0;
++  }
+ 
+   private void requestLogRoll() {
+     if (this.listener != null) {
+@@ -1239,7 +1335,7 @@
+     }
+     return append;
+   }
+-
++  
+   /**
+    * Utility class that lets us keep track of the edit with it's key
+    * Only used when splitting logs
