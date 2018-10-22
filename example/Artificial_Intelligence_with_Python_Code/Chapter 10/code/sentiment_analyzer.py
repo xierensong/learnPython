@@ -16,7 +16,7 @@ if __name__=='__main__':
             fileids=[f])), 'Positive') for f in fileids_pos]
     features_neg = [(extract_features(movie_reviews.words(
             fileids=[f])), 'Negative') for f in fileids_neg]
-    print(features_pos)
+    print(features_pos[:2])
     # Define the train and test split (80% and 20%)
     threshold = 0.8
     num_pos = int(threshold * len(features_pos))
