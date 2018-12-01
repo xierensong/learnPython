@@ -4,7 +4,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn import covariance, cluster
-from matplotlib.finance import quotes_historical_yahoo_ochl as quotes_yahoo
+from mpl.finance import quotes_historical_yahoo_ochl as quotes_yahoo
 
 # Input file containing company symbols 
 input_file = 'company_symbol_mapping.json'
