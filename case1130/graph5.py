@@ -2,12 +2,14 @@ import networkx as nx
 import pydot as pd
 import operator
 import matplotlib.pyplot as plt
+import pydot
+from networkx.drawing.nx_pydot import graphviz_layout
 
 # dot文件提取出pydot图（注：是列表）
 p_dot = pd.graph_from_dot_file('data/temp.dt',
                         encoding='utf-8')
 # print(p_dot[0])
-png_path = "pic/test.png"
+# png_path = "pic/test.png"
 # pydot图输出为png图片
 # p_dot[0].write_png(png_path)
 
@@ -51,9 +53,41 @@ print(nx.info(n_graph))
 n_graph3 = nx.to_undirected(n_graph)
 print('是否连通：', nx.number_connected_components(n_graph3))
 print('子图个数：', nx.number_connected_components(n_graph3))
+node_list = nx.nodes(n_graph)
+print(type(node_list))
+for item in node_list:
+    print("werqwe:", item, type(item))
+# print(node_list[0])
 
-f1 = plt.figure()
-nx.draw(n_graph2, node_size=0.1)
+G = nx.complete_graph(5)
+node_list1 = nx.nodes(G)
+print(type(node_list1))
+for item in node_list1:
+    print("werqwe:", item, type(item))
+f1 = plt.figure(figsize=(10, 10))
+pos = graphviz_layout(G)
+nx.draw(G, pos)
+plt.show()
+png_path = "pic/test.png"
+f1.savefig(png_path)
+
+# n_graph 节点转化为数字
+n_graph4 = nx.convert_node_labels_to_integers(n_graph, label_attribute='label')
+
+f1 = plt.figure(figsize=(10, 10))
+# pos = nx.spring_layout(n_graph2)
+# dot − filter for drawing directed graphs
+# neato − filter for drawing undirected graphs
+# twopi − filter for radial layouts of graphs
+# circo − filter for circular layout of graphs
+# fdp − filter for drawing undirected graphs
+# sfdp − filter for drawing large undirected graphs
+# patchwork − filter for squarified tree maps
+# osage − filter for array-based layouts
+print(n_graph4)
+pos = graphviz_layout(n_graph4, prog='dot', root=0)
+
+nx.draw(n_graph4, pos, node_size=400, alpha=0.5, with_labels=True)
 plt.show()
 filename1 = 'pic/graphLabels.png'
 f1.savefig(filename1)
