@@ -29,3 +29,7 @@ if __name__ == '__main__':
         else:
             print(q.read_text())
             q.unlink();
+    # 遍历文件
+    dir_path = Path('.')
+    for file in dir_path.glob('*.*'):
+        print('file name', file)
