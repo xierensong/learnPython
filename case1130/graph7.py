@@ -11,7 +11,7 @@ from matplotlib import cm
 from numpy import linspace
 
 # dot文件提取出pydot图（注：是列表）
-p_dot = pd.graph_from_dot_file('data/temp6.dt',
+p_dot = pd.graph_from_dot_file('data/temp9.dt',
                         encoding='utf-8')
 
 print('子图数量:', len(p_dot))
