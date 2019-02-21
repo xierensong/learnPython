@@ -8,21 +8,21 @@ with open('data/example.json', 'r') as json_file:
 for item in api_relation_list['method_list']:
     print(item)
 
-node_list = []
-edge_list = []
+node_list = set()
+edge_list = set()
 
 for item_dict in api_relation_list['method_list']:
     method_name = item_dict['method']
     node = '"' + str(method_name) + '"' + ' [ label="' + str(method_name) + '"]'
     print(node)
-    node_list.append(node)
+    node_list.update([node])
     api_list = item_dict['api_list']
     for api in api_list:
         api_node = '"' + str(api) + '"' + ' [ label="' + str(api) + '"]'
-        node_list.append(api_node)
+        node_list.update([api_node])
         edge = '"' + str(method_name) + '"' + ' -> ' + '"' + str(api) + '"'
         print('edge:', edge)
-        edge_list.append(edge)
+        edge_list.update([edge])
 
 with open('data/example.dt', 'w') as dt_file:
     dt_file.write('digraph "DirectedGraph" {\n')

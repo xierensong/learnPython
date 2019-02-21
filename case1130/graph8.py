@@ -33,6 +33,7 @@ print('复制图完成.')
 # n_graph 节点转化为数字
 n_graph4 = nx.convert_node_labels_to_integers(n_graph, label_attribute='label')
 print('点:', n_graph4.nodes)
+pprint(nx.get_node_attributes(n_graph4, 'label'))
 
 # # 查找有向图中的环
 # print('环个数 ', len(list(nx.simple_cycles(n_graph1))))
@@ -43,8 +44,9 @@ print('点:', n_graph4.nodes)
 # print('删除单环')
 # n_graph1.remove_edges_from(self_loop)
 #
-# # 查找有向图中的环
-# print('环个数 ', len(list(nx.simple_cycles(n_graph1))))
+# 查找有向图中的环
+print('环个数 ', len(list(nx.simple_cycles(n_graph1))))
+print('环 ', list(nx.simple_cycles(n_graph1)))
 #
 # 去掉非自环
 # while 1:
@@ -63,17 +65,24 @@ print('点:', n_graph4.nodes)
 
 # 找某个节点的为root的子图
 # 找某个节点下的所有子孙节点
-# root 75
+# root 66 main addPath
 node_list = set()
-root = 90
-node_list.add(root)
+root = 91
+# 子图节点列表
+node_list.update([root])
+# 是否访问过
+visit_list = set()
+visit_list.update([root])
+
 
 def dfs(root):
+    visit_list.update([root])
     out_list = n_graph4.successors(root)
     for item in out_list:
         print('item:', item)
-        node_list.add(item)
-        dfs(item)
+        node_list.update([item])
+        if item not in visit_list:
+            dfs(item)
 
 
 dfs(root)
@@ -81,12 +90,15 @@ dfs(root)
 # 根据节点画出子图
 n_graph5 = n_graph4.subgraph(node_list)
 
+# 画网络图
+nx.drawing.nx_pydot.write_dot(n_graph5, 'target.dt')
+
 # print("节点集：", nx.get_node_attributes(n_graph5, 'label'))
 pprint(nx.get_node_attributes(n_graph5, 'label'))
 print(nx.info(n_graph5))
 f1 = plt.figure(figsize=(10, 10))
-pos = graphviz_layout(n_graph5, prog='dot', root=0)
-nx.draw(n_graph5, pos, node_size=100, alpha=0.5, with_labels=True, edge_color='black', linewidth=1.0)
+pos = graphviz_layout(n_graph5, prog='dot', root=0)  # neato dot circo
+nx.draw(n_graph5, pos, node_size=400, alpha=0.5, with_labels=True, edge_color='black', linewidth=1.0)
 plt.show()
 filename1 = 'pic/pic.png'
 f1.savefig(filename1)
