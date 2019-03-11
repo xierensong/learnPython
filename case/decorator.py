@@ -16,7 +16,7 @@ def log1(text):   # 装饰器带参数
     def decorator(func):  # 中间多了一层函数定义
         @functools.wraps(func)   # 修改装饰函数名称为被装饰的函数名称
         def wrapper(*args, **kw):
-            print('%s %s():' % (text, func.__name__))   # 在装饰器代码中使用了装饰器参数
+            print('%s %s():'%(text, func.__name__))   # 在装饰器代码中使用了装饰器参数
             return func(*args, **kw)
         return wrapper
     return decorator
