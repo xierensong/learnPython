@@ -33,3 +33,8 @@ if __name__ == '__main__':
     dir_path = Path('.')
     for file in dir_path.glob('*.*'):
         print('file name', file)
+        print('name ', file.stem)   # 不带扩展名的文件名
+        print('suffix ', file.suffix)   # 扩展名
+        print('parent dir', file.parts[-2]) # 上一级父目录
+
+
